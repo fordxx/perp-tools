@@ -18,8 +18,10 @@ from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.capital_orchestrator import CapitalOrchestrator
 from perpbot.config import BotConfig
-from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
+from perpbot.exchanges.base import provision_exchanges
 from perpbot.monitoring.alerts import process_alerts
+from perpbot.monitoring.market_data_bus import MarketDataBus
+from perpbot.monitoring.state import MonitoringState
 from perpbot.models import ArbitrageOpportunity, AlertRecord, Position, PriceQuote, TradingState
 from perpbot.position_guard import PositionGuard
 from perpbot.persistence import AlertRecorder, TradeRecorder
@@ -85,6 +87,8 @@ class TradingService:
         self.cfg = cfg
         self.state = TradingState(min_profit_pct=cfg.arbitrage_min_profit_pct, per_exchange_limit=cfg.per_exchange_limit)
         self.state.trading_enabled = True
+        self.monitoring = MonitoringState()
+        self.market_bus = MarketDataBus(self.monitoring, per_exchange_limit=cfg.per_exchange_limit)
         self.exchanges = provision_exchanges()
         self.volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
         self.recorder = TradeRecorder(cfg.trade_record_path)
@@ -181,7 +185,13 @@ class TradingService:
 
     def run_cycle(self) -> None:
         with self._lock:
-            update_state_with_quotes(self.state, self.exchanges, self.cfg.symbols)
+            quotes = self.market_bus.collect_quotes(self.exchanges, self.cfg.symbols)
+            for quote in quotes:
+                self.state.quotes[f"{quote.exchange}:{quote.symbol}"] = quote
+                history = self.state.price_history.setdefault(quote.symbol, [])
+                history.append((datetime.utcnow(), quote.mid))
+                if len(history) > 500:
+                    del history[: len(history) - 500]
             positions = self.risk_manager.collect_positions(self.exchanges)
             self.state.account_positions = positions
             self.guard.update_equity_from_positions(positions)
@@ -192,6 +202,7 @@ class TradingService:
             self._record_equity_point(datetime.utcnow(), self.state.equity, self.state.pnl)
             self.state.last_cycle_at = datetime.utcnow()
             self.state.status = "running" if self.state.trading_enabled else "paused"
+            self._refresh_monitoring(quotes)
 
             # 即便暂停交易也向前端展示套利机会
             opportunities = find_arbitrage_opportunities(
@@ -288,7 +299,59 @@ class TradingService:
                 "alerts": self.state.triggered_alerts,
                 "alert_history": [_alert_to_dict(a) for a in self.state.alert_history[-self._max_alert_history :]],
                 "trade_stats": self.recorder.stats() if self.recorder else {},
+                "monitoring": self.monitoring.snapshot(),
             }
+
+    def _refresh_monitoring(self, quotes: Optional[list] = None) -> None:
+        snapshot = self.capital.current_snapshot()
+        self.monitoring.update_capital(snapshot)
+        if quotes:
+            for quote in quotes:
+                self.monitoring.update_quote(quote)
+        # 汇总交易所运行态
+        for ex in self.exchanges:
+            cap = snapshot.get(ex.name, {})
+            wash = cap.get("wash", {})
+            arb = cap.get("arb", {})
+            meta = cap.get("meta", {})
+            active_tasks = sum(
+                1
+                for t in self.monitoring.wash_tasks.values()
+                if ex.name in t.pair and t.status not in {"done", "blocked"}
+            )
+            active_notional = sum(t.notional for t in self.monitoring.wash_tasks.values() if ex.name in t.pair and t.status not in {"done", "blocked"})
+            self.monitoring.update_exchange_state(
+                ex.name,
+                equity=float(meta.get("equity", 0.0)),
+                available_margin=float(wash.get("available", 0.0)),
+                wash_usage=float(wash.get("allocated", 0.0)),
+                long_short_balanced=True,
+                funding_rate=0.0,
+                api_latency_ms=0.0,
+                risk_warnings=[],
+                active_wash_tasks=active_tasks,
+                active_notional=active_notional,
+            )
+        remaining_loss = 0.0
+        if self.risk_manager.daily_loss_limit > 0 and self.risk_manager._daily_anchor_equity:
+            remaining_loss = max(
+                0.0,
+                self.risk_manager.daily_loss_limit
+                - max(self.risk_manager._daily_anchor_equity - self.risk_manager.last_equity, 0.0),
+            )
+        self.monitoring.update_system(
+            status=self.state.status,
+            risk_mode=self.risk_manager.risk_mode,
+            daily_loss_limit=self.risk_manager.daily_loss_limit,
+            remaining_loss_buffer=remaining_loss,
+        )
+        self.monitoring.update_risk_radar(
+            {
+                "consecutive_failures": self.risk_manager.consecutive_failures,
+                "auto_paused": self.risk_manager.trading_halted,
+                "manual_override_active": self.risk_manager._override_active(),
+            }
+        )
 
     def _record_equity_point(self, ts: datetime, equity: float, pnl: float) -> None:
         self.state.equity_history.append((ts, equity))
@@ -332,6 +395,22 @@ def create_web_app(cfg: BotConfig, service: Optional[TradingService] = None) -> 
     @app.get("/api/alerts")
     def alerts():
         return service.snapshot().get("alert_history", [])
+
+    @app.get("/api/monitoring")
+    def monitoring():
+        return service.snapshot().get("monitoring", {})
+
+    @app.get("/api/monitoring/exchanges")
+    def monitoring_exchanges():
+        return service.snapshot().get("monitoring", {}).get("exchanges", {})
+
+    @app.get("/api/monitoring/wash_tasks")
+    def monitoring_wash_tasks():
+        return service.snapshot().get("monitoring", {}).get("wash_tasks", {})
+
+    @app.get("/api/monitoring/radar")
+    def monitoring_radar():
+        return service.snapshot().get("monitoring", {}).get("risk_radar", {})
 
     @app.post("/api/control/start")
     def start_trading():

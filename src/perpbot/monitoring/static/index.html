@@ -282,6 +282,88 @@
           <ul id="alertList" style="list-style: none; padding: 0; margin: 0"></ul>
         </div>
       </div>
+
+      <div style="margin-top: 16px">
+        <h2>实时监控（MVP）</h2>
+        <div class="cards" style="margin-top: 10px">
+          <div class="card">
+            <h3>全局总控</h3>
+            <div id="globalStatus"></div>
+          </div>
+          <div class="card">
+            <h3>风控雷达</h3>
+            <ul id="riskRadar" style="list-style: none; padding: 0; margin: 0"></ul>
+          </div>
+          <div class="card">
+            <h3>资金池</h3>
+            <div id="capitalPools"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>交易所状态</h3>
+          <div class="scrollable">
+            <table id="exchangeStatusTable">
+              <thead>
+                <tr>
+                  <th>交易所</th>
+                  <th>权益</th>
+                  <th>保证金</th>
+                  <th>刷量占用</th>
+                  <th>刷量任务</th>
+                  <th>API 延迟</th>
+                  <th>警告</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>刷量任务</h3>
+          <div class="scrollable">
+            <table id="washTaskTable">
+              <thead>
+                <tr>
+                  <th>任务</th>
+                  <th>交易所对</th>
+                  <th>交易对</th>
+                  <th>名义金额</th>
+                  <th>状态</th>
+                  <th>持仓(s)</th>
+                  <th>成交量</th>
+                  <th>手续费</th>
+                  <th>PnL</th>
+                  <th>风险</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>行情面板</h3>
+          <div class="scrollable">
+            <table id="marketPanel">
+              <thead>
+                <tr>
+                  <th>交易所</th>
+                  <th>交易对</th>
+                  <th>买价</th>
+                  <th>卖价</th>
+                  <th>点差</th>
+                  <th>Funding</th>
+                  <th>5s波动</th>
+                  <th>10s波动</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -389,6 +471,125 @@
           : "-";
       }
 
+      function renderMonitoring(monitoring) {
+        renderGlobalStatus(monitoring.system || {}, monitoring.capital || {});
+        renderCapitalPools(monitoring.capital || {});
+        renderExchangeStatus(monitoring.exchanges || {});
+        renderWashTasks(monitoring.wash_tasks || {});
+        renderRiskRadar(monitoring.risk_radar || {});
+        renderMarketPanel(monitoring.quotes || {});
+      }
+
+      function renderGlobalStatus(system, capital) {
+        const el = document.getElementById("globalStatus");
+        if (!el) return;
+        el.innerHTML = `
+          <div>系统状态：<span class="status ${system.status}">${system.status || "-"}</span></div>
+          <div>风险模式：${system.risk_mode || "-"}</div>
+          <div>今日成交量：${fmt(system.daily_volume_usd || 0, 2)} USDT</div>
+          <div>今日手续费：${fmt(system.daily_fee_usd || 0, 4)} USDT</div>
+          <div>今日PnL：${fmt(system.daily_pnl_usd || 0, 4)} USDT</div>
+          <div>当日亏损上限：${fmt(system.daily_loss_limit_usd || 0, 2)} / 剩余 ${fmt(system.remaining_loss_buffer_usd || 0, 2)}</div>
+        `;
+      }
+
+      function renderCapitalPools(capital) {
+        const el = document.getElementById("capitalPools");
+        if (!el) return;
+        const parts = Object.entries(capital).map(([ex, pools]) => {
+          const wash = pools.wash || {};
+          const arb = pools.arb || {};
+          const reserve = pools.reserve || {};
+          return `<div style="margin-bottom:8px"><strong>${ex}</strong><br/>S1刷量: ${fmt(
+            wash.allocated || 0,
+            2
+          )}/${fmt(wash.pool || 0, 2)} | S2套利: ${fmt(arb.allocated || 0, 2)}/${fmt(arb.pool || 0, 2)} | S3备用: ${fmt(
+            reserve.pool || 0,
+            2
+          )}</div>`;
+        });
+        el.innerHTML = parts.join("") || "-";
+      }
+
+      function renderExchangeStatus(exchanges) {
+        const tbody = document.querySelector("#exchangeStatusTable tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.entries(exchanges).forEach(([ex, info]) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${ex}</td>
+            <td>${fmt(info.equity || 0, 2)}</td>
+            <td>${fmt(info.available_margin || 0, 2)}</td>
+            <td>${fmt(info.wash_usage || 0, 2)}</td>
+            <td>${info.active_wash_tasks || 0}</td>
+            <td>${fmt(info.api_latency_ms || 0, 1)} ms</td>
+            <td>${(info.risk_warnings || []).join("; ")}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+
+      function renderWashTasks(tasks) {
+        const tbody = document.querySelector("#washTaskTable tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.values(tasks)
+          .sort((a, b) => (b.start_ts || "").localeCompare(a.start_ts || ""))
+          .forEach((t) => {
+            const risks = Object.entries(t.risk_flags || {})
+              .filter(([, v]) => v)
+              .map(([k]) => k)
+              .join(", ");
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${t.task_id}</td>
+              <td>${t.pair}</td>
+              <td>${t.symbol}</td>
+              <td>${fmt(t.notional || 0, 2)}</td>
+              <td>${t.status}</td>
+              <td>${fmt(t.hold_seconds || 0, 0)}</td>
+              <td>${fmt(t.filled_volume || 0, 2)}</td>
+              <td>${fmt(t.fee_paid || 0, 4)}</td>
+              <td>${fmt(t.floating_pnl || 0, 4)}</td>
+              <td>${risks || "-"}</td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderRiskRadar(radar) {
+        const el = document.getElementById("riskRadar");
+        if (!el) return;
+        el.innerHTML = `
+          <li>快市交易对：${(radar.fast_market_symbols || []).join(", ") || "-"}</li>
+          <li>延迟异常：${(radar.latency_anomalies || []).join(", ") || "-"}</li>
+          <li>资金费率黑窗：${Object.keys(radar.funding_blackout || {}).length}</li>
+          <li>连续失败：${radar.consecutive_failures || 0}</li>
+          <li>自动暂停：${radar.auto_paused ? "是" : "否"}</li>
+          <li>manual override：${radar.manual_override_active ? "是" : "否"}</li>
+        `;
+      }
+
+      function renderMarketPanel(quotes) {
+        const tbody = document.querySelector("#marketPanel tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.entries(quotes).forEach(([exchange, symbols]) => {
+          Object.entries(symbols).forEach(([symbol, q]) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${exchange}</td>
+              <td>${symbol}</td>
+              <td>${fmt(q.bid)}</td>
+              <td>${fmt(q.ask)}</td>
+              <td>${fmt(q.spread || 0, 4)}</td>
+              <td>${fmt(q.funding || 0, 4)}</td>
+              <td>${fmt(q.vol_5s || 0, 4)}</td>
+              <td>${fmt(q.vol_10s || 0, 4)}</td>`;
+            tbody.appendChild(tr);
+          });
+        });
+      }
+
       function renderOverview(data) {
         const statusBar = document.getElementById("statusBar");
         let statusClass = "status ";
@@ -462,6 +663,9 @@
         renderAlerts(data.alert_history || []);
         renderAlertList(data.alerts || []);
         renderStats(data.trade_stats || {});
+        if (data.monitoring) {
+          renderMonitoring(data.monitoring);
+        }
         if (data.equity_history) {
           const ctx = document.getElementById("pnlChart");
           renderChart(ctx, data.equity_history, data.pnl_history || [], chartRef);

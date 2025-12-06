@@ -197,7 +197,16 @@ class CapitalOrchestrator:
     def current_snapshot(self) -> Dict[str, Dict[str, Dict[str, float]]]:
         snapshot: Dict[str, Dict[str, Dict[str, float]]] = {}
         for ex, profile in self.exchange_profiles.items():
-            snapshot[ex] = {}
+            snapshot[ex] = {
+                "meta": {
+                    "equity": profile.equity,
+                    "drawdown_pct": profile.drawdown_pct,
+                    "safe_mode": 1 if profile.safe_mode else 0,
+                    "total_volume": profile.total_volume,
+                    "total_fee": profile.total_fee,
+                    "realized_pnl": profile.realized_pnl,
+                }
+            }
             for name, pool in profile.pools.items():
                 snapshot[ex][name] = {
                     "pool": pool.pool,

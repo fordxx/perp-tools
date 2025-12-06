@@ -13,8 +13,9 @@ from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.capital_orchestrator import CapitalOrchestrator
 from perpbot.config import BotConfig, load_config
-from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
+from perpbot.exchanges.base import provision_exchanges
 from perpbot.monitoring.alerts import process_alerts
+from perpbot.monitoring.market_data_bus import MarketDataBus
 from perpbot.monitoring.web_console import create_web_app
 from perpbot.models import TradingState
 from perpbot.position_guard import PositionGuard
@@ -114,6 +115,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             # 某些交易所不支持该查询时忽略即可
             pass
     state.account_positions = positions
+    market_bus = MarketDataBus(per_exchange_limit=cfg.per_exchange_limit)
     executor = ArbitrageExecutor(
         exchanges,
         guard,
@@ -123,7 +125,13 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         capital_orchestrator=capital,
     )
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
-    update_state_with_quotes(state, exchanges, cfg.symbols)
+    quotes = market_bus.collect_quotes(exchanges, cfg.symbols)
+    for quote in quotes:
+        state.quotes[f"{quote.exchange}:{quote.symbol}"] = quote
+        history = state.price_history.setdefault(quote.symbol, [])
+        history.append((datetime.utcnow(), quote.mid))
+        if len(history) > 500:
+            del history[: len(history) - 500]
     risk_manager.update_equity(positions, state.quotes.values())
     risk_manager.evaluate_market(state.quotes.values())
     state.equity = risk_manager.last_equity

@@ -9,6 +9,8 @@ from typing import Dict, Optional, Tuple
 
 from perpbot.capital_orchestrator import CapitalOrchestrator, CapitalReservation
 from perpbot.exchanges.base import ExchangeClient
+from perpbot.monitoring.market_data_bus import MarketDataBus
+from perpbot.monitoring.state import MonitoringState, WashTaskView
 from perpbot.risk_manager import RiskManager
 from perpbot.models import Order, OrderRequest, PriceQuote
 
@@ -61,6 +63,8 @@ class HedgeVolumeEngine:
         next_funding_timestamp: Optional[float] = None,
         max_acceptable_loss_pct: float = 0.0001,
         max_wash_pct_per_call: float = 0.1,
+        monitoring_state: Optional[MonitoringState] = None,
+        market_data_bus: Optional[MarketDataBus] = None,
     ) -> None:
         self.exchanges = exchanges
         self.orchestrator = orchestrator
@@ -80,6 +84,8 @@ class HedgeVolumeEngine:
         self.max_acceptable_loss_pct = max_acceptable_loss_pct
         self.max_wash_pct_per_call = max_wash_pct_per_call
         self.loss_tracker: Dict[str, float] = {}
+        self.monitoring_state = monitoring_state
+        self.market_data_bus = market_data_bus
 
     def _select_notional(self) -> float:
         return random.uniform(self.min_notional, self.max_notional)
@@ -104,6 +110,9 @@ class HedgeVolumeEngine:
         return True
 
     async def _fetch_quote(self, ex: ExchangeClient, symbol: str) -> PriceQuote:
+        cached = self.market_data_bus.get_cached(ex.name, symbol) if self.market_data_bus else None
+        if cached:
+            return cached
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, ex.get_current_price, symbol)
 
@@ -249,12 +258,27 @@ class HedgeVolumeEngine:
             return HedgeVolumeResult(status="blocked", reason="交易所不存在")
 
         notional = self._select_notional()
+        task_id = f"{long_exchange}-{short_exchange}-{symbol}-{int(time.time()*1000)}"
+        if self.monitoring_state:
+            self.monitoring_state.register_wash_task(
+                WashTaskView(
+                    task_id=task_id,
+                    pair=f"{long_exchange}↔{short_exchange}",
+                    symbol=symbol,
+                    notional=notional,
+                    status="precheck",
+                )
+            )
         if not self._within_wash_cap(long_exchange, notional) or not self._within_wash_cap(short_exchange, notional):
+            if self.monitoring_state:
+                self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"cap": True})
             return HedgeVolumeResult(status="blocked", reason="名义金额超过 wash 可用占比")
 
         wash_snapshot = self.orchestrator.current_snapshot().get(long_exchange, {}).get("wash", {})
         available = wash_snapshot.get("available", 0.0)
         if available > 0 and notional > available * self.max_wash_pct_per_call:
+            if self.monitoring_state:
+                self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"cap": True})
             return HedgeVolumeResult(status="blocked", reason="单次名义金额超过 wash 池上限")
 
         ok_long = self.orchestrator.reserve_for_wash(long_exchange, notional)
@@ -264,6 +288,8 @@ class HedgeVolumeEngine:
                 self.orchestrator.release((long_exchange, notional, "wash"))
             if ok_short:
                 self.orchestrator.release((short_exchange, notional, "wash"))
+            if self.monitoring_state:
+                self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"balance": True})
             return HedgeVolumeResult(status="blocked", reason="wash 资金不足")
 
         inflight_notional = notional * 2
@@ -272,6 +298,8 @@ class HedgeVolumeEngine:
             if not ok:
                 self.orchestrator.release((long_exchange, notional, "wash"))
                 self.orchestrator.release((short_exchange, notional, "wash"))
+                if self.monitoring_state:
+                    self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"risk": True})
                 return HedgeVolumeResult(status="blocked", reason=reason)
 
         reservation = CapitalReservation(
@@ -285,7 +313,12 @@ class HedgeVolumeEngine:
         try:
             ok, reason = await self._precheck(long_ex, short_ex, symbol, notional)
             if not ok:
+                if self.monitoring_state:
+                    self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"precheck": True})
                 return HedgeVolumeResult(status="blocked", reason=reason)
+
+            if self.monitoring_state:
+                self.monitoring_state.update_wash_task(task_id, status="open")
 
             # 同步开仓
             size_long = notional / (await self._fetch_quote(long_ex, symbol)).mid
@@ -298,6 +331,8 @@ class HedgeVolumeEngine:
 
             if not long_order or not short_order:
                 await self._rollback_open(long_ex, short_ex, symbol, long_order, short_order)
+                if self.monitoring_state:
+                    self.monitoring_state.update_wash_task(task_id, status="error", risk_flags={"leg_fail": True})
                 return HedgeVolumeResult(status="failed", reason="一边成交失败已回退")
 
             # 等待持仓
@@ -308,9 +343,13 @@ class HedgeVolumeEngine:
                 await asyncio.wait_for(asyncio.sleep(hold), timeout=self.max_hold_seconds)
             except asyncio.TimeoutError:
                 logger.warning("持仓等待超时，强制进入平仓")
+            if self.monitoring_state:
+                self.monitoring_state.update_wash_task(task_id, status="hold", hold_seconds=hold)
 
             long_close, short_close = await self._close_both(long_ex, short_ex, symbol, size_long, size_short)
             if not long_close or not short_close:
+                if self.monitoring_state:
+                    self.monitoring_state.update_wash_task(task_id, status="error", risk_flags={"close_fail": True})
                 return HedgeVolumeResult(status="failed", reason="平仓异常")
 
             fee = self._compute_fee(notional, long_ex.name, short_ex.name)
@@ -326,8 +365,12 @@ class HedgeVolumeEngine:
             self.orchestrator.record_volume_result(short_exchange, volume, fee, pnl)
             if self.risk_manager:
                 self.risk_manager.record_volume(volume)
+            if self.monitoring_state:
+                self.monitoring_state.finalize_wash_task(task_id, volume=volume, fee=fee, pnl=pnl)
 
             if not self._check_loss_limit(long_exchange, pnl) or not self._check_loss_limit(short_exchange, pnl):
+                if self.monitoring_state:
+                    self.monitoring_state.update_wash_task(task_id, status="blocked", risk_flags={"loss": True})
                 return HedgeVolumeResult(status="blocked", reason="单所刷量亏损超限", fee=fee, pnl=pnl, volume=volume)
 
             return HedgeVolumeResult(
