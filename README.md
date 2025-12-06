@@ -90,7 +90,7 @@
 
 ### 风控与执行配置
 
-`config.example.yaml` 提供 `max_risk_pct`、`assumed_equity`、`risk_cooldown_seconds` 用于限制单笔风险（默认账户 5%）、在无余额时假设的权益以及失败后的冷却。还包含 `max_drawdown_pct`、`daily_loss_limit_pct`（默认单日亏损 8% 即停止）、`max_consecutive_failures`（连续 3 次失败停机）、`max_symbol_exposure_pct`、`enforce_direction_consistency`、冻结阈值（默认 1 秒内 0.5% 变动）等设置。`loop_interval_seconds` 控制后台循环频率，`arbitrage_min_profit_pct` 可在 Web 控制台实时调节；动态利润门槛由 `high_vol_min_profit_pct` 与 `low_vol_min_profit_pct` 配合波动率调整。执行端覆盖滑点上限、部分成交对冲与超时、交易所熔断、余额集中度提醒、以及优先级/置信度评分过滤。
+`config.example.yaml` 提供 `max_risk_pct`、`assumed_equity`、`risk_cooldown_seconds` 用于限制单笔风险（默认账户 5%）、在无余额时假设的权益以及失败后的冷却。还包含 `max_drawdown_pct`、`daily_loss_limit_pct` 与可选的 `daily_loss_limit`（绝对金额）、`max_consecutive_failures`（连续 3 次失败停机）、`max_symbol_exposure_pct`、`enforce_direction_consistency`、冻结阈值（默认 1 秒内 0.5% 变动）等设置。`risk_mode` 支持 conservative/balanced/aggressive 档位，对应不同的 `min_expected_edge_bps`、`max_acceptable_loss_bps`、波动阈值与评分权重；自动风控暂停后，可通过 `manual_override_minutes` 或 `manual_override_trades` 让人工短期确认继续。`loop_interval_seconds` 控制后台循环频率，`arbitrage_min_profit_pct` 可在 Web 控制台实时调节；动态利润门槛由 `high_vol_min_profit_pct` 与 `low_vol_min_profit_pct` 配合波动率调整。执行端覆盖滑点上限、部分成交对冲与超时、交易所熔断、余额集中度提醒、在途名义额上限、以及优先级/置信度评分过滤。
 
 ### 提醒与通知
 

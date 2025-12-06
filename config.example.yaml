@@ -18,6 +18,36 @@ enforce_direction_consistency: true
 freeze_threshold_pct: 0.005
 freeze_window_seconds: 1
 daily_loss_limit_pct: 0.08
+risk_mode: balanced  # conservative / balanced / aggressive
+risk_mode_presets:
+  conservative:
+    min_expected_edge_bps: 5.0
+    max_acceptable_loss_bps: 1.0
+    volatility_threshold: 0.004
+    safety_weight: 0.8
+    volume_weight: 0.2
+    final_score_threshold: 75
+  balanced:
+    min_expected_edge_bps: 3.0
+    max_acceptable_loss_bps: 2.0
+    volatility_threshold: 0.006
+    safety_weight: 0.65
+    volume_weight: 0.35
+    final_score_threshold: 70
+  aggressive:
+    min_expected_edge_bps: 1.5
+    max_acceptable_loss_bps: 3.5
+    volatility_threshold: 0.01
+    safety_weight: 0.55
+    volume_weight: 0.45
+    final_score_threshold: 60
+risk_enabled: true
+manual_override_minutes: 0
+manual_override_trades: 0
+daily_loss_limit: 0        # 绝对金额上限，可选
+daily_volume_target: 0     # 期望日成交量，用于 volume_score
+max_notional_per_trade: 0  # 单笔硬上限，0 表示关闭
+max_total_notional_in_flight: 0  # 在途名义上限，0 表示关闭
 volatility_window_minutes: 5
 volatility_high_threshold_pct: 0.03
 high_vol_min_profit_pct: 0.002
@@ -120,3 +150,7 @@ hedge_hold_seconds: [10, 60]
 hedge_slippage_bps_limit: 30
 hedge_time_skew_ms: 800
 hedge_loss_limit_pct: 0.02
+hedge_funding_blackout_minutes: 10
+hedge_funding_cycle_seconds: 28800   # 8 小时
+hedge_next_funding_timestamp: 0      # 可选：下一次资金费率结算的时间戳
+hedge_max_wash_pct_per_call: 0.1

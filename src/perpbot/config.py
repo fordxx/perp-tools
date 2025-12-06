@@ -7,6 +7,32 @@ from typing import Dict, List
 from perpbot.models import AlertCondition, AlertNotificationConfig, ExchangeCost
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT"]
+DEFAULT_RISK_MODE_PRESETS = {
+    "conservative": {
+        "min_expected_edge_bps": 5.0,
+        "max_acceptable_loss_bps": 1.0,
+        "volatility_threshold": 0.004,
+        "safety_weight": 0.8,
+        "volume_weight": 0.2,
+        "final_score_threshold": 75.0,
+    },
+    "balanced": {
+        "min_expected_edge_bps": 3.0,
+        "max_acceptable_loss_bps": 2.0,
+        "volatility_threshold": 0.006,
+        "safety_weight": 0.65,
+        "volume_weight": 0.35,
+        "final_score_threshold": 70.0,
+    },
+    "aggressive": {
+        "min_expected_edge_bps": 1.5,
+        "max_acceptable_loss_bps": 3.5,
+        "volatility_threshold": 0.01,
+        "safety_weight": 0.55,
+        "volume_weight": 0.45,
+        "final_score_threshold": 60.0,
+    },
+}
 
 
 @dataclass
@@ -28,6 +54,7 @@ class BotConfig:
     freeze_threshold_pct: float = 0.005
     freeze_window_seconds: int = 1
     daily_loss_limit_pct: float = 0.08
+    daily_loss_limit: float = 0.0
     loop_interval_seconds: float = 2.0
     default_maker_fee_bps: float = 2.0
     default_taker_fee_bps: float = 5.0
@@ -44,6 +71,14 @@ class BotConfig:
         default_factory=lambda: {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
     )
     reliability_scores: Dict[str, float] = field(default_factory=dict)
+    risk_mode: str = "balanced"
+    risk_mode_presets: Dict[str, Dict[str, float]] = field(default_factory=lambda: dict(DEFAULT_RISK_MODE_PRESETS))
+    risk_enabled: bool = True
+    manual_override_minutes: int = 0
+    manual_override_trades: int = 0
+    daily_volume_target: float = 0.0
+    max_notional_per_trade: float = 0.0
+    max_total_notional_in_flight: float = 0.0
     max_slippage_bps: float = 50.0
     order_fill_timeout_seconds: int = 5
     circuit_breaker_failures: int = 3
@@ -68,6 +103,10 @@ class BotConfig:
     hedge_slippage_bps_limit: float = 30.0
     hedge_time_skew_ms: int = 800
     hedge_loss_limit_pct: float = 0.02
+    hedge_funding_blackout_minutes: int = 10
+    hedge_funding_cycle_seconds: int = 8 * 60 * 60
+    hedge_next_funding_timestamp: float = 0.0
+    hedge_max_wash_pct_per_call: float = 0.1
 
 
 def load_config(path: str) -> BotConfig:
@@ -79,6 +118,7 @@ def load_config(path: str) -> BotConfig:
         name: ExchangeCost(**cfg)
         for name, cfg in (data.get("exchange_costs", {}) or {}).items()
     }
+    risk_presets = data.get("risk_mode_presets", DEFAULT_RISK_MODE_PRESETS)
     return BotConfig(
         symbols=data.get("symbols", DEFAULT_SYMBOLS),
         position_size=data.get("position_size", 0.01),
@@ -97,6 +137,7 @@ def load_config(path: str) -> BotConfig:
         freeze_threshold_pct=data.get("freeze_threshold_pct", 0.005),
         freeze_window_seconds=data.get("freeze_window_seconds", 1),
         daily_loss_limit_pct=data.get("daily_loss_limit_pct", 0.08),
+        daily_loss_limit=data.get("daily_loss_limit", 0.0),
         loop_interval_seconds=data.get("loop_interval_seconds", 2.0),
         default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
         default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
@@ -113,6 +154,14 @@ def load_config(path: str) -> BotConfig:
             "priority_weights", {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
         ),
         reliability_scores=data.get("reliability_scores", {}),
+        risk_mode=data.get("risk_mode", "balanced"),
+        risk_mode_presets=risk_presets,
+        risk_enabled=data.get("risk_enabled", True),
+        manual_override_minutes=data.get("manual_override_minutes", 0),
+        manual_override_trades=data.get("manual_override_trades", 0),
+        daily_volume_target=data.get("daily_volume_target", 0.0),
+        max_notional_per_trade=data.get("max_notional_per_trade", 0.0),
+        max_total_notional_in_flight=data.get("max_total_notional_in_flight", 0.0),
         max_slippage_bps=data.get("max_slippage_bps", 50.0),
         order_fill_timeout_seconds=data.get("order_fill_timeout_seconds", 5),
         circuit_breaker_failures=data.get("circuit_breaker_failures", 3),
@@ -137,4 +186,8 @@ def load_config(path: str) -> BotConfig:
         hedge_slippage_bps_limit=data.get("hedge_slippage_bps_limit", 30.0),
         hedge_time_skew_ms=data.get("hedge_time_skew_ms", 800),
         hedge_loss_limit_pct=data.get("hedge_loss_limit_pct", 0.02),
+        hedge_funding_blackout_minutes=data.get("hedge_funding_blackout_minutes", 10),
+        hedge_funding_cycle_seconds=data.get("hedge_funding_cycle_seconds", 8 * 60 * 60),
+        hedge_next_funding_timestamp=data.get("hedge_next_funding_timestamp", 0.0),
+        hedge_max_wash_pct_per_call=data.get("hedge_max_wash_pct_per_call", 0.1),
     )

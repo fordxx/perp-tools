@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 
 from perpbot.capital_orchestrator import CapitalOrchestrator, CapitalReservation
 from perpbot.exchanges.base import ExchangeClient
+from perpbot.risk_manager import RiskManager
 from perpbot.models import Order, OrderRequest, PriceQuote
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ class HedgeVolumeEngine:
         self,
         exchanges: Dict[str, ExchangeClient],
         orchestrator: CapitalOrchestrator,
+        risk_manager: Optional[RiskManager] = None,
         min_notional: float = 300.0,
         max_notional: float = 800.0,
         hold_seconds: Tuple[int, int] = (10, 90),
@@ -58,9 +60,11 @@ class HedgeVolumeEngine:
         funding_cycle_seconds: int = 8 * 60 * 60,
         next_funding_timestamp: Optional[float] = None,
         max_acceptable_loss_pct: float = 0.0001,
+        max_wash_pct_per_call: float = 0.1,
     ) -> None:
         self.exchanges = exchanges
         self.orchestrator = orchestrator
+        self.risk_manager = risk_manager
         self.min_notional = min_notional
         self.max_notional = max_notional
         self.hold_seconds = hold_seconds
@@ -74,6 +78,7 @@ class HedgeVolumeEngine:
         self.funding_cycle_seconds = funding_cycle_seconds
         self.next_funding_timestamp = next_funding_timestamp
         self.max_acceptable_loss_pct = max_acceptable_loss_pct
+        self.max_wash_pct_per_call = max_wash_pct_per_call
         self.loss_tracker: Dict[str, float] = {}
 
     def _select_notional(self) -> float:
@@ -84,7 +89,9 @@ class HedgeVolumeEngine:
         if not snapshot or "wash" not in snapshot:
             return False
         available = snapshot["wash"].get("available", 0.0)
-        return notional <= available * self.wash_usage_cap_pct
+        allowed = available * self.wash_usage_cap_pct
+        allowed = min(allowed, available)
+        return notional <= allowed
 
     def _check_loss_limit(self, ex: str, pnl: float) -> bool:
         self.loss_tracker.setdefault(ex, 0.0)
@@ -182,7 +189,37 @@ class HedgeVolumeEngine:
             return False, "盘口深度不足"
         if slip > self.slippage_bps_limit:
             return False, "预估滑点超阈值"
-        if expected_pnl < -abs(self.max_acceptable_loss_pct) * notional:
+
+        expected_edge_bps = expected_pnl / max(notional, 1e-9) * 10_000
+        expected_loss_bps = max(0.0, -expected_edge_bps)
+
+        if self.risk_manager:
+            vol = abs(long_quote.mid - short_quote.mid) / max((long_quote.mid + short_quote.mid) / 2, 1e-9)
+            approved, reason, final_score, safety_score, volume_score = self.risk_manager.evaluate_plan(
+                notional=notional,
+                expected_edge_bps=expected_edge_bps,
+                expected_loss_bps=expected_loss_bps,
+                volatility=vol,
+                latency_ms=0.0,
+                slippage_bps=abs(slip),
+                volume_contrib=notional * 2,
+            )
+            if not approved:
+                logger.warning(
+                    "刷量因风险评分拒绝(%s)：score=%.1f safe=%.1f vol=%.1f",
+                    reason,
+                    final_score,
+                    safety_score,
+                    volume_score,
+                )
+                return False, reason
+
+        loss_floor_pct = abs(self.max_acceptable_loss_pct)
+        if self.risk_manager:
+            preset = self.risk_manager.risk_mode_presets.get(self.risk_manager.risk_mode, {})
+            loss_floor_pct = max(loss_floor_pct, preset.get("max_acceptable_loss_bps", 0.0) / 10_000)
+
+        if expected_pnl < -loss_floor_pct * notional:
             return False, "预期亏损超出容忍度"
 
         logger.info(
@@ -215,6 +252,11 @@ class HedgeVolumeEngine:
         if not self._within_wash_cap(long_exchange, notional) or not self._within_wash_cap(short_exchange, notional):
             return HedgeVolumeResult(status="blocked", reason="名义金额超过 wash 可用占比")
 
+        wash_snapshot = self.orchestrator.current_snapshot().get(long_exchange, {}).get("wash", {})
+        available = wash_snapshot.get("available", 0.0)
+        if available > 0 and notional > available * self.max_wash_pct_per_call:
+            return HedgeVolumeResult(status="blocked", reason="单次名义金额超过 wash 池上限")
+
         ok_long = self.orchestrator.reserve_for_wash(long_exchange, notional)
         ok_short = self.orchestrator.reserve_for_wash(short_exchange, notional)
         if not ok_long or not ok_short:
@@ -223,6 +265,14 @@ class HedgeVolumeEngine:
             if ok_short:
                 self.orchestrator.release((short_exchange, notional, "wash"))
             return HedgeVolumeResult(status="blocked", reason="wash 资金不足")
+
+        inflight_notional = notional * 2
+        if self.risk_manager:
+            ok, reason = self.risk_manager.register_in_flight(inflight_notional)
+            if not ok:
+                self.orchestrator.release((long_exchange, notional, "wash"))
+                self.orchestrator.release((short_exchange, notional, "wash"))
+                return HedgeVolumeResult(status="blocked", reason=reason)
 
         reservation = CapitalReservation(
             approved=True,
@@ -274,6 +324,8 @@ class HedgeVolumeEngine:
             # 回传到资金总控用于统计
             self.orchestrator.record_volume_result(long_exchange, volume, fee, pnl)
             self.orchestrator.record_volume_result(short_exchange, volume, fee, pnl)
+            if self.risk_manager:
+                self.risk_manager.record_volume(volume)
 
             if not self._check_loss_limit(long_exchange, pnl) or not self._check_loss_limit(short_exchange, pnl):
                 return HedgeVolumeResult(status="blocked", reason="单所刷量亏损超限", fee=fee, pnl=pnl, volume=volume)
@@ -290,6 +342,8 @@ class HedgeVolumeEngine:
             )
         finally:
             self.orchestrator.release(reservation)
+            if self.risk_manager:
+                self.risk_manager.release_in_flight(inflight_notional)
 
     async def _open_both(
         self,

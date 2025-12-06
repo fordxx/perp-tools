@@ -89,10 +89,19 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         freeze_window_seconds=cfg.freeze_window_seconds,
         max_trade_risk_pct=cfg.max_risk_pct,
         daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+        daily_loss_limit=cfg.daily_loss_limit,
         max_slippage_bps=cfg.max_slippage_bps,
         order_fill_timeout_seconds=cfg.order_fill_timeout_seconds,
         circuit_breaker_failures=cfg.circuit_breaker_failures,
         balance_concentration_pct=cfg.balance_concentration_pct,
+        enabled=cfg.risk_enabled,
+        risk_mode=cfg.risk_mode,
+        risk_mode_presets=cfg.risk_mode_presets,
+        manual_override_minutes=cfg.manual_override_minutes,
+        manual_override_trades=cfg.manual_override_trades,
+        daily_volume_target=cfg.daily_volume_target,
+        max_notional_per_trade=cfg.max_notional_per_trade,
+        max_total_notional_in_flight=cfg.max_total_notional_in_flight,
     )
     positions = []
     for ex in exchanges:
