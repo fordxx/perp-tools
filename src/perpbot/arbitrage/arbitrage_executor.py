@@ -26,7 +26,7 @@ class ExecutionResult:
 
 
 class ArbitrageExecutor:
-    """Execute two-sided arbitrage opportunities with risk controls and hedging."""
+    """执行双边套利机会，内置风控与对冲。"""
 
     def __init__(
         self,
@@ -52,30 +52,30 @@ class ArbitrageExecutor:
         buy_ex = self.exchanges.get(opportunity.buy_exchange)
         sell_ex = self.exchanges.get(opportunity.sell_exchange)
         if not buy_ex or not sell_ex:
-            msg = "Missing exchange client for opportunity"
+            msg = "缺少对应的交易所客户端"
             logger.error("%s %s/%s", msg, opportunity.buy_exchange, opportunity.sell_exchange)
             return ExecutionResult(opportunity, status="failed", error=msg)
 
         if self.risk_manager and (
             self.risk_manager.exchange_blocked(buy_ex.name) or self.risk_manager.exchange_blocked(sell_ex.name)
         ):
-            msg = "Exchange temporarily disabled due to failures"
+            msg = "交易所因连续失败被暂时熔断"
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
         if getattr(buy_ex, "venue_type", "dex") != "dex" or getattr(sell_ex, "venue_type", "dex") != "dex":
-            msg = "CEX venues cannot be used for arbitrage execution"
+            msg = "中心化交易所只能做参考定价，不能用于套利执行"
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
         if (buy_ex.name, sell_ex.name) not in DEX_ONLY_PAIRS:
-            msg = "Arbitrage pair not permitted"
+            msg = "该套利组合不在允许列表"
             logger.warning("%s: %s -> %s", msg, buy_ex.name, sell_ex.name)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
         notional = opportunity.buy_price * opportunity.size
         if not self.guard.allow_trade(notional):
-            msg = "Trade blocked by position guard"
+            msg = "仓位保护阻止了本次下单"
             logger.warning("%s: notional %.4f exceeds %s%% of equity", msg, notional, self.guard.max_risk_pct * 100)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
@@ -90,8 +90,8 @@ class ArbitrageExecutor:
                 quotes=quotes,
             )
             if not allowed:
-                msg = reason or "Blocked by risk manager"
-                logger.warning("Arbitrage blocked: %s", msg)
+                msg = reason or "被风控拦截"
+                logger.warning("套利被拦截: %s", msg)
                 return ExecutionResult(opportunity, status="blocked", error=msg)
             balances = {}
             for ex in (buy_ex, sell_ex):
@@ -99,7 +99,7 @@ class ArbitrageExecutor:
                     bal = sum(b.free for b in ex.get_account_balances())
                     balances[ex.name] = bal
                 except Exception:
-                    logger.debug("Balance fetch failed for %s", ex.name)
+                    logger.debug("获取余额失败: %s", ex.name)
             self.risk_manager.evaluate_balances(balances)
 
         buy_order = None
@@ -114,13 +114,13 @@ class ArbitrageExecutor:
         )
         expected_profit = calculate_real_profit(opportunity, notional, profit_ctx)
         if expected_profit.net_profit_abs <= 0:
-            msg = "Arbitrage no longer profitable"
+            msg = "套利不再有正收益"
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
         try:
             chunks = list(chunk_order_sizes(opportunity.size, opportunity.buy_price))
             logger.info(
-                "Executing arbitrage: %s chunks across %s -> %s (expected net %.4f%%)",
+                "执行套利: %s 笔拆单 %s -> %s (预期净收益 %.4f%%)",
                 len(chunks),
                 opportunity.buy_exchange,
                 opportunity.sell_exchange,
@@ -147,7 +147,7 @@ class ArbitrageExecutor:
                     ok_buy, reason_buy = self.risk_manager.check_slippage(opportunity.buy_price, latest_buy.ask)
                     ok_sell, reason_sell = self.risk_manager.check_slippage(opportunity.sell_price, latest_sell.bid)
                     if not (ok_buy and ok_sell):
-                        msg = reason_buy or reason_sell or "Slippage check failed"
+                        msg = reason_buy or reason_sell or "滑点校验未通过"
                         logger.warning(msg)
                         return ExecutionResult(opportunity, status="blocked", error=msg)
 
@@ -157,7 +157,7 @@ class ArbitrageExecutor:
                 filled = self._wait_for_fill(buy_ex, buy_order, opportunity.symbol)
                 filled &= self._wait_for_fill(sell_ex, sell_order, opportunity.symbol)
                 if not filled:
-                    logger.warning("Partial fill detected; hedging exposure")
+                    logger.warning("出现部分成交，启动对冲保护")
                     self._hedge_incomplete_legs(opportunity, buy_ex, sell_ex, buy_order, sell_order)
                     raise RuntimeError("Partial fill hedge executed")
 
@@ -173,7 +173,7 @@ class ArbitrageExecutor:
                 sell_order_id=sell_order.id,
             )
         except Exception as exc:  # pragma: no cover - runtime protection
-            logger.exception("Arbitrage leg failed: %s", exc)
+            logger.exception("套利腿执行失败: %s", exc)
             self._hedge_incomplete_legs(opportunity, buy_ex, sell_ex, buy_order, sell_order)
             self.guard.mark_failure()
             if self.risk_manager:
@@ -192,21 +192,21 @@ class ArbitrageExecutor:
         buy_order,
         sell_order,
     ) -> None:
-        """Neutralize open exposure when one leg fails."""
+        """在任意一腿失败时中和持仓敞口。"""
 
         fallback_ex = next(
             (ex for ex in self.exchanges.values() if ex.name not in {buy_ex.name, sell_ex.name} and getattr(ex, "venue_type", "dex") == "dex"),
             None,
         )
 
-        # If buy succeeded but sell failed, offset on buy venue
+        # 如果买腿成功但卖腿失败，在买入交易所对冲
         if buy_order and not sell_order:
-            logger.warning("Hedging buy leg on %s after sell failure", buy_ex.name)
+            logger.warning("卖腿失败，在 %s 对买腿做对冲", buy_ex.name)
             hedger = fallback_ex or buy_ex
             self._flatten_leg(hedger, buy_order, opportunity.symbol)
-        # If sell succeeded but buy failed, offset on sell venue
+        # 如果卖腿成功但买腿失败，在卖出交易所对冲
         elif sell_order and not buy_order:
-            logger.warning("Hedging sell leg on %s after buy failure", sell_ex.name)
+            logger.warning("买腿失败，在 %s 对卖腿做对冲", sell_ex.name)
             hedger = fallback_ex or sell_ex
             self._flatten_leg(hedger, sell_order, opportunity.symbol)
 
@@ -216,9 +216,9 @@ class ArbitrageExecutor:
             close_price = latest.ask if order.side == "buy" else latest.bid
             position = Position(id=f"hedge-{order.id}", order=order, target_profit_pct=0.0)
             ex.place_close_order(position, close_price)
-            logger.info("Submitted hedge close on %s for %s", ex.name, order.id)
+            logger.info("已在 %s 提交对冲平仓，来源订单 %s", ex.name, order.id)
         except Exception as hedge_exc:  # pragma: no cover - safety net
-            logger.error("Failed to hedge incomplete leg on %s: %s", ex.name, hedge_exc)
+            logger.error("在 %s 对冲未完成腿失败: %s", ex.name, hedge_exc)
 
     def _wait_for_fill(self, ex: ExchangeClient, order, symbol: str) -> bool:
         timeout = getattr(self.risk_manager, "order_fill_timeout_seconds", 5) if self.risk_manager else 5

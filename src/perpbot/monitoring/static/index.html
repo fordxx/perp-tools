@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PerpBot Arbitrage Console</title>
+    <title>PerpBot 套利控制台</title>
     <style>
       body {
         font-family: Arial, sans-serif;
@@ -152,105 +152,105 @@
   </head>
   <body>
     <header>
-      <h1>PerpBot Web Arbitrage Console</h1>
+      <h1>PerpBot Web 套利控制台</h1>
       <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
-        <span id="socketStatus" class="pill warning">WS: connecting</span>
-        <div id="statusBar" class="muted">Loading...</div>
+        <span id="socketStatus" class="pill warning">WS：连接中</span>
+        <div id="statusBar" class="muted">加载中...</div>
       </div>
     </header>
     <div class="container">
       <div class="cards">
         <div class="card">
-          <h2>Controls</h2>
+          <h2>控制</h2>
           <div style="margin-bottom: 8px">
-            <button id="startBtn">Start</button>
-            <button id="pauseBtn" class="secondary">Pause</button>
+            <button id="startBtn">启动</button>
+            <button id="pauseBtn" class="secondary">暂停</button>
           </div>
           <div>
-            <label for="profitInput">Min Profit Threshold (%)</label><br />
+            <label for="profitInput">最小利润阈值（%）</label><br />
             <input id="profitInput" type="number" step="0.01" min="0" />
-            <button id="updateThreshold">Update</button>
+            <button id="updateThreshold">更新</button>
           </div>
         </div>
         <div class="card">
-          <h2>Account</h2>
-          <div>Equity: <span id="equity">-</span></div>
-          <div>PNL: <span id="pnl">-</span></div>
-          <div>Last Cycle: <span id="lastCycle" class="muted">-</span></div>
+          <h2>账户</h2>
+          <div>净值：<span id="equity">-</span></div>
+          <div>盈亏：<span id="pnl">-</span></div>
+          <div>上次循环：<span id="lastCycle" class="muted">-</span></div>
         </div>
         <div class="card">
-          <h2>Arbitrage</h2>
+          <h2>套利</h2>
           <div style="display: flex; justify-content: space-between; align-items: center">
             <div>
-              <div>Opportunities: <span id="arbCount">0</span></div>
-              <div class="muted">DEX-only execution</div>
+              <div>机会数量：<span id="arbCount">0</span></div>
+              <div class="muted">仅 DEX 执行</div>
             </div>
             <div>
-              <div>Threshold: <span id="thresholdDisplay">-</span></div>
-              <div class="muted">Confidence-weighted</div>
+              <div>阈值：<span id="thresholdDisplay">-</span></div>
+              <div class="muted">包含置信度加权</div>
             </div>
           </div>
         </div>
         <div class="card">
-          <h2>Trade Stats</h2>
-          <div class="subtitle">Real-time success metrics</div>
+          <h2>交易统计</h2>
+          <div class="subtitle">实时成交表现</div>
           <div class="metric" id="successRate">-</div>
-          <div class="muted-small">Avg Profit: <span id="avgProfit">-</span></div>
+          <div class="muted-small">平均利润：<span id="avgProfit">-</span></div>
         </div>
       </div>
 
       <div class="row" style="margin-top: 14px">
         <div class="card">
-          <h2>Real-Time Quotes</h2>
+          <h2>实时行情</h2>
           <table id="quotesTable">
             <thead>
               <tr>
-                <th>Exchange</th>
-                <th>Symbol</th>
-                <th>Bid</th>
-                <th>Ask</th>
+                <th>交易所</th>
+                <th>交易对</th>
+                <th>买价</th>
+                <th>卖价</th>
               </tr>
             </thead>
             <tbody></tbody>
           </table>
         </div>
         <div class="card">
-          <h2>Equity / PnL</h2>
+          <h2>净值 / 盈亏</h2>
           <canvas id="pnlChart" height="140"></canvas>
-          <div class="muted" style="margin-top: 6px">Last 500 points</div>
+          <div class="muted" style="margin-top: 6px">最近 500 个采样点</div>
         </div>
       </div>
 
       <div class="row" style="margin-top: 14px">
         <div class="card">
-          <h2>Arbitrage Opportunities</h2>
+          <h2>套利机会</h2>
           <table id="arbTable">
             <thead>
               <tr>
-                <th>Symbol</th>
-                <th>Buy @</th>
-                <th>Sell @</th>
-                <th>Size</th>
-                <th>Net %</th>
-                <th>Exp. PnL</th>
-                <th>Confidence</th>
-                <th>Priority</th>
+                <th>交易对</th>
+                <th>买入</th>
+                <th>卖出</th>
+                <th>数量</th>
+                <th>净收益%</th>
+                <th>预期收益</th>
+                <th>置信度</th>
+                <th>优先级</th>
               </tr>
             </thead>
             <tbody></tbody>
           </table>
         </div>
         <div class="card">
-          <h2>Positions</h2>
+          <h2>持仓</h2>
           <table id="positionsTable">
             <thead>
               <tr>
-                <th>Exchange</th>
-                <th>Symbol</th>
-                <th>Side</th>
-                <th>Size</th>
-                <th>Entry</th>
-                <th>Opened</th>
+                <th>交易所</th>
+                <th>交易对</th>
+                <th>方向</th>
+                <th>数量</th>
+                <th>开仓价</th>
+                <th>开仓时间</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -259,17 +259,17 @@
       </div>
       <div class="split" style="margin-top: 14px">
         <div class="card">
-          <h2>Alert History</h2>
-          <div class="subtitle">Triggered price alerts</div>
+          <h2>提醒历史</h2>
+          <div class="subtitle">已触发的价格提醒</div>
           <div class="scrollable">
             <table id="alertTable">
               <thead>
                 <tr>
-                  <th>Time</th>
-                  <th>Symbol</th>
-                  <th>Condition</th>
-                  <th>Price</th>
-                  <th>Status</th>
+                  <th>时间</th>
+                  <th>交易对</th>
+                  <th>条件</th>
+                  <th>价格</th>
+                  <th>状态</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -277,8 +277,8 @@
           </div>
         </div>
         <div class="card">
-          <h2>Recent Alerts</h2>
-          <div class="subtitle">Latest notifications</div>
+          <h2>最新提醒</h2>
+          <div class="subtitle">最近的通知记录</div>
           <ul id="alertList" style="list-style: none; padding: 0; margin: 0"></ul>
         </div>
       </div>
@@ -469,13 +469,13 @@
       }
 
       async function refresh() {
-        if (socketLive) return; // websocket pushing
+        if (socketLive) return; // WebSocket 推送时跳过轮询
         try {
           const data = await fetchJSON("/api/overview");
           handleData(data);
         } catch (err) {
           console.error(err);
-          document.getElementById("statusBar").textContent = `Error: ${err.message}`;
+          document.getElementById("statusBar").textContent = `错误: ${err.message}`;
         }
       }
 
@@ -485,7 +485,7 @@
         const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
         ws.onopen = () => {
           socketLive = true;
-          status.textContent = "WS: live";
+          status.textContent = "WS：已连接";
           status.className = "pill success";
         };
         ws.onmessage = (event) => {
@@ -493,12 +493,12 @@
             const data = JSON.parse(event.data);
             handleData(data);
           } catch (err) {
-            console.error("WS parse error", err);
+            console.error("WS 解析失败", err);
           }
         };
         ws.onclose = () => {
           socketLive = false;
-          status.textContent = "WS: reconnecting";
+          status.textContent = "WS：重新连接";
           status.className = "pill warning";
           setTimeout(connectSocket, 2000);
         };

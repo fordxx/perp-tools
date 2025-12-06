@@ -9,7 +9,7 @@ from perpbot.models import ArbitrageOpportunity, ExchangeCost, ProfitResult
 
 @dataclass
 class ProfitContext:
-    """Helper container for cost lookups while pricing opportunities."""
+    """在计算套利机会时统一提供成本查询的辅助容器。"""
 
     buy_cost: ExchangeCost
     sell_cost: ExchangeCost
@@ -17,11 +17,9 @@ class ProfitContext:
 
 
 def estimate_slippage_pct(notional_usd: float) -> float:
-    """Return a conservative slippage estimate based on notional size.
+    """按名义金额给出保守的滑点估计。
 
-    The ranges are pessimistic to avoid overestimating fill quality and are
-    applied per leg. Larger notionals return the upper bound of the configured
-    range to encourage order splitting.
+    采用偏保守的区间以避免高估成交质量，并对每条腿分别应用；大额订单直接取区间上限，鼓励拆单执行。
     """
 
     if notional_usd < 1000:
@@ -32,7 +30,7 @@ def estimate_slippage_pct(notional_usd: float) -> float:
 
 
 def chunk_order_sizes(total_size: float, price: float, max_notional: float = 5000) -> Iterable[float]:
-    """Split large orders into multiple tranches capped by notional value."""
+    """将大额订单按名义金额上限拆成多笔。"""
 
     if price <= 0:
         return [total_size]
@@ -51,7 +49,7 @@ def calculate_real_profit(
     amount: float,
     ctx: ProfitContext,
 ) -> ProfitResult:
-    """Compute net profit with fees, slippage, funding, and failure probability."""
+    """综合手续费、滑点、资金费率与失败概率计算净利润。"""
 
     gross_spread_pct = (opportunity.sell_price - opportunity.buy_price) / opportunity.buy_price
     fees_pct = (ctx.buy_cost.taker_fee_bps + ctx.sell_cost.taker_fee_bps) / 10_000

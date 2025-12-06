@@ -57,7 +57,7 @@ class OKXClient(ExchangeClient):
         logger.info("Initialized OKX client (testnet=%s)", self.use_testnet)
         self._start_private_ws()
 
-    # Signing helpers
+    # 签名辅助方法
     def _timestamp(self) -> str:
         return str(time.time())
 
@@ -138,7 +138,7 @@ class OKXClient(ExchangeClient):
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
         raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
-    # WebSocket
+    # WebSocket 连接
     def _start_private_ws(self) -> None:
         if not all([self.api_key, self.api_secret, self.passphrase]):
             raise RuntimeError("Client not connected")

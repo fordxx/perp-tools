@@ -25,11 +25,11 @@ console = Console()
 
 
 def render_quotes(state: TradingState) -> None:
-    table = Table(title="Latest Quotes")
-    table.add_column("Exchange")
-    table.add_column("Symbol")
-    table.add_column("Bid")
-    table.add_column("Ask")
+    table = Table(title="最新行情")
+    table.add_column("交易所")
+    table.add_column("交易对")
+    table.add_column("买价")
+    table.add_column("卖价")
     for quote in state.quotes.values():
         table.add_row(quote.exchange, quote.symbol, f"{quote.bid:.2f}", f"{quote.ask:.2f}")
     console.print(table)
@@ -37,15 +37,15 @@ def render_quotes(state: TradingState) -> None:
 
 def render_arbitrage(state: TradingState) -> None:
     if not state.recent_arbitrage:
-        console.print("[yellow]No arbitrage edges above threshold[/yellow]")
+        console.print("[yellow]暂无达到阈值的套利机会[/yellow]")
         return
-    table = Table(title="Cross-exchange edges")
-    table.add_column("Symbol")
-    table.add_column("Buy @")
-    table.add_column("Sell @")
-    table.add_column("Size")
-    table.add_column("Net %")
-    table.add_column("Exp. PnL")
+    table = Table(title="跨所套利价差")
+    table.add_column("交易对")
+    table.add_column("买入所")
+    table.add_column("卖出所")
+    table.add_column("数量")
+    table.add_column("净收益率")
+    table.add_column("预期收益")
     for op in state.recent_arbitrage:
         table.add_row(
             op.symbol,
@@ -92,7 +92,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             positions.extend(ex_positions)
             guard.update_equity_from_positions(ex_positions)
         except Exception:
-            # Non-fatal in case an exchange does not support the query
+            # 某些交易所不支持该查询时忽略即可
             pass
     state.account_positions = positions
     executor = ArbitrageExecutor(
@@ -110,13 +110,13 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     state.pnl = risk_manager.last_equity - cfg.assumed_equity
     state.last_cycle_at = datetime.utcnow()
     if risk_manager.trading_halted:
-        console.print(f"[red]Trading halted: {risk_manager.halt_reason}[/red]")
+        console.print(f"[red]交易已停止: {risk_manager.halt_reason}[/red]")
         return
     if risk_manager.is_frozen():
-        console.print(f"[yellow]Market temporarily frozen: {risk_manager.freeze_reason()}[/yellow]")
+        console.print(f"[yellow]行情暂时冻结: {risk_manager.freeze_reason()}[/yellow]")
         return
 
-    # Auto alerts and monitoring
+    # 自动触发提醒与监控
     process_alerts(
         state,
         cfg.alerts,
@@ -127,7 +127,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         alert_recorder=alert_recorder.record,
     )
 
-    # Discover arbitrage
+    # 扫描套利机会
     opportunities = find_arbitrage_opportunities(
         state.quotes.values(),
         cfg.arbitrage_trade_size,
@@ -150,7 +150,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     )
     state.recent_arbitrage = opportunities
 
-    # Execute opportunities with hedging and risk controls
+    # 执行套利并启用对冲与风控
     for op in opportunities:
         positions = risk_manager.collect_positions(exchanges)
         allowed, reason = risk_manager.can_trade(
@@ -162,28 +162,28 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             quotes=state.quotes.values(),
         )
         if not allowed:
-            console.print(f"[yellow]Skipping arbitrage: {reason or 'risk block'}[/yellow]")
+            console.print(f"[yellow]跳过套利: {reason or '风险拦截'}[/yellow]")
             continue
 
         result = executor.execute(op, positions=positions, quotes=state.quotes.values())
         if result.status == "filled":
             console.print(
-                f"[green]Executed arbitrage {op.symbol}: buy {op.buy_exchange} / sell {op.sell_exchange}[/green]"
+                f"[green]完成套利 {op.symbol}: 买入 {op.buy_exchange} / 卖出 {op.sell_exchange}[/green]"
             )
         elif result.status == "blocked":
-            console.print(f"[yellow]Skipped arbitrage due to risk guard: {result.error}[/yellow]")
+            console.print(f"[yellow]因风控跳过套利: {result.error}[/yellow]")
         else:
-            console.print(f"[red]Arbitrage execution failed: {result.error}[/red]")
+            console.print(f"[red]套利执行失败: {result.error}[/red]")
 
-    # Fire strategy using a lightweight momentum signal derived from spread
+    # 使用简易动量信号触发策略
     for quote in state.quotes.values():
         spread_signal = (quote.ask - quote.bid) / quote.mid
         strategy.maybe_trade(state, next(ex for ex in exchanges if ex.name == quote.exchange), spread_signal, quote, cfg.position_size)
 
-    # Auto close profitable positions
+    # 自动平掉已达标的持仓
     closed = strategy.evaluate_positions(state, state.quotes.values(), exchanges)
     if closed:
-        console.print(f"[green]Closed {len(closed)} positions at target[/green]")
+        console.print(f"[green]已按目标平仓 {len(closed)} 笔仓位[/green]")
 
     render_quotes(state)
     render_arbitrage(state)
@@ -192,10 +192,10 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Modular multi-exchange trading bot")
-    parser.add_argument("command", choices=["cycle", "serve"], help="Action to perform")
-    parser.add_argument("--config", default="config.example.yaml", help="Path to YAML config")
-    parser.add_argument("--port", type=int, default=8000, help="Dashboard port for serve mode")
+    parser = argparse.ArgumentParser(description="多交易所模块化交易机器人")
+    parser.add_argument("command", choices=["cycle", "serve"], help="执行模式（cycle=单次循环，serve=启动控制台）")
+    parser.add_argument("--config", default="config.example.yaml", help="YAML 配置文件路径")
+    parser.add_argument("--port", type=int, default=8000, help="serve 模式下的控制台端口")
     args = parser.parse_args()
 
     cfg = load_config(args.config)

@@ -164,7 +164,7 @@ class ArbitrageOpportunity:
             "reliability": reliability_weight,
         }
         pct_component = max(0.0, min(1.0, self.net_profit_pct * 100 / 5)) * _weights.get("profit_pct", 0)
-        # Normalize absolute profit relative to a $10k notional band for scoring purposes
+        # 将绝对利润按照 1 万美元的名义区间归一化，用于评分
         abs_component = max(0.0, min(1.0, self.expected_pnl / 10_000)) * _weights.get("profit_abs", 0)
         liq_component = max(0.0, min(1.0, self.liquidity_score / 100)) * _weights.get("liquidity", 0)
         rel_component = max(0.0, min(1.0, self.reliability_score / 100)) * _weights.get("reliability", 0)

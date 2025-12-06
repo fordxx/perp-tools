@@ -51,7 +51,7 @@ class BinanceClient(ExchangeClient):
         logger.info("Initialized Binance client (testnet=%s)", self.use_testnet)
         self._start_user_stream()
 
-    # REST helpers
+    # REST 辅助方法
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> httpx.Response:
         if not self._client or not self.api_secret:
             raise RuntimeError("Client not connected")

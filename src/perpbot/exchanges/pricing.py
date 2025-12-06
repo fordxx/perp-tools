@@ -31,7 +31,7 @@ async def fetch_price_with_semaphore(ex, symbol: str, sem: asyncio.Semaphore, mo
         if monitor:
             monitor.update(quote)
         try:
-            # Also fetch orderbook concurrently inside executor
+            # 在执行端并发抓取盘口
             book = await loop.run_in_executor(None, ex.get_orderbook, symbol)
             quote.order_book = book
         except Exception:

@@ -1,4 +1,4 @@
-# Sample configuration for the modular multi-exchange trading bot
+# 多交易所套利机器人的示例配置
 symbols:
   - BTC/USDT
   - ETH/USDT

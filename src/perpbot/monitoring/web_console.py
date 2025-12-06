@@ -169,7 +169,7 @@ class TradingService:
             self.state.last_cycle_at = datetime.utcnow()
             self.state.status = "running" if self.state.trading_enabled else "paused"
 
-            # Surface arbitrage opportunities for the UI regardless of toggle
+            # 即便暂停交易也向前端展示套利机会
             opportunities = find_arbitrage_opportunities(
                 self.state.quotes.values(),
                 self.cfg.arbitrage_trade_size,

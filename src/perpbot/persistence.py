@@ -137,7 +137,7 @@ class TradeRecorder:
                     "avg_profit": avg_profit,
                 }
 
-        # CSV fallback reads all rows
+        # CSV 回退模式会读取全部行
         if not os.path.exists(self.path):
             return {"success_rate": 0.0, "avg_profit": 0.0}
         with open(self.path, "r", encoding="utf-8") as f:

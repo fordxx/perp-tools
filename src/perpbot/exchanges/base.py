@@ -92,10 +92,10 @@ class ExchangeClient(ABC):
         ...
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        """Optional hook for streaming position updates."""
+        """用于订阅持仓推送的可选钩子。"""
         self._position_handler = handler  # type: ignore[attr-defined]
 
-    # Backward-compatible helpers
+    # 兼容旧接口的便捷方法
     def fetch_price(self, symbol: str) -> PriceQuote:
         return self.get_current_price(symbol)
 
@@ -107,11 +107,9 @@ class ExchangeClient(ABC):
 
 
 class RESTWebSocketExchangeClient(ExchangeClient):
-    """Generic REST + WebSocket exchange client template.
+    """通用的 REST + WebSocket 交易所客户端模板。
 
-    Concrete venues should inherit and override endpoints or signing logic as
-    required by their APIs. This class centralises consistent logging,
-    credential loading, and graceful retries.
+    具体交易所继承后可根据其 API 重写路径或签名逻辑。本类统一了日志、凭据加载与重试策略。
     """
 
     ticker_endpoint: str = "/api/v1/market/ticker"

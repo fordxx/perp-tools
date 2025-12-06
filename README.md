@@ -1,87 +1,87 @@
-# PerpBot - Multi-Exchange Modular Trading Bot
+# PerpBot - 多交易所模块化自动套利机器人
 
-This project bootstraps a modular automated trading bot that supports multiple exchanges (EdgeX, Backpack, Paradex, Aster, GRVT, Extended, OKX, and Binance). It provides modular real exchange connectors, automatic take-profit execution, alerting, and cross-exchange arbitrage discovery alongside a minimal monitoring API.
+本项目提供一个可扩展的自动交易与套利框架，覆盖 EdgeX、Backpack、Paradex、Aster、GRVT、Extended、OKX、Binance 等多家交易所。框架支持真实 REST/WebSocket 连接、自动止盈、跨所套利、报警通知以及简洁的 Web 控制台，方便快速落地多交易所策略。
 
-## Features
+## 功能亮点
 
-- **Modular exchange layer** with stub clients for all requested venues.
-- **Take-profit strategy** that opens positions and auto-closes after reaching a configurable profit threshold.
-- **Arbitrage scanner and executor** that discovers cross-exchange price edges, enforces risk limits, and fires two-sided orders with automatic hedging.
-- **Dynamic profit gating** that adjusts the minimum profit floor using recent spread volatility and scores opportunities by profitability, liquidity, and venue reliability before execution.
-- **Concurrent pricing** with shared WebSocket price cache and asyncio-gather REST fallbacks, plus per-exchange rate limiting to avoid throttling.
-- **Trade recording and analytics hooks** that persist every arbitrage attempt to CSV/SQLite for later reliability scoring and dashboarding.
-- **Smart alerts** with flexible conditions (breakouts, ranges, percent changes, spreads, volatility) that can notify across Telegram/Lark/webhooks/console/audio, auto-start trading, or fire venue-agnostic auto-orders with full history logging.
-- **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel with priority/confidence scores, real-time position view, equity/PnL curve, alert history, and controls to start/pause arbitrage or retune the minimum profit threshold. WebSocket pushes keep the UI live without refreshes.
-- **Config-driven setup** via `config.example.yaml`.
+- **模块化交易所层**：为所有交易所提供统一接口，方便按需接入。
+- **自动止盈策略**：开仓后按配置的收益阈值自动平仓。
+- **套利扫描与执行**：跨所发现价差，叠加风控后触发双边下单并自动对冲。
+- **动态利润门槛**：结合近期价差波动动态调整最小收益，并基于收益、流动性与交易所可靠性评分排序。
+- **并发行情获取**：共享 WebSocket 价格缓存，REST 作为回退，并按交易所限流保护。
+- **交易记录与分析钩子**：每次套利尝试都会落盘（CSV/SQLite），便于回溯和统计。
+- **智能提醒**：支持突破、区间、百分比、价差、波动率等条件，可推送到 Telegram/Lark/Webhook/控制台/音频，支持自动启动交易或自动下单，并完整记录历史。
+- **FastAPI Web 控制台**：实时展示 BTC/ETH 跨所报价、套利机会（含优先级评分与置信度）、仓位、资产曲线、提醒历史，可一键启停套利或在线调整利润阈值，WebSocket 实时推送免刷新。
+- **配置驱动**：通过 `config.example.yaml` 快速调整策略与风控参数。
 
-## Project Layout
+## 目录结构
 
-- `src/perpbot/models.py` — shared domain models for orders, positions, quotes, alerts, and state.
-- `src/perpbot/exchanges/base.py` — unified exchange interface and real clients for each venue.
-- `src/perpbot/strategy/take_profit.py` — take-profit trading loop and position lifecycle.
-- `src/perpbot/arbitrage/scanner.py` — cross-exchange arbitrage detector with depth-aware, cost-adjusted signal generation.
-- `src/perpbot/arbitrage/arbitrage_executor.py` — two-sided arbitrage executor with hedging when a leg fails.
-- `src/perpbot/position_guard.py` — per-trade risk limits and cooldown enforcement.
-- `src/perpbot/risk_manager.py` — portfolio-level guardrails for per-trade caps, drawdown, daily loss, exposure, direction consistency, streak limits, and fast-market freezes.
-- `src/perpbot/monitoring/alerts.py` — rule-based alert evaluation with optional auto-orders.
-- `src/perpbot/monitoring/web_console.py` — FastAPI web console and background trading service.
-- `src/perpbot/monitoring/static/index.html` — lightweight HTML dashboard for real-time control and visibility.
-- `src/perpbot/cli.py` — CLI entrypoint to run a single trading cycle or launch the dashboard server.
+- `src/perpbot/models.py` —— 订单、仓位、报价、提醒、全局状态等共享模型。
+- `src/perpbot/exchanges/base.py` —— 统一的交易所接口及各交易所真实客户端实现。
+- `src/perpbot/strategy/take_profit.py` —— 止盈交易循环与持仓生命周期管理。
+- `src/perpbot/arbitrage/scanner.py` —— 考虑深度与成本的跨所套利信号生成器。
+- `src/perpbot/arbitrage/arbitrage_executor.py` —— 双边套利执行与对冲保护。
+- `src/perpbot/position_guard.py` —— 单笔仓位风险限制与冷却。
+- `src/perpbot/risk_manager.py` —— 账户级风控：单笔上限、回撤、日亏、敞口、方向一致性、连续失败、快市冻结等。
+- `src/perpbot/monitoring/alerts.py` —— 规则化提醒与可选的自动下单。
+- `src/perpbot/monitoring/web_console.py` —— FastAPI Web 控制台与后台交易服务。
+- `src/perpbot/monitoring/static/index.html` —— 轻量化实时控制面板。
+- `src/perpbot/cli.py` —— CLI 入口，可跑单次交易循环或启动控制台服务。
 
-## Getting Started
+## 快速开始
 
-### Project Status
+### 项目状态
 
-This repository ships a working simulation-oriented scaffold: the CLI, monitoring API, arbitrage detector, alerts, and take-profit loop all run end-to-end against the bundled mock exchange connectors. Real REST/WebSocket connectors for Binance USDT-M futures and OKX SWAP are provided and will be used automatically when credentials are present.
+仓库内置完整的模拟与真实连接框架：CLI、监控 API、套利检测、提醒、止盈循环都可端到端运行。Binance USDT-M 与 OKX SWAP 提供真实 REST/WebSocket 连接（有密钥则自动启用，否则退回模拟）。
 
-1. Install dependencies (Python 3.10+ recommended):
+1. 安装依赖（推荐 Python 3.10+）：
 
    ```bash
    pip install -r requirements.txt
    ```
 
-2. Review and adjust settings in `config.example.yaml` (copy to `config.yaml` if desired).
+2. 查看并调整 `config.example.yaml`（需要可复制为 `config.yaml`）。
 
-3. Run a single trading/monitoring cycle to see quotes, cost-adjusted arbitrage edges, and auto-take-profit behavior (set `PYTHONPATH=src` so the package is discoverable):
+3. 运行单次交易/监控循环，查看行情、成本校正后的套利边际以及自动止盈行为（需设置 `PYTHONPATH=src` 以便加载包）：
 
    ```bash
    PYTHONPATH=src python -m perpbot.cli cycle --config config.example.yaml
    ```
 
-4. Launch the web console (defaults to port 8000):
+4. 启动 Web 控制台（默认端口 8000）：
 
    ```bash
    PYTHONPATH=src python -m perpbot.cli serve --config config.example.yaml --port 8000
    ```
 
-   Open `http://localhost:8000/` to view the live BTC/ETH board, arbitrage spreads, open positions, and the rolling equity/PnL curve. Toggle arbitrage on/off with one click or adjust the profit threshold. API endpoints are available under `/api/*` for programmatic control (`/api/overview`, `/api/control/start`, `/api/control/pause`, `/api/control/threshold`, plus `/api/quotes`, `/api/arbitrage`, and `/api/positions`).
+   打开 `http://localhost:8000/` 可查看实时 BTC/ETH 行情、套利价差、持仓与资产曲线，可一键开/停套利并在线调整利润阈值。API 接口位于 `/api/*`（`/api/overview`、`/api/control/start`、`/api/control/pause`、`/api/control/threshold`、`/api/quotes`、`/api/arbitrage`、`/api/positions`）。
 
-### Risk and execution settings
+### 风控与执行配置
 
-`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `daily_loss_limit_pct` (default 8% stop for the UTC day), `max_consecutive_failures` (halts after three misses), `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings (default 0.5% move inside one second) to halt trading during violent moves. `loop_interval_seconds` controls how often the background loop refreshes quotes and evaluates spreads, while `arbitrage_min_profit_pct` can be tuned live from the web console. Dynamic safeguards now cover slippage caps, partial-fill hedging with timeouts, exchange-level circuit breakers, balance concentration warnings, and volatility-driven profit targets (`high_vol_min_profit_pct` vs `low_vol_min_profit_pct`) with priority-score gating.
+`config.example.yaml` 提供 `max_risk_pct`、`assumed_equity`、`risk_cooldown_seconds` 用于限制单笔风险（默认账户 5%）、在无余额时假设的权益以及失败后的冷却。还包含 `max_drawdown_pct`、`daily_loss_limit_pct`（默认单日亏损 8% 即停止）、`max_consecutive_failures`（连续 3 次失败停机）、`max_symbol_exposure_pct`、`enforce_direction_consistency`、冻结阈值（默认 1 秒内 0.5% 变动）等设置。`loop_interval_seconds` 控制后台循环频率，`arbitrage_min_profit_pct` 可在 Web 控制台实时调节；动态利润门槛由 `high_vol_min_profit_pct` 与 `low_vol_min_profit_pct` 配合波动率调整。执行端覆盖滑点上限、部分成交对冲与超时、交易所熔断、余额集中度提醒、以及优先级/置信度评分过滤。
 
-### Alerts & notifications
+### 提醒与通知
 
-Alerts are defined in `alerts` within the YAML config and support price breakouts, ranges, percent changes over a lookback window, cross-symbol spreads, and volatility triggers. Each alert can specify `channels` (console, telegram, lark, webhook, audio), an `action` (`notify`, `start-trading`, or `auto-order`), and per-alert sizing for auto-orders. Global notification credentials live under the `notifications` section, and every fired alert is recorded to `alert_record_path` (CSV or SQLite) for historical analytics.
+在 `alerts` 中定义提醒规则，可选择价格突破、区间、百分比变化（带回溯窗口）、跨品种价差、波动率等条件。每条提醒可配置 `channels`（console、telegram、lark、webhook、audio）、`action`（`notify`、`start-trading` 或 `auto-order`）及自动下单尺寸。全局通知凭据在 `notifications` 下，所有触发都会写入 `alert_record_path`（CSV 或 SQLite）便于后续统计。
 
-### Environment & credentials
+### 环境与凭据
 
-Create a `.env` file with the keys you intend to use. When absent, the bot falls back to simulated connectors.
+在根目录创建 `.env` 并填入所需密钥。缺失密钥时自动使用模拟连接。
 
 ```env
-# Binance USDT-M futures
+# Binance USDT-M 期货
 BINANCE_API_KEY=your_key
 BINANCE_API_SECRET=your_secret
-BINANCE_ENV=testnet  # or "live"
+BINANCE_ENV=testnet  # 或 "live"
 
-# OKX perpetual swaps
+# OKX 永续合约
 OKX_API_KEY=your_key
 OKX_API_SECRET=your_secret
 OKX_PASSPHRASE=your_passphrase
-OKX_ENV=testnet  # or "live"
+OKX_ENV=testnet  # 或 "live"
 ```
 
-### Notes
+### 说明
 
-- Binance and OKX connectors use official REST + WebSocket APIs with error handling and logging. Without credentials the bot runs in simulation mode.
-- Strategy signals are intentionally simple placeholders to illustrate lifecycle; replace with production-grade logic as needed.
+- Binance 与 OKX 客户端采用官方 REST + WebSocket，内置异常处理与日志；无密钥则退回模拟模式。
+- 策略与信号逻辑保持简化，便于二次扩展到生产级策略。

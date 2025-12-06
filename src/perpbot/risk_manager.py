@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class RiskManager:
-    """Portfolio-level risk controls for drawdown, exposure, and anomalies."""
+    """账户层面的风险控制，覆盖回撤、敞口与异常行情。"""
 
     def __init__(
         self,
@@ -60,14 +60,14 @@ class RiskManager:
             try:
                 positions.extend(ex.get_account_positions())
             except Exception as exc:  # pragma: no cover - runtime guard
-                logger.debug("Failed to collect positions from %s: %s", getattr(ex, "name", "unknown"), exc)
+                logger.debug("获取 %s 持仓失败: %s", getattr(ex, "name", "unknown"), exc)
         return positions
 
     def update_equity(self, positions: Sequence[Position], quotes: Optional[Iterable[PriceQuote]] = None) -> float:
         quote_map = {q.symbol: q for q in quotes} if quotes else {}
         now = datetime.utcnow()
         if now.date() != self._daily_anchor_date:
-            # reset daily anchor at UTC midnight to monitor fresh day losses
+            # 每日 UTC 0 点重置基准，用于监控当日亏损
             self._daily_anchor_date = now.date()
             self._daily_anchor_equity = self.last_equity or self.assumed_equity
 
@@ -81,14 +81,14 @@ class RiskManager:
         drawdown = (self.peak_equity - self.last_equity) / self.peak_equity if self.peak_equity else 0.0
         if drawdown >= self.max_drawdown_pct:
             self.trading_halted = True
-            self.halt_reason = f"Max drawdown reached: {drawdown * 100:.2f}%"
+            self.halt_reason = f"触及最大回撤: {drawdown * 100:.2f}%"
             logger.warning(self.halt_reason)
 
         if self.daily_loss_limit_pct and self._daily_anchor_equity:
             daily_loss = (self._daily_anchor_equity - self.last_equity) / self._daily_anchor_equity
             if daily_loss >= self.daily_loss_limit_pct:
                 self.trading_halted = True
-                self.halt_reason = f"Daily loss limit reached: {daily_loss * 100:.2f}%"
+                self.halt_reason = f"触及当日亏损上限: {daily_loss * 100:.2f}%"
                 logger.warning(self.halt_reason)
         return self.last_equity
 
@@ -123,12 +123,12 @@ class RiskManager:
         if self._is_frozen():
             return False, self._freeze_reason
         if self.max_consecutive_failures and self.consecutive_failures >= self.max_consecutive_failures:
-            return False, "Max consecutive failures reached"
+            return False, "连续失败次数已达上限"
 
         equity = max(self.last_equity, self.assumed_equity)
         notional = size * price
         if self.max_trade_risk_pct and equity > 0 and notional > equity * self.max_trade_risk_pct:
-            return False, f"Notional exceeds {self.max_trade_risk_pct * 100:.2f}% trade cap"
+            return False, f"名义金额超过单笔上限 {self.max_trade_risk_pct * 100:.2f}%"
 
         net_size, _ = self._symbol_net_and_exposure(symbol, positions, quotes, price)
         direction = 1 if side == "buy" else -1
@@ -136,10 +136,10 @@ class RiskManager:
         new_exposure = abs(new_net) * price
 
         if self.max_symbol_exposure_pct and equity > 0 and new_exposure > equity * self.max_symbol_exposure_pct:
-            return False, f"Exposure limit exceeded for {symbol}"
+            return False, f"{symbol} 的敞口超过上限"
 
         if self.enforce_direction_consistency and abs(net_size) > 1e-9 and (net_size > 0) != (direction > 0):
-            return False, "Position direction conflict"
+            return False, "持仓方向与下单方向冲突"
 
         return True, None
 
@@ -153,26 +153,26 @@ class RiskManager:
 
     def record_failure(self) -> None:
         self.consecutive_failures += 1
-        logger.warning("Trade failure recorded; streak=%s", self.consecutive_failures)
+        logger.warning("记录一次失败，连续失败=%s", self.consecutive_failures)
         if self.max_consecutive_failures and self.consecutive_failures >= self.max_consecutive_failures:
             self.trading_halted = True
-            self.halt_reason = "Max consecutive failures reached"
+            self.halt_reason = "连续失败次数超限，停止交易"
             logger.error(self.halt_reason)
 
     def record_success(self) -> None:
         if self.consecutive_failures:
-            logger.info("Resetting failure streak after success")
+            logger.info("成功成交，连续失败计数清零")
         self.consecutive_failures = 0
 
     def check_slippage(self, intended_price: float, current_price: float) -> Tuple[bool, Optional[str]]:
         move = abs(current_price - intended_price) / max(intended_price, 1e-9)
         if move * 10_000 > self.max_slippage_bps:
-            return False, f"Slippage {move*100:.3f}% exceeds limit"
+            return False, f"滑点 {move*100:.3f}% 超过上限"
         return True, None
 
     def record_exchange_failure(self, exchange: str) -> None:
         self.exchange_failures[exchange] = self.exchange_failures.get(exchange, 0) + 1
-        logger.warning("Recorded failure for %s (count=%s)", exchange, self.exchange_failures[exchange])
+        logger.warning("记录交易所 %s 失败（累计=%s）", exchange, self.exchange_failures[exchange])
 
     def exchange_blocked(self, exchange: str) -> bool:
         return self.exchange_failures.get(exchange, 0) >= self.circuit_breaker_failures
@@ -185,7 +185,7 @@ class RiskManager:
             return None
         for ex, bal in balances.items():
             if bal / total >= self.balance_concentration_pct:
-                msg = f"Balance concentration on {ex}: {bal/total*100:.2f}%"
+                msg = f"{ex} 余额占比过高: {bal/total*100:.2f}%"
                 logger.warning(msg)
                 return msg
         return None
