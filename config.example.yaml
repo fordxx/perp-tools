@@ -1,0 +1,18 @@
+# Sample configuration for the modular multi-exchange trading bot
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+position_size: 0.1
+profit_target_pct: 0.02
+arbitrage_edge: 0.005
+alerts:
+  - symbol: BTC/USDT
+    direction: above
+    price: 32000
+    action: notify
+  - symbol: ETH/USDT
+    direction: below
+    price: 1800
+    action: auto-order
+    size: 0.5
+    side: buy
