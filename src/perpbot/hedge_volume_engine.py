@@ -47,23 +47,44 @@ class HedgeVolumeEngine:
         orchestrator: CapitalOrchestrator,
         min_notional: float = 300.0,
         max_notional: float = 800.0,
-        hold_seconds: Tuple[int, int] = (10, 60),
+        hold_seconds: Tuple[int, int] = (10, 90),
+        max_hold_seconds: int = 120,
         slippage_bps_limit: float = 30.0,
         time_skew_ms: int = 800,
         loss_limit_pct: float = 0.02,
+        wash_usage_cap_pct: float = 0.1,
+        fee_table: Optional[Dict[str, Dict[str, float]]] = None,
+        funding_blackout_minutes: int = 10,
+        funding_cycle_seconds: int = 8 * 60 * 60,
+        next_funding_timestamp: Optional[float] = None,
+        max_acceptable_loss_pct: float = 0.0001,
     ) -> None:
         self.exchanges = exchanges
         self.orchestrator = orchestrator
         self.min_notional = min_notional
         self.max_notional = max_notional
         self.hold_seconds = hold_seconds
+        self.max_hold_seconds = max_hold_seconds
         self.slippage_bps_limit = slippage_bps_limit
         self.time_skew_ms = time_skew_ms
         self.loss_limit_pct = loss_limit_pct
+        self.wash_usage_cap_pct = wash_usage_cap_pct
+        self.fee_table = fee_table or {}
+        self.funding_blackout_minutes = funding_blackout_minutes
+        self.funding_cycle_seconds = funding_cycle_seconds
+        self.next_funding_timestamp = next_funding_timestamp
+        self.max_acceptable_loss_pct = max_acceptable_loss_pct
         self.loss_tracker: Dict[str, float] = {}
 
     def _select_notional(self) -> float:
         return random.uniform(self.min_notional, self.max_notional)
+
+    def _within_wash_cap(self, exchange: str, notional: float) -> bool:
+        snapshot = self.orchestrator.current_snapshot().get(exchange)
+        if not snapshot or "wash" not in snapshot:
+            return False
+        available = snapshot["wash"].get("available", 0.0)
+        return notional <= available * self.wash_usage_cap_pct
 
     def _check_loss_limit(self, ex: str, pnl: float) -> bool:
         self.loss_tracker.setdefault(ex, 0.0)
@@ -83,54 +104,133 @@ class HedgeVolumeEngine:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, ex.get_orderbook, symbol)
 
+    def _in_funding_blackout(self) -> bool:
+        if not self.next_funding_timestamp:
+            return False
+        now = time.time()
+        window = self.funding_blackout_minutes * 60
+        return abs(self.next_funding_timestamp - now) <= window
+
+    def _estimate_pnl(
+        self, long_quote: PriceQuote, short_quote: PriceQuote, notional: float
+    ) -> Tuple[Optional[float], float, float, float]:
+        # 返回 (滑点bps, 手续费成本, 资金费率成本, 预估Pnl)
+        long_size = notional / long_quote.mid
+        short_size = notional / short_quote.mid
+        long_px = long_quote.executable_price("buy", long_size)
+        short_px = short_quote.executable_price("sell", short_size)
+        if long_px is None or short_px is None:
+            return None, 0.0, 0.0, 0.0
+
+        best_long = long_quote.ask
+        best_short = short_quote.bid
+        slip_bps_long = (long_px - best_long) / best_long * 10_000
+        slip_bps_short = (best_short - short_px) / best_short * 10_000
+        slip_bps = max(slip_bps_long, slip_bps_short, 0.0)
+
+        maker_fee = self.fee_table.get(long_quote.exchange, {}).get("maker", 0.0005)
+        taker_fee = self.fee_table.get(short_quote.exchange, {}).get("taker", 0.0005)
+        fee_cost = notional * (maker_fee + taker_fee)
+
+        # 简化资金费率估算：按双方费率均值乘以名义
+        funding_long = self.fee_table.get(long_quote.exchange, {}).get("funding", 0.0)
+        funding_short = self.fee_table.get(short_quote.exchange, {}).get("funding", 0.0)
+        funding_cost = notional * (funding_long + funding_short) / 2
+
+        gross_spread = (short_px - long_px) * long_size
+        expected_pnl = gross_spread - fee_cost - abs(slip_bps) / 10_000 * notional - funding_cost
+        return slip_bps, fee_cost, funding_cost, expected_pnl
+
+    def _compute_fee(self, notional: float, long_ex: str, short_ex: str) -> float:
+        maker_fee = self.fee_table.get(long_ex, {}).get("maker", 0.0005)
+        taker_fee = self.fee_table.get(short_ex, {}).get("taker", 0.0005)
+        return notional * (maker_fee + taker_fee) * 2
+
     async def _precheck(self, long_ex: ExchangeClient, short_ex: ExchangeClient, symbol: str, notional: float) -> Tuple[bool, str]:
-        # 只允许 DEX 永续参与刷量
+        # 伪代码流程：
+        # 1) 确认两边均为 DEX 永续
+        # 2) 检查是否处于资金费率黑名单窗口
+        # 3) 拉取盘口 + 估算滑点
+        # 4) 估算预期盈亏（手续费、滑点、资金费率）
+        # 5) 若预期亏损超过容忍度则拒绝
         if long_ex.venue_type != "dex" or short_ex.venue_type != "dex":
             return False, "仅支持 DEX 永续合约刷量"
+
+        if self._in_funding_blackout():
+            return False, "临近资金费率结算，暂停刷量"
 
         try:
             ob_long, ob_short = await asyncio.gather(
                 self._fetch_orderbook(long_ex, symbol),
                 self._fetch_orderbook(short_ex, symbol),
             )
+            quotes = await asyncio.gather(
+                self._fetch_quote(long_ex, symbol),
+                self._fetch_quote(short_ex, symbol),
+            )
         except Exception as e:
-            return False, f"盘口获取失败: {e}"
+            return False, f"盘口或行情获取失败: {e}"
 
-        quotes = await asyncio.gather(
-            self._fetch_quote(long_ex, symbol),
-            self._fetch_quote(short_ex, symbol),
-        )
         long_quote, short_quote = quotes
         long_quote.order_book = ob_long
         short_quote.order_book = ob_short
 
-        # 估算滑点
-        long_price = long_quote.executable_price("buy", notional / long_quote.mid)
-        short_price = short_quote.executable_price("sell", notional / short_quote.mid)
-        if long_price is None or short_price is None:
+        slip, fee_cost, funding_cost, expected_pnl = self._estimate_pnl(
+            long_quote, short_quote, notional
+        )
+        if slip is None:
             return False, "盘口深度不足"
-
-        best_long = long_quote.ask
-        best_short = short_quote.bid
-        long_slip_bps = (long_price - best_long) / best_long * 10_000
-        short_slip_bps = (best_short - short_price) / best_short * 10_000
-        if long_slip_bps > self.slippage_bps_limit or short_slip_bps > self.slippage_bps_limit:
+        if slip > self.slippage_bps_limit:
             return False, "预估滑点超阈值"
+        if expected_pnl < -abs(self.max_acceptable_loss_pct) * notional:
+            return False, "预期亏损超出容忍度"
 
+        logger.info(
+            "刷量预检通过 %s/%s 名义=%.2f 预估PnL=%.4f 费=%.4f 滑点bps=%.2f 资金费率=%.4f",
+            long_ex.name,
+            short_ex.name,
+            notional,
+            expected_pnl,
+            fee_cost,
+            slip,
+            funding_cost,
+        )
         return True, "ok"
 
     async def execute_wash_cycle(self, symbol: str, long_exchange: str, short_exchange: str) -> HedgeVolumeResult:
+        # 伪代码（关键路径注释）：
+        # 1) 选取名义金额（受 wash 可用额度与占比上限约束）
+        # 2) 分别向两边交易所申请 wash 资金 reserve_for_wash
+        # 3) 预检：DEX 限制、资金费率黑窗、滑点/预估损益
+        # 4) 并发开仓，时间差控制；失败则立即回滚
+        # 5) 等待持仓时间，超时强制平仓
+        # 6) 并发平仓，计算实际 volume/fee/pnl，写入 orchestrator
+        # 7) 无论结果如何，finally 中释放占用资金
         long_ex = self.exchanges.get(long_exchange)
         short_ex = self.exchanges.get(short_exchange)
         if not long_ex or not short_ex:
             return HedgeVolumeResult(status="blocked", reason="交易所不存在")
 
         notional = self._select_notional()
-        reservation: CapitalReservation = self.orchestrator.reserve_for_strategy(
-            [long_exchange, short_exchange], amount=notional, strategy="wash_trade"
+        if not self._within_wash_cap(long_exchange, notional) or not self._within_wash_cap(short_exchange, notional):
+            return HedgeVolumeResult(status="blocked", reason="名义金额超过 wash 可用占比")
+
+        ok_long = self.orchestrator.reserve_for_wash(long_exchange, notional)
+        ok_short = self.orchestrator.reserve_for_wash(short_exchange, notional)
+        if not ok_long or not ok_short:
+            if ok_long:
+                self.orchestrator.release((long_exchange, notional, "wash"))
+            if ok_short:
+                self.orchestrator.release((short_exchange, notional, "wash"))
+            return HedgeVolumeResult(status="blocked", reason="wash 资金不足")
+
+        reservation = CapitalReservation(
+            approved=True,
+            allocations={
+                long_exchange: ("wash", notional),
+                short_exchange: ("wash", notional),
+            },
         )
-        if not reservation.approved:
-            return HedgeVolumeResult(status="blocked", reason=reservation.reason)
 
         try:
             ok, reason = await self._precheck(long_ex, short_ex, symbol, notional)
@@ -152,16 +252,24 @@ class HedgeVolumeEngine:
 
             # 等待持仓
             hold = random.randint(self.hold_seconds[0], self.hold_seconds[1])
-            await asyncio.sleep(hold)
+            if hold > self.max_hold_seconds:
+                hold = self.max_hold_seconds
+            try:
+                await asyncio.wait_for(asyncio.sleep(hold), timeout=self.max_hold_seconds)
+            except asyncio.TimeoutError:
+                logger.warning("持仓等待超时，强制进入平仓")
 
             long_close, short_close = await self._close_both(long_ex, short_ex, symbol, size_long, size_short)
             if not long_close or not short_close:
                 return HedgeVolumeResult(status="failed", reason="平仓异常")
 
-            # 简单估算手续费与名义
-            fee = notional * 2 * 0.0005  # 占位：默认 5bps 双边
+            fee = self._compute_fee(notional, long_ex.name, short_ex.name)
             pnl = (short_close.price - long_close.price) * size_long
             volume = notional * 2
+
+            logger.info(
+                "刷量完成 %s/%s %s 名义=%.2f 手续费=%.4f PnL=%.4f", long_exchange, short_exchange, symbol, notional, fee, pnl
+            )
 
             # 回传到资金总控用于统计
             self.orchestrator.record_volume_result(long_exchange, volume, fee, pnl)
