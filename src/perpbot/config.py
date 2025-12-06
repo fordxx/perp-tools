@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import yaml
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+from perpbot.models import AlertCondition, AlertNotificationConfig, ExchangeCost
+
+DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT"]
+DEFAULT_RISK_MODE_PRESETS = {
+    "conservative": {
+        "min_expected_edge_bps": 5.0,
+        "max_acceptable_loss_bps": 1.0,
+        "volatility_threshold": 0.004,
+        "safety_weight": 0.8,
+        "volume_weight": 0.2,
+        "final_score_threshold": 75.0,
+    },
+    "balanced": {
+        "min_expected_edge_bps": 3.0,
+        "max_acceptable_loss_bps": 2.0,
+        "volatility_threshold": 0.006,
+        "safety_weight": 0.65,
+        "volume_weight": 0.35,
+        "final_score_threshold": 70.0,
+    },
+    "aggressive": {
+        "min_expected_edge_bps": 1.5,
+        "max_acceptable_loss_bps": 3.5,
+        "volatility_threshold": 0.01,
+        "safety_weight": 0.55,
+        "volume_weight": 0.45,
+        "final_score_threshold": 60.0,
+    },
+}
+
+
+@dataclass
+class BotConfig:
+    symbols: List[str] = field(default_factory=lambda: list(DEFAULT_SYMBOLS))
+    position_size: float = 0.01
+    profit_target_pct: float = 0.01
+    arbitrage_edge: float = 0.003
+    arbitrage_min_profit_pct: float = 0.001
+    arbitrage_trade_size: float = 0.01
+    failure_probability: float = 0.05
+    max_risk_pct: float = 0.05
+    risk_cooldown_seconds: int = 30
+    assumed_equity: float = 10_000.0
+    max_drawdown_pct: float = 0.1
+    max_consecutive_failures: int = 3
+    max_symbol_exposure_pct: float = 0.2
+    enforce_direction_consistency: bool = True
+    freeze_threshold_pct: float = 0.005
+    freeze_window_seconds: int = 1
+    daily_loss_limit_pct: float = 0.08
+    daily_loss_limit: float = 0.0
+    loop_interval_seconds: float = 2.0
+    default_maker_fee_bps: float = 2.0
+    default_taker_fee_bps: float = 5.0
+    default_slippage_bps: float = 1.0
+    retry_cost_bps: float = 0.5
+    exchange_costs: Dict[str, ExchangeCost] = field(default_factory=dict)
+    alerts: List[AlertCondition] = field(default_factory=list)
+    volatility_window_minutes: int = 5
+    volatility_high_threshold_pct: float = 0.03
+    high_vol_min_profit_pct: float = 0.002
+    low_vol_min_profit_pct: float = 0.005
+    priority_score_threshold: float = 70.0
+    priority_weights: Dict[str, float] = field(
+        default_factory=lambda: {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
+    )
+    reliability_scores: Dict[str, float] = field(default_factory=dict)
+    risk_mode: str = "balanced"
+    risk_mode_presets: Dict[str, Dict[str, float]] = field(default_factory=lambda: dict(DEFAULT_RISK_MODE_PRESETS))
+    risk_enabled: bool = True
+    manual_override_minutes: int = 0
+    manual_override_trades: int = 0
+    daily_volume_target: float = 0.0
+    max_notional_per_trade: float = 0.0
+    max_total_notional_in_flight: float = 0.0
+    max_slippage_bps: float = 50.0
+    order_fill_timeout_seconds: int = 5
+    circuit_breaker_failures: int = 3
+    balance_concentration_pct: float = 0.5
+    per_exchange_limit: int = 2
+    trade_record_path: str = "data/trades.csv"
+    alert_record_path: str = "data/alerts.csv"
+    notifications: AlertNotificationConfig = field(default_factory=AlertNotificationConfig)
+    capital_wu_size: float = 10_000.0
+    capital_layer_targets: Dict[str, float] = field(
+        default_factory=lambda: {"L1": 0.2, "L2": 0.3, "L3": 0.25, "L4": 0.1, "L5": 0.15}
+    )
+    capital_layer_max_usage: Dict[str, float] = field(
+        default_factory=lambda: {"L1": 1.0, "L2": 1.0, "L3": 1.0, "L4": 1.0, "L5": 1.0}
+    )
+    capital_safe_layers: List[str] = field(default_factory=lambda: ["L1", "L4"])
+    capital_allow_borrow_from_l5: bool = True
+    capital_drawdown_limit_pct: float = 0.05
+    hedge_min_notional: float = 300.0
+    hedge_max_notional: float = 800.0
+    hedge_hold_seconds: List[int] = field(default_factory=lambda: [10, 60])
+    hedge_slippage_bps_limit: float = 30.0
+    hedge_time_skew_ms: int = 800
+    hedge_loss_limit_pct: float = 0.02
+    hedge_funding_blackout_minutes: int = 10
+    hedge_funding_cycle_seconds: int = 8 * 60 * 60
+    hedge_next_funding_timestamp: float = 0.0
+    hedge_max_wash_pct_per_call: float = 0.1
+
+
+def load_config(path: str) -> BotConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    alerts = [AlertCondition(**a) for a in data.get("alerts", [])]
+    notifications = AlertNotificationConfig(**(data.get("notifications") or {}))
+    exchange_costs = {
+        name: ExchangeCost(**cfg)
+        for name, cfg in (data.get("exchange_costs", {}) or {}).items()
+    }
+    risk_presets = data.get("risk_mode_presets", DEFAULT_RISK_MODE_PRESETS)
+    return BotConfig(
+        symbols=data.get("symbols", DEFAULT_SYMBOLS),
+        position_size=data.get("position_size", 0.01),
+        profit_target_pct=data.get("profit_target_pct", 0.01),
+        arbitrage_edge=data.get("arbitrage_edge", 0.003),
+        arbitrage_min_profit_pct=data.get("arbitrage_min_profit_pct", 0.001),
+        arbitrage_trade_size=data.get("arbitrage_trade_size", data.get("position_size", 0.01)),
+        failure_probability=data.get("failure_probability", 0.05),
+        max_risk_pct=data.get("max_risk_pct", 0.05),
+        risk_cooldown_seconds=data.get("risk_cooldown_seconds", 30),
+        assumed_equity=data.get("assumed_equity", 10_000.0),
+        max_drawdown_pct=data.get("max_drawdown_pct", 0.1),
+        max_consecutive_failures=data.get("max_consecutive_failures", 3),
+        max_symbol_exposure_pct=data.get("max_symbol_exposure_pct", 0.2),
+        enforce_direction_consistency=data.get("enforce_direction_consistency", True),
+        freeze_threshold_pct=data.get("freeze_threshold_pct", 0.005),
+        freeze_window_seconds=data.get("freeze_window_seconds", 1),
+        daily_loss_limit_pct=data.get("daily_loss_limit_pct", 0.08),
+        daily_loss_limit=data.get("daily_loss_limit", 0.0),
+        loop_interval_seconds=data.get("loop_interval_seconds", 2.0),
+        default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
+        default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
+        default_slippage_bps=data.get("default_slippage_bps", 1.0),
+        retry_cost_bps=data.get("retry_cost_bps", 0.5),
+        exchange_costs=exchange_costs,
+        alerts=alerts,
+        volatility_window_minutes=data.get("volatility_window_minutes", 5),
+        volatility_high_threshold_pct=data.get("volatility_high_threshold_pct", 0.03),
+        high_vol_min_profit_pct=data.get("high_vol_min_profit_pct", 0.002),
+        low_vol_min_profit_pct=data.get("low_vol_min_profit_pct", 0.005),
+        priority_score_threshold=data.get("priority_score_threshold", 70.0),
+        priority_weights=data.get(
+            "priority_weights", {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
+        ),
+        reliability_scores=data.get("reliability_scores", {}),
+        risk_mode=data.get("risk_mode", "balanced"),
+        risk_mode_presets=risk_presets,
+        risk_enabled=data.get("risk_enabled", True),
+        manual_override_minutes=data.get("manual_override_minutes", 0),
+        manual_override_trades=data.get("manual_override_trades", 0),
+        daily_volume_target=data.get("daily_volume_target", 0.0),
+        max_notional_per_trade=data.get("max_notional_per_trade", 0.0),
+        max_total_notional_in_flight=data.get("max_total_notional_in_flight", 0.0),
+        max_slippage_bps=data.get("max_slippage_bps", 50.0),
+        order_fill_timeout_seconds=data.get("order_fill_timeout_seconds", 5),
+        circuit_breaker_failures=data.get("circuit_breaker_failures", 3),
+        balance_concentration_pct=data.get("balance_concentration_pct", 0.5),
+        per_exchange_limit=data.get("per_exchange_limit", 2),
+        trade_record_path=data.get("trade_record_path", "data/trades.csv"),
+        alert_record_path=data.get("alert_record_path", "data/alerts.csv"),
+        notifications=notifications,
+        capital_wu_size=data.get("capital_wu_size", 10_000.0),
+        capital_layer_targets=data.get(
+            "capital_layer_targets", {"L1": 0.2, "L2": 0.3, "L3": 0.25, "L4": 0.1, "L5": 0.15}
+        ),
+        capital_layer_max_usage=data.get(
+            "capital_layer_max_usage", {"L1": 1.0, "L2": 1.0, "L3": 1.0, "L4": 1.0, "L5": 1.0}
+        ),
+        capital_safe_layers=data.get("capital_safe_layers", ["L1", "L4"]),
+        capital_allow_borrow_from_l5=data.get("capital_allow_borrow_from_l5", True),
+        capital_drawdown_limit_pct=data.get("capital_drawdown_limit_pct", 0.05),
+        hedge_min_notional=data.get("hedge_min_notional", 300.0),
+        hedge_max_notional=data.get("hedge_max_notional", 800.0),
+        hedge_hold_seconds=data.get("hedge_hold_seconds", [10, 60]),
+        hedge_slippage_bps_limit=data.get("hedge_slippage_bps_limit", 30.0),
+        hedge_time_skew_ms=data.get("hedge_time_skew_ms", 800),
+        hedge_loss_limit_pct=data.get("hedge_loss_limit_pct", 0.02),
+        hedge_funding_blackout_minutes=data.get("hedge_funding_blackout_minutes", 10),
+        hedge_funding_cycle_seconds=data.get("hedge_funding_cycle_seconds", 8 * 60 * 60),
+        hedge_next_funding_timestamp=data.get("hedge_next_funding_timestamp", 0.0),
+        hedge_max_wash_pct_per_call=data.get("hedge_max_wash_pct_per_call", 0.1),
+    )

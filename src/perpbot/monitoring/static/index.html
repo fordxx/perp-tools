@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PerpBot 套利控制台</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #0b1021;
+        color: #e9edf5;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        background: #121a35;
+        padding: 16px 24px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid #1f2a52;
+        position: sticky;
+        top: 0;
+        z-index: 10;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+      }
+      .container {
+        padding: 20px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+      }
+      .card {
+        background: #11182f;
+        border: 1px solid #1b2647;
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .card h2 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+      }
+      .card .subtitle {
+        color: #9aa5c2;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        padding: 6px 8px;
+        border-bottom: 1px solid #1f2a52;
+        text-align: left;
+        font-size: 13px;
+      }
+      th {
+        color: #7ea8ff;
+      }
+      button {
+        background: #2f80ed;
+        color: #fff;
+        border: none;
+        padding: 8px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        margin-right: 8px;
+      }
+      button.secondary {
+        background: #6c7a99;
+      }
+      input[type="number"] {
+        background: #0f172a;
+        border: 1px solid #1f2a52;
+        color: #fff;
+        padding: 6px;
+        border-radius: 6px;
+        width: 100px;
+        margin-right: 8px;
+      }
+      .status {
+        font-weight: bold;
+      }
+      .status.running {
+        color: #6bea9e;
+      }
+      .status.paused {
+        color: #f2c94c;
+      }
+      .status.halted {
+        color: #ff7b7b;
+      }
+      .muted {
+        color: #9aa5c2;
+        font-size: 12px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #1f2a52;
+        font-size: 12px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 14px;
+      }
+      .split {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 14px;
+        align-items: start;
+      }
+      .scrollable {
+        max-height: 320px;
+        overflow: auto;
+      }
+      .pill.success {
+        background: #15331f;
+        color: #6bea9e;
+      }
+      .pill.warning {
+        background: #2f2a14;
+        color: #f2c94c;
+      }
+      .pill.danger {
+        background: #3f1c1c;
+        color: #ff7b7b;
+      }
+      .metric {
+        font-size: 20px;
+        font-weight: bold;
+      }
+      .muted-small {
+        color: #9aa5c2;
+        font-size: 11px;
+      }
+      @media (max-width: 960px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>PerpBot Web 套利控制台</h1>
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+        <span id="socketStatus" class="pill warning">WS：连接中</span>
+        <div id="statusBar" class="muted">加载中...</div>
+      </div>
+    </header>
+    <div class="container">
+      <div class="cards">
+        <div class="card">
+          <h2>控制</h2>
+          <div style="margin-bottom: 8px">
+            <button id="startBtn">启动</button>
+            <button id="pauseBtn" class="secondary">暂停</button>
+          </div>
+          <div>
+            <label for="profitInput">最小利润阈值（%）</label><br />
+            <input id="profitInput" type="number" step="0.01" min="0" />
+            <button id="updateThreshold">更新</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>账户</h2>
+          <div>净值：<span id="equity">-</span></div>
+          <div>盈亏：<span id="pnl">-</span></div>
+          <div>上次循环：<span id="lastCycle" class="muted">-</span></div>
+        </div>
+        <div class="card">
+          <h2>套利</h2>
+          <div style="display: flex; justify-content: space-between; align-items: center">
+            <div>
+              <div>机会数量：<span id="arbCount">0</span></div>
+              <div class="muted">仅 DEX 执行</div>
+            </div>
+            <div>
+              <div>阈值：<span id="thresholdDisplay">-</span></div>
+              <div class="muted">包含置信度加权</div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <h2>交易统计</h2>
+          <div class="subtitle">实时成交表现</div>
+          <div class="metric" id="successRate">-</div>
+          <div class="muted-small">平均利润：<span id="avgProfit">-</span></div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 14px">
+        <div class="card">
+          <h2>实时行情</h2>
+          <table id="quotesTable">
+            <thead>
+              <tr>
+                <th>交易所</th>
+                <th>交易对</th>
+                <th>买价</th>
+                <th>卖价</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>净值 / 盈亏</h2>
+          <canvas id="pnlChart" height="140"></canvas>
+          <div class="muted" style="margin-top: 6px">最近 500 个采样点</div>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top: 14px">
+        <div class="card">
+          <h2>套利机会</h2>
+          <table id="arbTable">
+            <thead>
+              <tr>
+                <th>交易对</th>
+                <th>买入</th>
+                <th>卖出</th>
+                <th>数量</th>
+                <th>净收益%</th>
+                <th>预期收益</th>
+                <th>置信度</th>
+                <th>优先级</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>持仓</h2>
+          <table id="positionsTable">
+            <thead>
+              <tr>
+                <th>交易所</th>
+                <th>交易对</th>
+                <th>方向</th>
+                <th>数量</th>
+                <th>开仓价</th>
+                <th>开仓时间</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="split" style="margin-top: 14px">
+        <div class="card">
+          <h2>提醒历史</h2>
+          <div class="subtitle">已触发的价格提醒</div>
+          <div class="scrollable">
+            <table id="alertTable">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>交易对</th>
+                  <th>条件</th>
+                  <th>价格</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h2>最新提醒</h2>
+          <div class="subtitle">最近的通知记录</div>
+          <ul id="alertList" style="list-style: none; padding: 0; margin: 0"></ul>
+        </div>
+      </div>
+
+      <div style="margin-top: 16px">
+        <h2>实时监控（MVP）</h2>
+        <div class="cards" style="margin-top: 10px">
+          <div class="card">
+            <h3>全局总控</h3>
+            <div id="globalStatus"></div>
+          </div>
+          <div class="card">
+            <h3>风控雷达</h3>
+            <ul id="riskRadar" style="list-style: none; padding: 0; margin: 0"></ul>
+          </div>
+          <div class="card">
+            <h3>资金池</h3>
+            <div id="capitalPools"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>交易所状态</h3>
+          <div class="scrollable">
+            <table id="exchangeStatusTable">
+              <thead>
+                <tr>
+                  <th>交易所</th>
+                  <th>权益</th>
+                  <th>保证金</th>
+                  <th>刷量占用</th>
+                  <th>刷量任务</th>
+                  <th>API 延迟</th>
+                  <th>警告</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>刷量任务</h3>
+          <div class="scrollable">
+            <table id="washTaskTable">
+              <thead>
+                <tr>
+                  <th>任务</th>
+                  <th>交易所对</th>
+                  <th>交易对</th>
+                  <th>名义金额</th>
+                  <th>状态</th>
+                  <th>持仓(s)</th>
+                  <th>成交量</th>
+                  <th>手续费</th>
+                  <th>PnL</th>
+                  <th>风险</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top: 12px">
+          <h3>行情面板</h3>
+          <div class="scrollable">
+            <table id="marketPanel">
+              <thead>
+                <tr>
+                  <th>交易所</th>
+                  <th>交易对</th>
+                  <th>买价</th>
+                  <th>卖价</th>
+                  <th>点差</th>
+                  <th>Funding</th>
+                  <th>5s波动</th>
+                  <th>10s波动</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script>
+      const fmt = (num, digits = 2) =>
+        typeof num === "number" && !Number.isNaN(num)
+          ? num.toLocaleString(undefined, {
+              minimumFractionDigits: digits,
+              maximumFractionDigits: digits,
+            })
+          : "-";
+
+      const chartRef = { chart: null };
+      let socketLive = false;
+
+      async function fetchJSON(url, options) {
+        const res = await fetch(url, options);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || res.statusText);
+        }
+        return res.json();
+      }
+
+      function renderQuotes(quotes) {
+        const tbody = document.querySelector("#quotesTable tbody");
+        tbody.innerHTML = "";
+        quotes
+          .sort((a, b) => a.exchange.localeCompare(b.exchange))
+          .forEach((q) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td>${q.exchange}</td><td>${q.symbol}</td><td>${fmt(q.bid)}</td><td>${fmt(q.ask)}</td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderArb(ops) {
+        const tbody = document.querySelector("#arbTable tbody");
+        tbody.innerHTML = "";
+        ops.forEach((op) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${op.symbol}</td><td>${op.buy_exchange} @ ${fmt(
+            op.buy_price
+          )}</td><td>${op.sell_exchange} @ ${fmt(op.sell_price)}</td><td>${fmt(
+            op.size,
+            4
+          )}</td><td>${fmt(op.net_profit_pct * 100, 3)}%</td><td>${fmt(
+            op.expected_pnl,
+            4
+          )}</td><td>${fmt(op.confidence * 100, 1)}%</td><td>${
+            op.priority_score ? fmt(op.priority_score, 1) : "-"
+          }</td>`;
+          tbody.appendChild(tr);
+        });
+        document.getElementById("arbCount").textContent = ops.length;
+      }
+
+      function renderPositions(positions) {
+        const tbody = document.querySelector("#positionsTable tbody");
+        tbody.innerHTML = "";
+        positions.forEach((p) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${p.exchange}</td><td>${p.symbol}</td><td>${p.side}</td><td>${fmt(
+            p.size,
+            4
+          )}</td><td>${fmt(p.entry_price)}</td><td>${p.open_ts}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+
+      function renderAlerts(alerts) {
+        const tbody = document.querySelector("#alertTable tbody");
+        tbody.innerHTML = "";
+        alerts
+          .slice()
+          .reverse()
+          .forEach((a) => {
+            const tr = document.createElement("tr");
+            const statusClass = a.success ? "pill success" : "pill danger";
+            tr.innerHTML = `<td>${new Date(a.timestamp).toLocaleTimeString()}</td><td>${a.symbol}</td><td>${
+              a.condition
+            }</td><td>${fmt(a.price)}</td><td><span class="${statusClass}">${
+              a.success ? "hit" : "fail"
+            }</span></td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderAlertList(alerts) {
+        const list = document.getElementById("alertList");
+        list.innerHTML = "";
+        (alerts || []).slice(-5).reverse().forEach((msg) => {
+          const li = document.createElement("li");
+          li.className = "muted-small";
+          li.textContent = msg;
+          list.appendChild(li);
+        });
+      }
+
+      function renderStats(stats) {
+        const successRate = typeof stats.success_rate === "number" ? stats.success_rate * 100 : null;
+        document.getElementById("successRate").textContent = successRate !== null ? `${fmt(successRate, 2)}%` : "-";
+        document.getElementById("avgProfit").textContent = stats.avg_profit
+          ? `$${fmt(stats.avg_profit, 4)}`
+          : "-";
+      }
+
+      function renderMonitoring(monitoring) {
+        renderGlobalStatus(monitoring.system || {}, monitoring.capital || {});
+        renderCapitalPools(monitoring.capital || {});
+        renderExchangeStatus(monitoring.exchanges || {});
+        renderWashTasks(monitoring.wash_tasks || {});
+        renderRiskRadar(monitoring.risk_radar || {});
+        renderMarketPanel(monitoring.quotes || {});
+      }
+
+      function renderGlobalStatus(system, capital) {
+        const el = document.getElementById("globalStatus");
+        if (!el) return;
+        el.innerHTML = `
+          <div>系统状态：<span class="status ${system.status}">${system.status || "-"}</span></div>
+          <div>风险模式：${system.risk_mode || "-"}</div>
+          <div>今日成交量：${fmt(system.daily_volume_usd || 0, 2)} USDT</div>
+          <div>今日手续费：${fmt(system.daily_fee_usd || 0, 4)} USDT</div>
+          <div>今日PnL：${fmt(system.daily_pnl_usd || 0, 4)} USDT</div>
+          <div>当日亏损上限：${fmt(system.daily_loss_limit_usd || 0, 2)} / 剩余 ${fmt(system.remaining_loss_buffer_usd || 0, 2)}</div>
+        `;
+      }
+
+      function renderCapitalPools(capital) {
+        const el = document.getElementById("capitalPools");
+        if (!el) return;
+        const parts = Object.entries(capital).map(([ex, pools]) => {
+          const wash = pools.wash || {};
+          const arb = pools.arb || {};
+          const reserve = pools.reserve || {};
+          return `<div style="margin-bottom:8px"><strong>${ex}</strong><br/>S1刷量: ${fmt(
+            wash.allocated || 0,
+            2
+          )}/${fmt(wash.pool || 0, 2)} | S2套利: ${fmt(arb.allocated || 0, 2)}/${fmt(arb.pool || 0, 2)} | S3备用: ${fmt(
+            reserve.pool || 0,
+            2
+          )}</div>`;
+        });
+        el.innerHTML = parts.join("") || "-";
+      }
+
+      function renderExchangeStatus(exchanges) {
+        const tbody = document.querySelector("#exchangeStatusTable tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.entries(exchanges).forEach(([ex, info]) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${ex}</td>
+            <td>${fmt(info.equity || 0, 2)}</td>
+            <td>${fmt(info.available_margin || 0, 2)}</td>
+            <td>${fmt(info.wash_usage || 0, 2)}</td>
+            <td>${info.active_wash_tasks || 0}</td>
+            <td>${fmt(info.api_latency_ms || 0, 1)} ms</td>
+            <td>${(info.risk_warnings || []).join("; ")}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+
+      function renderWashTasks(tasks) {
+        const tbody = document.querySelector("#washTaskTable tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.values(tasks)
+          .sort((a, b) => (b.start_ts || "").localeCompare(a.start_ts || ""))
+          .forEach((t) => {
+            const risks = Object.entries(t.risk_flags || {})
+              .filter(([, v]) => v)
+              .map(([k]) => k)
+              .join(", ");
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${t.task_id}</td>
+              <td>${t.pair}</td>
+              <td>${t.symbol}</td>
+              <td>${fmt(t.notional || 0, 2)}</td>
+              <td>${t.status}</td>
+              <td>${fmt(t.hold_seconds || 0, 0)}</td>
+              <td>${fmt(t.filled_volume || 0, 2)}</td>
+              <td>${fmt(t.fee_paid || 0, 4)}</td>
+              <td>${fmt(t.floating_pnl || 0, 4)}</td>
+              <td>${risks || "-"}</td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderRiskRadar(radar) {
+        const el = document.getElementById("riskRadar");
+        if (!el) return;
+        el.innerHTML = `
+          <li>快市交易对：${(radar.fast_market_symbols || []).join(", ") || "-"}</li>
+          <li>延迟异常：${(radar.latency_anomalies || []).join(", ") || "-"}</li>
+          <li>资金费率黑窗：${Object.keys(radar.funding_blackout || {}).length}</li>
+          <li>连续失败：${radar.consecutive_failures || 0}</li>
+          <li>自动暂停：${radar.auto_paused ? "是" : "否"}</li>
+          <li>manual override：${radar.manual_override_active ? "是" : "否"}</li>
+        `;
+      }
+
+      function renderMarketPanel(quotes) {
+        const tbody = document.querySelector("#marketPanel tbody");
+        if (!tbody) return;
+        tbody.innerHTML = "";
+        Object.entries(quotes).forEach(([exchange, symbols]) => {
+          Object.entries(symbols).forEach(([symbol, q]) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `
+              <td>${exchange}</td>
+              <td>${symbol}</td>
+              <td>${fmt(q.bid)}</td>
+              <td>${fmt(q.ask)}</td>
+              <td>${fmt(q.spread || 0, 4)}</td>
+              <td>${fmt(q.funding || 0, 4)}</td>
+              <td>${fmt(q.vol_5s || 0, 4)}</td>
+              <td>${fmt(q.vol_10s || 0, 4)}</td>`;
+            tbody.appendChild(tr);
+          });
+        });
+      }
+
+      function renderOverview(data) {
+        const statusBar = document.getElementById("statusBar");
+        let statusClass = "status ";
+        if (data.status?.startsWith("halted")) {
+          statusClass += "halted";
+        } else if (data.trading_enabled) {
+          statusClass += "running";
+        } else {
+          statusClass += "paused";
+        }
+        statusBar.innerHTML = `<span class="${statusClass}">${data.status}</span>`;
+        document.getElementById("equity").textContent = `$${fmt(data.equity)}`;
+        document.getElementById("pnl").textContent = `$${fmt(data.pnl)}`;
+        document.getElementById("thresholdDisplay").textContent = `${fmt(
+          data.min_profit_pct * 100,
+          3
+        )}%`;
+        document.getElementById("profitInput").value = (data.min_profit_pct * 100).toFixed(3);
+        document.getElementById("lastCycle").textContent = data.last_cycle_at || "-";
+      }
+
+      function renderChart(ctx, equityHistory, pnlHistory, chartRef) {
+        const labels = equityHistory.map((p) => new Date(p.ts).toLocaleTimeString());
+        const equityValues = equityHistory.map((p) => p.value);
+        const pnlValues = pnlHistory.map((p) => p.value);
+        if (!chartRef.chart) {
+          chartRef.chart = new Chart(ctx, {
+            type: "line",
+            data: {
+              labels,
+              datasets: [
+                {
+                  label: "Equity",
+                  data: equityValues,
+                  borderColor: "#6bea9e",
+                  backgroundColor: "rgba(110,234,158,0.1)",
+                  tension: 0.25,
+                  pointRadius: 0,
+                },
+                {
+                  label: "PnL",
+                  data: pnlValues,
+                  borderColor: "#7ea8ff",
+                  backgroundColor: "rgba(126,168,255,0.12)",
+                  tension: 0.25,
+                  pointRadius: 0,
+                },
+              ],
+            },
+            options: {
+              plugins: { legend: { display: true, labels: { color: "#9aa5c2" } } },
+              scales: {
+                x: { ticks: { color: "#9aa5c2" } },
+                y: { ticks: { color: "#9aa5c2" } },
+              },
+            },
+          });
+        } else {
+          chartRef.chart.data.labels = labels;
+          chartRef.chart.data.datasets[0].data = equityValues;
+          chartRef.chart.data.datasets[1].data = pnlValues;
+          chartRef.chart.update();
+        }
+      }
+
+      function handleData(data) {
+        renderOverview(data);
+        renderQuotes(data.quotes || []);
+        renderArb(data.arbitrage || []);
+        renderPositions(data.positions || []);
+        renderAlerts(data.alert_history || []);
+        renderAlertList(data.alerts || []);
+        renderStats(data.trade_stats || {});
+        if (data.monitoring) {
+          renderMonitoring(data.monitoring);
+        }
+        if (data.equity_history) {
+          const ctx = document.getElementById("pnlChart");
+          renderChart(ctx, data.equity_history, data.pnl_history || [], chartRef);
+        }
+      }
+
+      async function refresh() {
+        if (socketLive) return; // WebSocket 推送时跳过轮询
+        try {
+          const data = await fetchJSON("/api/overview");
+          handleData(data);
+        } catch (err) {
+          console.error(err);
+          document.getElementById("statusBar").textContent = `错误: ${err.message}`;
+        }
+      }
+
+      function connectSocket() {
+        const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+        const status = document.getElementById("socketStatus");
+        const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+        ws.onopen = () => {
+          socketLive = true;
+          status.textContent = "WS：已连接";
+          status.className = "pill success";
+        };
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            handleData(data);
+          } catch (err) {
+            console.error("WS 解析失败", err);
+          }
+        };
+        ws.onclose = () => {
+          socketLive = false;
+          status.textContent = "WS：重新连接";
+          status.className = "pill warning";
+          setTimeout(connectSocket, 2000);
+        };
+        ws.onerror = () => ws.close();
+      }
+
+      document.getElementById("startBtn").addEventListener("click", async () => {
+        await fetchJSON("/api/control/start", { method: "POST" });
+        refresh();
+      });
+      document.getElementById("pauseBtn").addEventListener("click", async () => {
+        await fetchJSON("/api/control/pause", { method: "POST" });
+        refresh();
+      });
+      document.getElementById("updateThreshold").addEventListener("click", async () => {
+        const value = parseFloat(document.getElementById("profitInput").value);
+        if (Number.isNaN(value)) return;
+        await fetchJSON("/api/control/threshold", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ min_profit_pct: value / 100 }),
+        });
+        refresh();
+      });
+
+      connectSocket();
+      refresh();
+      setInterval(refresh, 4000);
+    </script>
+  </body>
+</html>
