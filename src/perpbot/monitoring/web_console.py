@@ -55,6 +55,10 @@ def _arb_to_dict(op: ArbitrageOpportunity) -> Dict:
     return data
 
 
+def _series_to_list(points):
+    return [{"ts": ts.isoformat(), "value": value} for ts, value in points]
+
+
 class TradingService:
     """Background arbitrage loop with web-facing controls."""
 
@@ -84,6 +88,7 @@ class TradingService:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._max_history = 500
 
     def start(self, trading_enabled: bool = True) -> None:
         self.state.trading_enabled = trading_enabled
@@ -128,6 +133,7 @@ class TradingService:
             self.risk_manager.evaluate_market(self.state.quotes.values())
             self.state.equity = equity
             self.state.pnl = equity - self.cfg.assumed_equity
+            self._record_equity_point(datetime.utcnow(), self.state.equity, self.state.pnl)
             self.state.last_cycle_at = datetime.utcnow()
             self.state.status = "running" if self.state.trading_enabled else "paused"
 
@@ -201,11 +207,21 @@ class TradingService:
                 "equity": self.state.equity,
                 "pnl": self.state.pnl,
                 "last_cycle_at": self.state.last_cycle_at.isoformat() if self.state.last_cycle_at else None,
+                "equity_history": _series_to_list(self.state.equity_history),
+                "pnl_history": _series_to_list(self.state.pnl_history),
                 "quotes": quotes,
                 "arbitrage": arbitrage,
                 "positions": positions,
                 "alerts": self.state.triggered_alerts,
             }
+
+    def _record_equity_point(self, ts: datetime, equity: float, pnl: float) -> None:
+        self.state.equity_history.append((ts, equity))
+        self.state.pnl_history.append((ts, pnl))
+        if len(self.state.equity_history) > self._max_history:
+            self.state.equity_history = self.state.equity_history[-self._max_history :]
+        if len(self.state.pnl_history) > self._max_history:
+            self.state.pnl_history = self.state.pnl_history[-self._max_history :]
 
 
 def create_web_app(cfg: BotConfig, service: Optional[TradingService] = None) -> FastAPI:

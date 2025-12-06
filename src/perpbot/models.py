@@ -149,6 +149,8 @@ class TradingState:
     account_positions: List[Position] = field(default_factory=list)
     equity: float = 0.0
     pnl: float = 0.0
+    equity_history: List[Tuple[datetime, float]] = field(default_factory=list)
+    pnl_history: List[Tuple[datetime, float]] = field(default_factory=list)
     last_cycle_at: Optional[datetime] = None
     trading_enabled: bool = True
     status: str = "initializing"

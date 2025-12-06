@@ -8,7 +8,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - **Take-profit strategy** that opens positions and auto-closes after reaching a configurable profit threshold.
 - **Arbitrage scanner and executor** that discovers cross-exchange price edges, enforces risk limits, and fires two-sided orders with automatic hedging.
 - **Smart alerts** that trigger notifications or optional auto-orders when price rules are met.
-- **FastAPI web console** with live BTC/ETH quotes across exchanges, arbitrage spreads, positions/PnL, and controls to start/pause arbitrage or retune the minimum profit threshold.
+- **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel, real-time position view, an equity/PnL curve, and controls to start/pause arbitrage or retune the minimum profit threshold.
 - **Config-driven setup** via `config.example.yaml`.
 
 ## Project Layout
@@ -51,7 +51,7 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
    PYTHONPATH=src python -m perpbot.cli serve --config config.example.yaml --port 8000
    ```
 
-   Open `http://localhost:8000/` to view the live BTC/ETH board, spreads, PnL, and toggle arbitrage on/off. API endpoints are available under `/api/*` for programmatic control (`/api/overview`, `/api/control/start`, `/api/control/pause`, `/api/control/threshold`, plus `/api/quotes`, `/api/arbitrage`, and `/api/positions`).
+   Open `http://localhost:8000/` to view the live BTC/ETH board, arbitrage spreads, open positions, and the rolling equity/PnL curve. Toggle arbitrage on/off with one click or adjust the profit threshold. API endpoints are available under `/api/*` for programmatic control (`/api/overview`, `/api/control/start`, `/api/control/pause`, `/api/control/threshold`, plus `/api/quotes`, `/api/arbitrage`, and `/api/positions`).
 
 ### Risk and execution settings
 

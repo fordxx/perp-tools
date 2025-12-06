@@ -19,6 +19,9 @@
         justify-content: space-between;
         align-items: center;
         border-bottom: 1px solid #1f2a52;
+        position: sticky;
+        top: 0;
+        z-index: 10;
       }
       h1 {
         margin: 0;
@@ -100,6 +103,16 @@
         background: #1f2a52;
         font-size: 12px;
       }
+      .row {
+        display: grid;
+        grid-template-columns: 2fr 1fr;
+        gap: 14px;
+      }
+      @media (max-width: 960px) {
+        .row {
+          grid-template-columns: 1fr;
+        }
+      }
     </style>
   </head>
   <body>
@@ -129,62 +142,79 @@
         </div>
         <div class="card">
           <h2>Arbitrage</h2>
-          <div>Opportunities: <span id="arbCount">0</span></div>
-          <div>Threshold: <span id="thresholdDisplay">-</span></div>
+          <div style="display: flex; justify-content: space-between; align-items: center">
+            <div>
+              <div>Opportunities: <span id="arbCount">0</span></div>
+              <div class="muted">DEX-only execution</div>
+            </div>
+            <div>
+              <div>Threshold: <span id="thresholdDisplay">-</span></div>
+              <div class="muted">Confidence-weighted</div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div class="card" style="margin-top: 14px">
-        <h2>BTC / ETH Quotes</h2>
-        <table id="quotesTable">
-          <thead>
-            <tr>
-              <th>Exchange</th>
-              <th>Symbol</th>
-              <th>Bid</th>
-              <th>Ask</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="row" style="margin-top: 14px">
+        <div class="card">
+          <h2>Real-Time Quotes</h2>
+          <table id="quotesTable">
+            <thead>
+              <tr>
+                <th>Exchange</th>
+                <th>Symbol</th>
+                <th>Bid</th>
+                <th>Ask</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Equity / PnL</h2>
+          <canvas id="pnlChart" height="140"></canvas>
+          <div class="muted" style="margin-top: 6px">Last 500 points</div>
+        </div>
       </div>
 
-      <div class="card" style="margin-top: 14px">
-        <h2>Arbitrage Spreads</h2>
-        <table id="arbTable">
-          <thead>
-            <tr>
-              <th>Symbol</th>
-              <th>Buy @</th>
-              <th>Sell @</th>
-              <th>Size</th>
-              <th>Net %</th>
-              <th>Exp. PnL</th>
-              <th>Confidence</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-
-      <div class="card" style="margin-top: 14px">
-        <h2>Positions</h2>
-        <table id="positionsTable">
-          <thead>
-            <tr>
-              <th>Exchange</th>
-              <th>Symbol</th>
-              <th>Side</th>
-              <th>Size</th>
-              <th>Entry</th>
-              <th>Opened</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
+      <div class="row" style="margin-top: 14px">
+        <div class="card">
+          <h2>Arbitrage Opportunities</h2>
+          <table id="arbTable">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Buy @</th>
+                <th>Sell @</th>
+                <th>Size</th>
+                <th>Net %</th>
+                <th>Exp. PnL</th>
+                <th>Confidence</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>Positions</h2>
+          <table id="positionsTable">
+            <thead>
+              <tr>
+                <th>Exchange</th>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th>Size</th>
+                <th>Entry</th>
+                <th>Opened</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script>
       const fmt = (num, digits = 2) =>
         typeof num === "number" && !Number.isNaN(num)
@@ -210,9 +240,7 @@
           .sort((a, b) => a.exchange.localeCompare(b.exchange))
           .forEach((q) => {
             const tr = document.createElement("tr");
-            tr.innerHTML = `<td>${q.exchange}</td><td>${q.symbol}</td><td>${fmt(
-              q.bid
-            )}</td><td>${fmt(q.ask)}</td>`;
+            tr.innerHTML = `<td>${q.exchange}</td><td>${q.symbol}</td><td>${fmt(q.bid)}</td><td>${fmt(q.ask)}</td>`;
             tbody.appendChild(tr);
           });
       }
@@ -270,6 +298,42 @@
         document.getElementById("lastCycle").textContent = data.last_cycle_at || "-";
       }
 
+      function renderChart(ctx, history, chartRef) {
+        const labels = history.map((p) => new Date(p.ts).toLocaleTimeString());
+        const data = history.map((p) => p.value);
+        if (!chartRef.chart) {
+          chartRef.chart = new Chart(ctx, {
+            type: "line",
+            data: {
+              labels,
+              datasets: [
+                {
+                  label: "Equity",
+                  data,
+                  borderColor: "#6bea9e",
+                  backgroundColor: "rgba(110,234,158,0.1)",
+                  tension: 0.25,
+                  pointRadius: 0,
+                },
+              ],
+            },
+            options: {
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { ticks: { color: "#9aa5c2" } },
+                y: { ticks: { color: "#9aa5c2" } },
+              },
+            },
+          });
+        } else {
+          chartRef.chart.data.labels = labels;
+          chartRef.chart.data.datasets[0].data = data;
+          chartRef.chart.update();
+        }
+      }
+
+      const chartRef = { chart: null };
+
       async function refresh() {
         try {
           const data = await fetchJSON("/api/overview");
@@ -277,6 +341,10 @@
           renderQuotes(data.quotes || []);
           renderArb(data.arbitrage || []);
           renderPositions(data.positions || []);
+          if (data.equity_history) {
+            const ctx = document.getElementById("pnlChart");
+            renderChart(ctx, data.equity_history, chartRef);
+          }
         } catch (err) {
           console.error(err);
           document.getElementById("statusBar").textContent = `Error: ${err.message}`;
