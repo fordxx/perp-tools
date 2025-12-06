@@ -6,7 +6,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 
 - **Modular exchange layer** with stub clients for all requested venues.
 - **Take-profit strategy** that opens positions and auto-closes after reaching a configurable profit threshold.
-- **Arbitrage scanner** that discovers cross-exchange price edges and can be extended to execute legs automatically.
+- **Arbitrage scanner and executor** that discovers cross-exchange price edges, enforces risk limits, and fires two-sided orders with automatic hedging.
 - **Smart alerts** that trigger notifications or optional auto-orders when price rules are met.
 - **FastAPI dashboard** for real-time visibility into quotes, positions, alerts, and arbitrage opportunities.
 - **Config-driven setup** via `config.example.yaml`.
@@ -17,6 +17,8 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - `src/perpbot/exchanges/base.py` — exchange interface plus simulated clients for each exchange.
 - `src/perpbot/strategy/take_profit.py` — take-profit trading loop and position lifecycle.
 - `src/perpbot/arbitrage/scanner.py` — cross-exchange arbitrage detector with depth-aware, cost-adjusted signal generation.
+- `src/perpbot/arbitrage/arbitrage_executor.py` — two-sided arbitrage executor with hedging when a leg fails.
+- `src/perpbot/position_guard.py` — per-trade risk limits and cooldown enforcement.
 - `src/perpbot/monitoring/alerts.py` — rule-based alert evaluation with optional auto-orders.
 - `src/perpbot/monitoring/dashboard.py` — FastAPI monitoring API.
 - `src/perpbot/cli.py` — CLI entrypoint to run a single trading cycle or launch the dashboard server.
@@ -48,6 +50,10 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
    ```
 
    The API exposes `GET /`, `/quotes`, `/positions`, `/arbitrage`, and `/alerts`.
+
+### Risk and execution settings
+
+`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt.
 
 ### Environment & credentials
 

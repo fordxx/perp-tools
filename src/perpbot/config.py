@@ -17,6 +17,9 @@ class BotConfig:
     arbitrage_edge: float = 0.003
     arbitrage_min_profit_pct: float = 0.0005
     arbitrage_trade_size: float = 0.01
+    max_risk_pct: float = 0.05
+    risk_cooldown_seconds: int = 30
+    assumed_equity: float = 10_000.0
     default_maker_fee_bps: float = 2.0
     default_taker_fee_bps: float = 5.0
     default_slippage_bps: float = 1.0
@@ -35,6 +38,9 @@ def load_config(path: str) -> BotConfig:
         arbitrage_edge=data.get("arbitrage_edge", 0.003),
         arbitrage_min_profit_pct=data.get("arbitrage_min_profit_pct", 0.0005),
         arbitrage_trade_size=data.get("arbitrage_trade_size", data.get("position_size", 0.01)),
+        max_risk_pct=data.get("max_risk_pct", 0.05),
+        risk_cooldown_seconds=data.get("risk_cooldown_seconds", 30),
+        assumed_equity=data.get("assumed_equity", 10_000.0),
         default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
         default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
         default_slippage_bps=data.get("default_slippage_bps", 1.0),

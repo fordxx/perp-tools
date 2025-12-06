@@ -7,12 +7,14 @@ import uvicorn
 from rich.console import Console
 from rich.table import Table
 
+from perpbot.arbitrage.arbitrage_executor import ArbitrageExecutor
 from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.config import BotConfig, load_config
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
 from perpbot.monitoring.dashboard import create_dashboard_app
 from perpbot.models import TradingState
+from perpbot.position_guard import PositionGuard
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
 console = Console()
@@ -54,6 +56,18 @@ def render_arbitrage(state: TradingState) -> None:
 
 def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     exchanges = provision_exchanges()
+    guard = PositionGuard(
+        max_risk_pct=cfg.max_risk_pct,
+        assumed_equity=cfg.assumed_equity,
+        cooldown_seconds=cfg.risk_cooldown_seconds,
+    )
+    for ex in exchanges:
+        try:
+            guard.update_equity_from_positions(ex.get_account_positions())
+        except Exception:
+            # Non-fatal in case an exchange does not support the query
+            pass
+    executor = ArbitrageExecutor(exchanges, guard)
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)
 
@@ -71,6 +85,18 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         retry_cost_bps=cfg.retry_cost_bps,
     )
     state.recent_arbitrage = opportunities
+
+    # Execute opportunities with hedging and risk controls
+    for op in opportunities:
+        result = executor.execute(op)
+        if result.status == "filled":
+            console.print(
+                f"[green]Executed arbitrage {op.symbol}: buy {op.buy_exchange} / sell {op.sell_exchange}[/green]"
+            )
+        elif result.status == "blocked":
+            console.print("[yellow]Skipped arbitrage due to risk guard[/yellow]")
+        else:
+            console.print(f"[red]Arbitrage execution failed: {result.error}[/red]")
 
     # Fire strategy using a lightweight momentum signal derived from spread
     for quote in state.quotes.values():
