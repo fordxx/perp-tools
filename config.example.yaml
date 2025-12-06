@@ -1,0 +1,156 @@
+# 多交易所套利机器人的示例配置
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+position_size: 0.1
+profit_target_pct: 0.02
+arbitrage_edge: 0.005
+arbitrage_min_profit_pct: 0.001
+arbitrage_trade_size: 0.05
+failure_probability: 0.05
+max_risk_pct: 0.05
+risk_cooldown_seconds: 30
+assumed_equity: 10000
+max_drawdown_pct: 0.1
+max_consecutive_failures: 3
+max_symbol_exposure_pct: 0.2
+enforce_direction_consistency: true
+freeze_threshold_pct: 0.005
+freeze_window_seconds: 1
+daily_loss_limit_pct: 0.08
+risk_mode: balanced  # conservative / balanced / aggressive
+risk_mode_presets:
+  conservative:
+    min_expected_edge_bps: 5.0
+    max_acceptable_loss_bps: 1.0
+    volatility_threshold: 0.004
+    safety_weight: 0.8
+    volume_weight: 0.2
+    final_score_threshold: 75
+  balanced:
+    min_expected_edge_bps: 3.0
+    max_acceptable_loss_bps: 2.0
+    volatility_threshold: 0.006
+    safety_weight: 0.65
+    volume_weight: 0.35
+    final_score_threshold: 70
+  aggressive:
+    min_expected_edge_bps: 1.5
+    max_acceptable_loss_bps: 3.5
+    volatility_threshold: 0.01
+    safety_weight: 0.55
+    volume_weight: 0.45
+    final_score_threshold: 60
+risk_enabled: true
+manual_override_minutes: 0
+manual_override_trades: 0
+daily_loss_limit: 0        # 绝对金额上限，可选
+daily_volume_target: 0     # 期望日成交量，用于 volume_score
+max_notional_per_trade: 0  # 单笔硬上限，0 表示关闭
+max_total_notional_in_flight: 0  # 在途名义上限，0 表示关闭
+volatility_window_minutes: 5
+volatility_high_threshold_pct: 0.03
+high_vol_min_profit_pct: 0.002
+low_vol_min_profit_pct: 0.005
+priority_score_threshold: 70
+priority_weights:
+  profit_pct: 0.4
+  profit_abs: 0.3
+  liquidity: 0.2
+  reliability: 0.1
+reliability_scores:
+  edgex: 95
+  paradex: 90
+loop_interval_seconds: 2
+default_maker_fee_bps: 2.0
+default_taker_fee_bps: 5.0
+default_slippage_bps: 1.5
+retry_cost_bps: 0.5
+max_slippage_bps: 75
+order_fill_timeout_seconds: 5
+circuit_breaker_failures: 3
+balance_concentration_pct: 0.5
+per_exchange_limit: 2
+trade_record_path: data/trades.csv
+exchange_costs:
+  edgex:
+    maker_fee_bps: 1.5
+    taker_fee_bps: 2.5
+    funding_rate: 0.0
+  paradex:
+    maker_fee_bps: 1.5
+    taker_fee_bps: 2.5
+    funding_rate: 0.0
+  backpack:
+    maker_fee_bps: 2.0
+    taker_fee_bps: 3.0
+    funding_rate: 0.0
+  aster:
+    maker_fee_bps: 1.8
+    taker_fee_bps: 2.8
+    funding_rate: 0.0
+  grvt:
+    maker_fee_bps: 1.6
+    taker_fee_bps: 2.6
+    funding_rate: 0.0
+  extended:
+    maker_fee_bps: 1.6
+    taker_fee_bps: 2.6
+    funding_rate: 0.0
+alerts:
+  - symbol: BTC/USDT
+    condition: price_above
+    price: 32000
+    action: notify
+    channels: [console]
+  - symbol: ETH/USDT
+    condition: percent_change
+    change_pct: 0.02
+    lookback_minutes: 10
+    action: start-trading
+  - symbol: BTC/USDT
+    condition: spread
+    spread_symbol: ETH/USDT
+    spread_threshold: 0.01
+    direction: above
+    action: auto-order
+    size: 0.5
+    side: buy
+
+notifications:
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  lark_webhook: ""
+  webhook_url: ""
+  console: true
+  play_sound: false
+
+alert_record_path: data/alerts.csv
+
+# 资金调度与分层总控
+capital_wu_size: 10000
+capital_layer_targets:
+  L1: 0.2   # 刷量对冲层
+  L2: 0.3   # 高频套利层
+  L3: 0.25  # 中频增强套利层
+  L4: 0.1   # 底仓/费率层
+  L5: 0.15  # 安全闲置层
+capital_layer_max_usage:
+  L1: 1.0
+  L2: 1.0
+  L3: 1.0
+  L4: 1.0
+  L5: 1.0
+capital_safe_layers: ["L1", "L4"]
+capital_allow_borrow_from_l5: true
+capital_drawdown_limit_pct: 0.05
+hedge_min_notional: 300
+hedge_max_notional: 800
+hedge_hold_seconds: [10, 60]
+hedge_slippage_bps_limit: 30
+hedge_time_skew_ms: 800
+hedge_loss_limit_pct: 0.02
+hedge_funding_blackout_minutes: 10
+hedge_funding_cycle_seconds: 28800   # 8 小时
+hedge_next_funding_timestamp: 0      # 可选：下一次资金费率结算的时间戳
+hedge_max_wash_pct_per_call: 0.1
