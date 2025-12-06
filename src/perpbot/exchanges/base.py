@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 import os
 import random
 import string
@@ -441,6 +442,10 @@ def update_state_with_quotes(state: TradingState, exchanges: Iterable[ExchangeCl
     quotes = asyncio.run(_collect())
     for quote in quotes:
         state.quotes[f"{quote.exchange}:{quote.symbol}"] = quote
+        history = state.price_history.setdefault(quote.symbol, [])
+        history.append((datetime.utcnow(), quote.mid))
+        if len(history) > 500:
+            del history[: len(history) - 500]
 
 
 def evaluate_alerts(state: TradingState, alerts: Iterable[AlertCondition]) -> List[AlertCondition]:

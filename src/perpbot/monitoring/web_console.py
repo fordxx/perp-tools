@@ -20,7 +20,7 @@ from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
 from perpbot.models import ArbitrageOpportunity, Position, PriceQuote, TradingState
 from perpbot.position_guard import PositionGuard
-from perpbot.persistence import TradeRecorder
+from perpbot.persistence import AlertRecorder, TradeRecorder
 from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
@@ -71,6 +71,7 @@ class TradingService:
         self.exchanges = provision_exchanges()
         self.volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
         self.recorder = TradeRecorder(cfg.trade_record_path)
+        self.alert_recorder = AlertRecorder(cfg.alert_record_path)
         self.guard = PositionGuard(
             max_risk_pct=cfg.max_risk_pct,
             assumed_equity=cfg.assumed_equity,
@@ -178,7 +179,10 @@ class TradingService:
                 self.state,
                 self.cfg.alerts,
                 self.exchanges,
+                notification_cfg=self.cfg.notifications,
                 execute_orders=self.state.trading_enabled,
+                start_trading_cb=self.resume_trading,
+                alert_recorder=self.alert_recorder.record,
             )
 
             if self.risk_manager.trading_halted:

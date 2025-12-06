@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Dict, Optional
 
-from perpbot.models import ArbitrageOpportunity, ProfitResult
+from perpbot.models import AlertRecord, ArbitrageOpportunity, ProfitResult
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,92 @@ class TradeRecorder:
         profits = [float(r.get("actual_profit", 0) or 0) for r in success_rows]
         avg_profit = sum(profits) / len(profits) if profits else 0.0
         return {"success_rate": success_rate, "avg_profit": avg_profit}
+
+
+class AlertRecorder:
+    """Persist alert history for later inspection and stats."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.is_sqlite = path.endswith(".db") or path.endswith(".sqlite")
+        if self.is_sqlite:
+            self._init_db()
+        else:
+            self._init_csv()
+
+    def _init_db(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alerts (
+                    timestamp TEXT,
+                    symbol TEXT,
+                    condition TEXT,
+                    price REAL,
+                    message TEXT,
+                    success INTEGER
+                );
+                """
+            )
+
+    def _init_csv(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        if not os.path.exists(self.path):
+            with open(self.path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp", "symbol", "condition", "price", "message", "success"])
+
+    def record(self, alert: AlertRecord) -> None:
+        if self.is_sqlite:
+            with sqlite3.connect(self.path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO alerts (timestamp, symbol, condition, price, message, success)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        alert.timestamp.isoformat(),
+                        alert.symbol,
+                        alert.condition,
+                        alert.price,
+                        alert.message,
+                        1 if alert.success else 0,
+                    ),
+                )
+        else:
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        alert.timestamp.isoformat(),
+                        alert.symbol,
+                        alert.condition,
+                        alert.price,
+                        alert.message,
+                        int(alert.success),
+                    ]
+                )
+        logger.info("Recorded alert for %s (%s)", alert.symbol, alert.condition)
+
+    def stats(self) -> Dict[str, float]:
+        if self.is_sqlite:
+            with sqlite3.connect(self.path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM alerts")
+                total = cur.fetchone()[0] or 1
+                cur.execute("SELECT COUNT(*) FROM alerts WHERE success=1")
+                success = cur.fetchone()[0]
+                return {"total_alerts": total, "hit_rate": success / total}
+
+        if not os.path.exists(self.path):
+            return {"total_alerts": 0, "hit_rate": 0.0}
+        with open(self.path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        total = len(rows) or 1
+        hits = len([r for r in rows if r.get("success") == "1"])
+        return {"total_alerts": total, "hit_rate": hits / total}
 
 
 def profit_to_dict(profit: ProfitResult) -> dict:

@@ -184,11 +184,48 @@ class ProfitResult:
 @dataclass
 class AlertCondition:
     symbol: str
-    direction: Literal["above", "below"]
-    price: float
-    action: Literal["notify", "auto-order"] = "notify"
+    condition: Literal[
+        "price_above",
+        "price_below",
+        "range",
+        "percent_change",
+        "spread",
+        "volatility",
+    ] = "price_above"
+    price: float = 0.0
+    upper: Optional[float] = None
+    lower: Optional[float] = None
+    change_pct: Optional[float] = None
+    lookback_minutes: int = 5
+    spread_symbol: Optional[str] = None
+    spread_threshold: Optional[float] = None
+    volatility_threshold: Optional[float] = None
+    volatility_window: int = 5
+    action: Literal["notify", "auto-order", "start-trading"] = "notify"
+    direction: Optional[Literal["above", "below"]] = None
     size: float = 0
     side: Optional[Side] = None
+    channels: Optional[List[str]] = None
+
+
+@dataclass
+class AlertNotificationConfig:
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    lark_webhook: Optional[str] = None
+    webhook_url: Optional[str] = None
+    console: bool = True
+    play_sound: bool = False
+
+
+@dataclass
+class AlertRecord:
+    timestamp: datetime
+    symbol: str
+    condition: str
+    price: float
+    message: str
+    success: bool
 
 
 @dataclass
@@ -197,6 +234,7 @@ class TradingState:
     open_positions: Dict[str, Position] = field(default_factory=dict)
     recent_arbitrage: List[ArbitrageOpportunity] = field(default_factory=list)
     triggered_alerts: List[str] = field(default_factory=list)
+    alert_history: List[AlertRecord] = field(default_factory=list)
     account_positions: List[Position] = field(default_factory=list)
     equity: float = 0.0
     pnl: float = 0.0
@@ -208,3 +246,4 @@ class TradingState:
     min_profit_pct: float = 0.0
     price_monitor: Optional[object] = None
     per_exchange_limit: int = 2
+    price_history: Dict[str, List[Tuple[datetime, float]]] = field(default_factory=dict)

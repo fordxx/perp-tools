@@ -69,12 +69,30 @@ exchange_costs:
     funding_rate: 0.0
 alerts:
   - symbol: BTC/USDT
-    direction: above
+    condition: price_above
     price: 32000
     action: notify
+    channels: [console]
   - symbol: ETH/USDT
-    direction: below
-    price: 1800
+    condition: percent_change
+    change_pct: 0.02
+    lookback_minutes: 10
+    action: start-trading
+  - symbol: BTC/USDT
+    condition: spread
+    spread_symbol: ETH/USDT
+    spread_threshold: 0.01
+    direction: above
     action: auto-order
     size: 0.5
     side: buy
+
+notifications:
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  lark_webhook: ""
+  webhook_url: ""
+  console: true
+  play_sound: false
+
+alert_record_path: data/alerts.csv

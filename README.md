@@ -10,7 +10,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - **Dynamic profit gating** that adjusts the minimum profit floor using recent spread volatility and scores opportunities by profitability, liquidity, and venue reliability before execution.
 - **Concurrent pricing** with shared WebSocket price cache and asyncio-gather REST fallbacks, plus per-exchange rate limiting to avoid throttling.
 - **Trade recording and analytics hooks** that persist every arbitrage attempt to CSV/SQLite for later reliability scoring and dashboarding.
-- **Smart alerts** that trigger notifications or optional auto-orders when price rules are met.
+- **Smart alerts** with flexible conditions (breakouts, ranges, percent changes, spreads, volatility) that can notify across Telegram/Lark/webhooks/console/audio, auto-start trading, or fire venue-agnostic auto-orders with full history logging.
 - **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel, real-time position view, an equity/PnL curve, and controls to start/pause arbitrage or retune the minimum profit threshold.
 - **Config-driven setup** via `config.example.yaml`.
 
@@ -59,6 +59,10 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
 ### Risk and execution settings
 
 `config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `daily_loss_limit_pct` (default 8% stop for the UTC day), `max_consecutive_failures` (halts after three misses), `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings (default 0.5% move inside one second) to halt trading during violent moves. `loop_interval_seconds` controls how often the background loop refreshes quotes and evaluates spreads, while `arbitrage_min_profit_pct` can be tuned live from the web console. Dynamic safeguards now cover slippage caps, partial-fill hedging with timeouts, exchange-level circuit breakers, balance concentration warnings, and volatility-driven profit targets (`high_vol_min_profit_pct` vs `low_vol_min_profit_pct`) with priority-score gating.
+
+### Alerts & notifications
+
+Alerts are defined in `alerts` within the YAML config and support price breakouts, ranges, percent changes over a lookback window, cross-symbol spreads, and volatility triggers. Each alert can specify `channels` (console, telegram, lark, webhook, audio), an `action` (`notify`, `start-trading`, or `auto-order`), and per-alert sizing for auto-orders. Global notification credentials live under the `notifications` section, and every fired alert is recorded to `alert_record_path` (CSV or SQLite) for historical analytics.
 
 ### Environment & credentials
 

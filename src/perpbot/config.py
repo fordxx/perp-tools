@@ -4,7 +4,7 @@ import yaml
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-from perpbot.models import AlertCondition, ExchangeCost
+from perpbot.models import AlertCondition, AlertNotificationConfig, ExchangeCost
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 
@@ -50,12 +50,15 @@ class BotConfig:
     balance_concentration_pct: float = 0.5
     per_exchange_limit: int = 2
     trade_record_path: str = "data/trades.csv"
+    alert_record_path: str = "data/alerts.csv"
+    notifications: AlertNotificationConfig = field(default_factory=AlertNotificationConfig)
 
 
 def load_config(path: str) -> BotConfig:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     alerts = [AlertCondition(**a) for a in data.get("alerts", [])]
+    notifications = AlertNotificationConfig(**(data.get("notifications") or {}))
     exchange_costs = {
         name: ExchangeCost(**cfg)
         for name, cfg in (data.get("exchange_costs", {}) or {}).items()
@@ -100,4 +103,6 @@ def load_config(path: str) -> BotConfig:
         balance_concentration_pct=data.get("balance_concentration_pct", 0.5),
         per_exchange_limit=data.get("per_exchange_limit", 2),
         trade_record_path=data.get("trade_record_path", "data/trades.csv"),
+        alert_record_path=data.get("alert_record_path", "data/alerts.csv"),
+        notifications=notifications,
     )

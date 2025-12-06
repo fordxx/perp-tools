@@ -17,7 +17,7 @@ from perpbot.monitoring.alerts import process_alerts
 from perpbot.monitoring.web_console import create_web_app
 from perpbot.models import TradingState
 from perpbot.position_guard import PositionGuard
-from perpbot.persistence import TradeRecorder
+from perpbot.persistence import AlertRecorder, TradeRecorder
 from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
@@ -68,6 +68,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         cooldown_seconds=cfg.risk_cooldown_seconds,
     )
     recorder = TradeRecorder(cfg.trade_record_path)
+    alert_recorder = AlertRecorder(cfg.alert_record_path)
     volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
     risk_manager = RiskManager(
         assumed_equity=cfg.assumed_equity,
@@ -116,7 +117,15 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         return
 
     # Auto alerts and monitoring
-    process_alerts(state, cfg.alerts, exchanges)
+    process_alerts(
+        state,
+        cfg.alerts,
+        exchanges,
+        notification_cfg=cfg.notifications,
+        execute_orders=state.trading_enabled,
+        start_trading_cb=lambda: setattr(state, "trading_enabled", True),
+        alert_recorder=alert_recorder.record,
+    )
 
     # Discover arbitrage
     opportunities = find_arbitrage_opportunities(
