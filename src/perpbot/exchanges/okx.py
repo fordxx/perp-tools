@@ -14,7 +14,7 @@ import httpx
 import websockets
 
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import Order, OrderBookDepth, OrderRequest, Position, PriceQuote
+from perpbot.models import Balance, Order, OrderBookDepth, OrderRequest, Position, PriceQuote
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ class OKXClient(ExchangeClient):
             self.ws_url = "wss://wspap.okx.com:8443/ws/v5/private"
         self._client: Optional[httpx.Client] = None
         self._order_handler: Optional[Callable[[dict], None]] = None
+        self._position_handler: Optional[Callable[[dict], None]] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -203,9 +204,34 @@ class OKXClient(ExchangeClient):
             positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
         return positions
 
+    def get_account_balances(self) -> List[Balance]:
+        resp = self._request("GET", "/api/v5/account/balance")
+        balances: List[Balance] = []
+        for raw in resp.json().get("data", []):
+            for detail in raw.get("details", []):
+                try:
+                    total = float(detail.get("cashBal", 0))
+                    available = float(detail.get("availBal", 0))
+                    locked = total - available
+                    balances.append(
+                        Balance(
+                            asset=detail.get("ccy", ""),
+                            free=available,
+                            locked=locked,
+                            total=total,
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to parse OKX balance payload: %s", detail)
+        return balances
+
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
         self._order_handler = handler
         logger.info("Registered OKX order update handler")
+
+    def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
+        self._position_handler = handler
+        logger.info("Registered OKX position update handler")
 
     # WebSocket
     def _start_private_ws(self) -> None:
@@ -236,11 +262,24 @@ class OKXClient(ExchangeClient):
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=15, extra_headers=headers) as ws:
                         await ws.send(json.dumps(self._login_payload()))
+                        subscriptions = []
                         if self._order_handler:
-                            await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "orders", "instType": "SWAP"}]}))
+                            subscriptions.append({"channel": "orders", "instType": "SWAP"})
+                        if self._position_handler:
+                            subscriptions.append({"channel": "positions", "instType": "SWAP"})
+                        if subscriptions:
+                            await ws.send(json.dumps({"op": "subscribe", "args": subscriptions}))
                         async for msg in ws:
                             data = json.loads(msg)
-                            if self._order_handler and data.get("event") is None:
+                            if data.get("event") is not None:
+                                continue
+                            channel = None
+                            if isinstance(data, dict):
+                                arg = data.get("arg", {})
+                                channel = arg.get("channel")
+                            if channel == "positions" and self._position_handler:
+                                self._position_handler(data)
+                            elif channel == "orders" and self._order_handler:
                                 self._order_handler(data)
                 except Exception as exc:  # pragma: no cover - network dependent
                     logger.exception("OKX private stream error: %s", exc)

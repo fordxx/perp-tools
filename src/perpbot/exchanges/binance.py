@@ -14,7 +14,7 @@ import httpx
 import websockets
 
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import Order, OrderBookDepth, OrderRequest, Position, PriceQuote
+from perpbot.models import Balance, Order, OrderBookDepth, OrderRequest, Position, PriceQuote
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,7 @@ class BinanceClient(ExchangeClient):
         self.ws_base = "wss://stream.binancefuture.com" if use_testnet else "wss://fstream.binance.com"
         self._client: Optional[httpx.Client] = None
         self._order_handler: Optional[Callable[[dict], None]] = None
+        self._position_handler: Optional[Callable[[dict], None]] = None
         self._listen_key: Optional[str] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -85,7 +86,10 @@ class BinanceClient(ExchangeClient):
                     async with websockets.connect(url, ping_interval=15) as ws:
                         async for msg in ws:
                             data = json.loads(msg)
-                            if self._order_handler:
+                            event_type = data.get("e") or data.get("eventType")
+                            if event_type == "ACCOUNT_UPDATE" and self._position_handler:
+                                self._position_handler(data)
+                            elif self._order_handler:
                                 self._order_handler(data)
                 except Exception as exc:  # pragma: no cover - network dependent
                     logger.exception("Binance user stream error: %s", exc)
@@ -213,6 +217,27 @@ class BinanceClient(ExchangeClient):
             positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
         return positions
 
+    def get_account_balances(self) -> List[Balance]:
+        resp = self._signed_request("GET", "/fapi/v2/balance")
+        balances: List[Balance] = []
+        for raw in resp.json():
+            try:
+                balances.append(
+                    Balance(
+                        asset=raw.get("asset", ""),
+                        free=float(raw.get("availableBalance", 0)),
+                        locked=float(raw.get("balance", 0)) - float(raw.get("availableBalance", 0)),
+                        total=float(raw.get("balance", 0)),
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to parse Binance balance row: %s", raw)
+        return balances
+
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
         self._order_handler = handler
         logger.info("Registered Binance order update handler")
+
+    def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
+        self._position_handler = handler
+        logger.info("Registered Binance position update handler")

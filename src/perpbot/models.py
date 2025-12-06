@@ -88,6 +88,18 @@ class Order:
 
 
 @dataclass
+class Balance:
+    asset: str
+    free: float
+    locked: float = 0.0
+    total: float = 0.0
+
+    @property
+    def available(self) -> float:
+        return self.free
+
+
+@dataclass
 class Position:
     id: str
     order: Order

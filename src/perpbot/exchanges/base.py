@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from perpbot.models import (
     AlertCondition,
     Order,
+    Balance,
     OrderBookDepth,
     OrderRequest,
     Position,
@@ -81,8 +82,16 @@ class ExchangeClient(ABC):
         ...
 
     @abstractmethod
+    def get_account_balances(self) -> List[Balance]:
+        ...
+
+    @abstractmethod
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
         ...
+
+    def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
+        """Optional hook for streaming position updates."""
+        self._position_handler = handler  # type: ignore[attr-defined]
 
     # Backward-compatible helpers
     def fetch_price(self, symbol: str) -> PriceQuote:
@@ -110,6 +119,8 @@ class RESTWebSocketExchangeClient(ExchangeClient):
     open_orders_endpoint: str = "/api/v1/trade/open-orders"
     positions_endpoint: str = "/api/v1/account/positions"
     ws_orders_channel: str = "orders"
+    ws_positions_channel: str = "positions"
+    balance_endpoint: str = "/api/v1/account/balances"
 
     def __init__(
         self,
@@ -134,6 +145,7 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         self.ws_url: Optional[str] = None
         self._client: Optional[httpx.Client] = None
         self._order_handler: Optional[Callable[[dict], None]] = None
+        self._position_handler: Optional[Callable[[dict], None]] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -197,8 +209,12 @@ class RESTWebSocketExchangeClient(ExchangeClient):
             asks=[(float(p), float(q)) for p, q in asks],
         )
 
+    def _format_symbol(self, symbol: str) -> str:
+        return symbol
+
     def get_current_price(self, symbol: str) -> PriceQuote:
-        resp = self._request("GET", self.ticker_endpoint, params={"symbol": symbol})
+        market = self._format_symbol(symbol)
+        resp = self._request("GET", self.ticker_endpoint, params={"symbol": market})
         data = resp.json()
         if isinstance(data, dict):
             payload = data.get("data", data)
@@ -211,15 +227,17 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         return PriceQuote(exchange=self.name, symbol=symbol, bid=bid, ask=ask, order_book=order_book)
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
-        resp = self._request("GET", self.orderbook_endpoint, params={"symbol": symbol, "depth": depth})
+        market = self._format_symbol(symbol)
+        resp = self._request("GET", self.orderbook_endpoint, params={"symbol": market, "depth": depth})
         data = resp.json()
         book_data = data.get("data", data) if isinstance(data, dict) else data
         depth_obj = self._parse_orderbook(book_data)
         return depth_obj
 
     def place_open_order(self, request: OrderRequest) -> Order:
+        market = self._format_symbol(request.symbol)
         body = {
-            "symbol": request.symbol,
+            "symbol": market,
             "side": request.side,
             "type": "limit" if request.limit_price is not None else "market",
             "size": request.size,
@@ -233,9 +251,10 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         return Order(id=order_id, exchange=self.name, symbol=request.symbol, side=request.side, size=request.size, price=price)
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
+        market = self._format_symbol(position.order.symbol)
         closing_side = "sell" if position.order.side == "buy" else "buy"
         body = {
-            "symbol": position.order.symbol,
+            "symbol": market,
             "side": closing_side,
             "type": "market",
             "size": position.order.size,
@@ -248,14 +267,16 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         return Order(id=order_id, exchange=self.name, symbol=position.order.symbol, side=closing_side, size=position.order.size, price=price)
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
+        market = self._format_symbol(symbol) if symbol else None
         params = {"orderId": order_id}
-        if symbol:
-            params["symbol"] = symbol
+        if market:
+            params["symbol"] = market
         self._request("POST", self.cancel_endpoint, json_body=params)
         logger.info("Cancelled %s order %s", self.name, order_id)
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        params = {"symbol": symbol} if symbol else None
+        market = self._format_symbol(symbol) if symbol else None
+        params = {"symbol": market} if market else None
         resp = self._request("GET", self.open_orders_endpoint, params=params)
         payload = resp.json()
         orders_data = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -289,6 +310,22 @@ class RESTWebSocketExchangeClient(ExchangeClient):
             positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
         return positions
 
+    def get_account_balances(self) -> List[Balance]:
+        resp = self._request("GET", self.balance_endpoint)
+        payload = resp.json()
+        balances_data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        balances: List[Balance] = []
+        for raw in balances_data or []:
+            try:
+                asset = raw.get("asset") or raw.get("currency") or raw.get("coin")
+                free = float(raw.get("free", raw.get("available", 0)))
+                locked = float(raw.get("locked", raw.get("frozen", 0) or 0))
+                total = float(raw.get("total", free + locked))
+                balances.append(Balance(asset=asset, free=free, locked=locked, total=total))
+            except Exception:
+                logger.exception("Failed to parse balance payload on %s: %s", self.name, raw)
+        return balances
+
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
         self._order_handler = handler
         logger.info("Registered %s order update handler", self.name)
@@ -299,8 +336,21 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
         self._ws_thread.start()
 
-    def _ws_subscribe_message(self) -> dict:
-        return {"op": "subscribe", "channel": self.ws_orders_channel}
+    def _ws_subscribe_message(self) -> List[dict]:
+        channels = [self.ws_orders_channel]
+        if self.ws_positions_channel:
+            channels.append(self.ws_positions_channel)
+        return [
+            {"op": "subscribe", "channel": channel}
+            for channel in channels
+        ]
+
+    def _dispatch_ws_message(self, data: dict) -> None:
+        channel = data.get("channel") or data.get("topic")
+        if channel == self.ws_orders_channel and self._order_handler:
+            self._order_handler(data)
+        elif channel == self.ws_positions_channel and self._position_handler:
+            self._position_handler(data)
 
     def _run_ws(self) -> None:
         async def _consume() -> None:
@@ -308,13 +358,12 @@ class RESTWebSocketExchangeClient(ExchangeClient):
             while not self._stop_event.is_set():
                 try:
                     async with websockets.connect(self.ws_url, ping_interval=15) as ws:
-                        await ws.send(json.dumps(self._ws_subscribe_message()))
+                        for msg in self._ws_subscribe_message():
+                            await ws.send(json.dumps(msg))
                         async for msg in ws:
-                            if not self._order_handler:
-                                continue
                             try:
                                 data = json.loads(msg)
-                                self._order_handler(data)
+                                self._dispatch_ws_message(data)
                             except Exception:
                                 logger.exception("Error handling %s order stream message", self.name)
                 except Exception as exc:  # pragma: no cover - network dependent
