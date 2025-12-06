@@ -126,6 +126,7 @@ class ArbitrageOpportunity:
     size: float
     expected_pnl: float
     net_profit_pct: float
+    confidence: float = 1.0
     discovered_at: datetime = field(default_factory=datetime.utcnow)
 
 

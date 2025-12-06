@@ -110,6 +110,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         default_taker_fee_bps=cfg.default_taker_fee_bps,
         default_slippage_bps=cfg.default_slippage_bps,
         retry_cost_bps=cfg.retry_cost_bps,
+        failure_probability=cfg.failure_probability,
     )
     state.recent_arbitrage = opportunities
 

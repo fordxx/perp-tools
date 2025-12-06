@@ -160,6 +160,7 @@
               <th>Size</th>
               <th>Net %</th>
               <th>Exp. PnL</th>
+              <th>Confidence</th>
             </tr>
           </thead>
           <tbody></tbody>
@@ -229,7 +230,7 @@
           )}</td><td>${fmt(op.net_profit_pct * 100, 3)}%</td><td>${fmt(
             op.expected_pnl,
             4
-          )}</td>`;
+          )}</td><td>${fmt(op.confidence * 100, 1)}%</td>`;
           tbody.appendChild(tr);
         });
         document.getElementById("arbCount").textContent = ops.length;

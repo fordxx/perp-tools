@@ -138,6 +138,7 @@ class TradingService:
                 default_taker_fee_bps=self.cfg.default_taker_fee_bps,
                 default_slippage_bps=self.cfg.default_slippage_bps,
                 retry_cost_bps=self.cfg.retry_cost_bps,
+                failure_probability=self.cfg.failure_probability,
             )
             self.state.recent_arbitrage = opportunities
 

@@ -15,8 +15,9 @@ class BotConfig:
     position_size: float = 0.01
     profit_target_pct: float = 0.01
     arbitrage_edge: float = 0.003
-    arbitrage_min_profit_pct: float = 0.0005
+    arbitrage_min_profit_pct: float = 0.001
     arbitrage_trade_size: float = 0.01
+    failure_probability: float = 0.05
     max_risk_pct: float = 0.05
     risk_cooldown_seconds: int = 30
     assumed_equity: float = 10_000.0
@@ -43,8 +44,9 @@ def load_config(path: str) -> BotConfig:
         position_size=data.get("position_size", 0.01),
         profit_target_pct=data.get("profit_target_pct", 0.01),
         arbitrage_edge=data.get("arbitrage_edge", 0.003),
-        arbitrage_min_profit_pct=data.get("arbitrage_min_profit_pct", 0.0005),
+        arbitrage_min_profit_pct=data.get("arbitrage_min_profit_pct", 0.001),
         arbitrage_trade_size=data.get("arbitrage_trade_size", data.get("position_size", 0.01)),
+        failure_probability=data.get("failure_probability", 0.05),
         max_risk_pct=data.get("max_risk_pct", 0.05),
         risk_cooldown_seconds=data.get("risk_cooldown_seconds", 30),
         assumed_equity=data.get("assumed_equity", 10_000.0),

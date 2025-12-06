@@ -28,11 +28,12 @@ def _fee_bps(quote: PriceQuote, default_maker_fee_bps: float, default_taker_fee_
 def find_arbitrage_opportunities(
     quotes: Iterable[PriceQuote],
     trade_size: float,
-    min_profit_pct: float = 0.0005,
+    min_profit_pct: float = 0.001,
     default_maker_fee_bps: float = 2.0,
     default_taker_fee_bps: float = 5.0,
     default_slippage_bps: float = 1.0,
     retry_cost_bps: float = 0.5,
+    failure_probability: float = 0.05,
 ) -> List[ArbitrageOpportunity]:
     """
     Discover executable arbitrage signals across exchanges using depth-aware prices
@@ -75,9 +76,11 @@ def find_arbitrage_opportunities(
             )
 
             net_pnl = gross_pnl - fee_cost - funding_cost - retry_cost
-            net_profit_pct = net_pnl / (buy_price * trade_size)
+            success_prob = max(0.0, min(1.0, 1 - failure_probability))
+            expected_pnl = net_pnl * success_prob
+            net_profit_pct = expected_pnl / (buy_price * trade_size)
 
-            if net_pnl > 0 and net_profit_pct >= min_profit_pct:
+            if expected_pnl > 0 and net_profit_pct >= min_profit_pct:
                 opportunities.append(
                     ArbitrageOpportunity(
                         symbol=symbol,
@@ -86,8 +89,9 @@ def find_arbitrage_opportunities(
                         buy_price=buy_price,
                         sell_price=sell_price,
                         size=trade_size,
-                        expected_pnl=net_pnl,
+                        expected_pnl=expected_pnl,
                         net_profit_pct=net_profit_pct,
+                        confidence=success_prob,
                     )
                 )
     return opportunities
