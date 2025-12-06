@@ -40,8 +40,8 @@ def find_arbitrage_opportunities(
     reliability_scores: dict[str, float] | None = None,
 ) -> List[ArbitrageOpportunity]:
     """
-    Discover executable arbitrage signals across exchanges using depth-aware prices
-    and a conservative cost model.
+    Discover executable arbitrage signals across exchanges using各交易所自己的深度盘口，
+    不依赖中心化交易所锚定价，全部计算基于实时可成交价格与成本模型。
     """
 
     grouped: dict[str, List[PriceQuote]] = {}

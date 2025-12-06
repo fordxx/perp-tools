@@ -64,7 +64,7 @@ class ArbitrageExecutor:
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
         if getattr(buy_ex, "venue_type", "dex") != "dex" or getattr(sell_ex, "venue_type", "dex") != "dex":
-            msg = "中心化交易所只能做参考定价，不能用于套利执行"
+            msg = "中心化交易所仅做行情参考/风控过滤，套利执行严格基于各交易所实时盘口"
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
