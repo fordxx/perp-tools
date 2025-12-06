@@ -58,7 +58,14 @@ class CapitalReservation:
 
 
 class CapitalOrchestrator:
-    """资金调度与风险分层总控，负责在下单前分配/冻结资金。"""
+    """资金调度与风险分层总控，负责在下单前分配/冻结资金。
+
+    设计约束：
+    - 作为独立模块存在，可被单独引用或删除，而不影响既有套利与风控主流程。
+    - 通过显式方法（update_* / reserve_for_strategy / release / record_volume_result）对外暴露接口，
+      不修改任何交易所、套利、风控模块内部逻辑。
+    - 支持在 demo/独立脚本中直接运行，便于验证资金分层的占用与释放行为。
+    """
 
     def __init__(
         self,

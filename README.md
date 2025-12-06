@@ -45,14 +45,15 @@
   4. 当监测到单所回撤超过 `capital_drawdown_limit_pct` 时，`update_drawdown` 会将该所切换至安全模式，只允许“刷量对冲 + 费率层”并可自动降仓/熔断。
   5. `current_snapshot` 提供 Web/监控端的分层水位，用于可视化 L1-L5 的占用与剩余额度。
 
-- **对接方式**：`ArbitrageExecutor` 已在下单前向 `CapitalOrchestrator` 申请额度，`cli.py` 与 Web `TradingService` 默认加载配置中的五层比例（L1 20%、L2 30%、L3 25%、L4 10%、L5 15%）并为每个交易所初始化 1 WU 资金池，未来可扩展为实时余额/回撤驱动的动态调整。
+  - **对接方式**：`ArbitrageExecutor` 已在下单前向 `CapitalOrchestrator` 申请额度，`cli.py` 与 Web `TradingService` 默认加载配置中的五层比例（L1 20%、L2 30%、L3 25%、L4 10%、L5 15%）并为每个交易所初始化 1 WU 资金池，未来可扩展为实时余额/回撤驱动的动态调整。模块可独立运行/删除，不会影响原套利与风控主流程；可通过 `PYTHONPATH=src python -m perpbot.demos.capital_orchestrator_demo` 独立验证接口。
 
 ## 跨所永续对冲刷量（hedge_volume_engine）
 
 - **目标**：使用两家交易所的永续合约同时开多/开空对冲，产生成交量并控制风险暴露。
-- **资金来源**：下单前向 `CapitalOrchestrator` 的 L1 层申请 300–800 USDT（可配）名义额度，缺口可暂借 L5；执行后自动释放并通过 `record_volume_result` 回传 volume/fee/pnl。
-- **流程**：预检查余额/盘口/合约状态 → 并发开仓（时间差阈值控制）→ 随机持仓 10–60 秒 → 并发平仓 → 记录结果、累计亏损保护。
-- **风控**：
+  - **资金来源**：下单前向 `CapitalOrchestrator` 的 L1 层申请 300–800 USDT（可配）名义额度，缺口可暂借 L5；执行后自动释放并通过 `record_volume_result` 回传 volume/fee/pnl。
+  - **模块边界**：完全独立，通过显式传入交易所实例与资本总控对接，删除该模块不影响原系统；可用 `PYTHONPATH=src python -m perpbot.demos.hedge_volume_demo` 独立运行演示。
+  - **流程**：预检查余额/盘口/合约状态 → 并发开仓（时间差阈值控制）→ 随机持仓 10–60 秒 → 并发平仓 → 记录结果、累计亏损保护。
+  - **风控**：
   - 预估滑点超阈值直接放弃；
   - 仅一边成交则立即回滚；
   - 单所刷量累计亏损超过阈值（默认 2% WU）自动暂停该所刷量。
