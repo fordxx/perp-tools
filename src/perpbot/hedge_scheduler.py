@@ -18,7 +18,11 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Set
 
-from perpbot.capital_orchestrator import CapitalOrchestrator
+from perpbot.capital.simple_capital_orchestrator import (
+    CapitalPool,
+    CapitalReservation,
+    SimpleCapitalOrchestrator,
+)
 
 
 class JobStatus(Enum):
@@ -237,14 +241,14 @@ class HedgeScheduler:
 
     def __init__(
         self,
-        capital_orchestrator: Optional[CapitalOrchestrator] = None,
+        capital_orchestrator: Optional[SimpleCapitalOrchestrator] = None,
         config: Optional[SchedulerConfig] = None
     ):
         """
         初始化调度器
 
         Args:
-            capital_orchestrator: 资金调度器实例
+            capital_orchestrator: 简化资金调度器实例（SimpleCapitalOrchestrator）
             config: 调度器配置
         """
         self.capital = capital_orchestrator
@@ -253,6 +257,9 @@ class HedgeScheduler:
 
         # 执行回调函数字典 {source: executor_func}
         self.executors: Dict[JobSource, Callable] = {}
+
+        import logging
+        self.logger = logging.getLogger(__name__)
 
     def register_executor(self, source: JobSource, executor_func: Callable):
         """
@@ -404,20 +411,61 @@ class HedgeScheduler:
             if not can_schedule:
                 continue
 
-            # 4. 预留资金
+            # 4. 预留资金（使用简化的三层接口）
+            reservations: List[CapitalReservation] = []
             if self.capital:
                 try:
-                    # TODO: 调用 capital.reserve_for_strategy(...)
-                    # reservation = self.capital.reserve_for_strategy(
-                    #     exchanges=list(job.exchanges),
-                    #     amount=job.notional,
-                    #     strategy=job.source.value
-                    # )
-                    # job.metadata["capital_reservation"] = reservation
-                    pass
+                    # 根据任务来源选择资金池
+                    for exchange in job.exchanges:
+                        if job.source == JobSource.HEDGE_VOLUME:
+                            # 刷量任务使用 S1_wash 池
+                            reservation = self.capital.reserve_wash(exchange, job.notional)
+                            self.logger.info(
+                                "[调度器] 任务 %s 使用 S1_wash 池: %s %.2f",
+                                job.job_id[:8], exchange, job.notional
+                            )
+                        elif job.source in (JobSource.ARBITRAGE, JobSource.MARKET_MAKING):
+                            # 套利/做市任务使用 S2_arb 池
+                            reservation = self.capital.reserve_arb(exchange, job.notional)
+                            self.logger.info(
+                                "[调度器] 任务 %s 使用 S2_arb 池: %s %.2f",
+                                job.job_id[:8], exchange, job.notional
+                            )
+                        else:
+                            # 手动任务也使用 S2_arb 池
+                            reservation = self.capital.reserve_arb(exchange, job.notional)
+                            self.logger.info(
+                                "[调度器] 任务 %s (manual) 使用 S2_arb 池: %s %.2f",
+                                job.job_id[:8], exchange, job.notional
+                            )
+
+                        if not reservation.approved:
+                            # 资金预留失败，回滚已预留的
+                            for prev_res in reservations:
+                                self.capital.release(prev_res)
+                            rejected_count += 1
+                            rejected_reasons[f"Capital: {reservation.reason}"] += 1
+                            self.logger.warning(
+                                "[调度器] 任务 %s 资金预留失败: %s",
+                                job.job_id[:8], reservation.reason
+                            )
+                            break
+                        else:
+                            reservations.append(reservation)
+                    else:
+                        # 所有交易所都预留成功
+                        job.metadata["capital_reservations"] = reservations
+                        # 继续执行
+                    if not reservations or not all(r.approved for r in reservations):
+                        continue
                 except Exception as e:
+                    # 预留过程出错，回滚
+                    for res in reservations:
+                        if res.approved:
+                            self.capital.release(res)
                     rejected_count += 1
-                    rejected_reasons[f"Capital reservation failed: {e}"] += 1
+                    rejected_reasons[f"Capital exception: {e}"] += 1
+                    self.logger.error("[调度器] 资金预留异常: %s", e)
                     continue
 
             # 5. 提交执行
@@ -506,12 +554,20 @@ class HedgeScheduler:
             self.state.exchange_notional[exchange] -= job.notional
 
         # 释放资金
-        if self.capital and "capital_reservation" in job.metadata:
+        if self.capital and "capital_reservations" in job.metadata:
+            reservations = job.metadata["capital_reservations"]
             try:
-                # TODO: 调用 capital.release(job.metadata["capital_reservation"])
-                pass
+                for reservation in reservations:
+                    self.capital.release(reservation)
+                    self.logger.info(
+                        "[调度器] 任务 %s 释放资金: %s %s %.2f",
+                        job.job_id[:8],
+                        reservation.exchange,
+                        reservation.pool.value if reservation.pool else "unknown",
+                        reservation.amount
+                    )
             except Exception as e:
-                print(f"Failed to release capital: {e}")
+                self.logger.error("[调度器] 释放资金失败: %s", e)
 
     def get_scheduler_state(self) -> Dict:
         """
