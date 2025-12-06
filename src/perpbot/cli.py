@@ -72,6 +72,8 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         enforce_direction_consistency=cfg.enforce_direction_consistency,
         freeze_threshold_pct=cfg.freeze_threshold_pct,
         freeze_window_seconds=cfg.freeze_window_seconds,
+        max_trade_risk_pct=cfg.max_risk_pct,
+        daily_loss_limit_pct=cfg.daily_loss_limit_pct,
     )
     positions = []
     for ex in exchanges:

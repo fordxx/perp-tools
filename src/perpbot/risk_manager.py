@@ -19,8 +19,10 @@ class RiskManager:
         max_consecutive_failures: int = 3,
         max_symbol_exposure_pct: float = 0.2,
         enforce_direction_consistency: bool = True,
-        freeze_threshold_pct: float = 0.02,
+        freeze_threshold_pct: float = 0.005,
         freeze_window_seconds: int = 1,
+        max_trade_risk_pct: float = 0.05,
+        daily_loss_limit_pct: float = 0.08,
     ):
         self.assumed_equity = max(assumed_equity, 1.0)
         self.peak_equity = self.assumed_equity
@@ -31,6 +33,8 @@ class RiskManager:
         self.enforce_direction_consistency = enforce_direction_consistency
         self.freeze_threshold_pct = freeze_threshold_pct
         self.freeze_window = timedelta(seconds=freeze_window_seconds)
+        self.max_trade_risk_pct = max_trade_risk_pct
+        self.daily_loss_limit_pct = daily_loss_limit_pct
 
         self.consecutive_failures = 0
         self.trading_halted = False
@@ -38,6 +42,8 @@ class RiskManager:
         self._frozen_until: Optional[datetime] = None
         self._freeze_reason: Optional[str] = None
         self._last_price: Dict[str, Tuple[float, datetime]] = {}
+        self._daily_anchor_equity = self.assumed_equity
+        self._daily_anchor_date = datetime.utcnow().date()
 
     def collect_positions(self, exchanges: Iterable) -> List[Position]:
         positions: List[Position] = []
@@ -50,6 +56,12 @@ class RiskManager:
 
     def update_equity(self, positions: Sequence[Position], quotes: Optional[Iterable[PriceQuote]] = None) -> float:
         quote_map = {q.symbol: q for q in quotes} if quotes else {}
+        now = datetime.utcnow()
+        if now.date() != self._daily_anchor_date:
+            # reset daily anchor at UTC midnight to monitor fresh day losses
+            self._daily_anchor_date = now.date()
+            self._daily_anchor_equity = self.last_equity or self.assumed_equity
+
         equity = self.assumed_equity
         for pos in positions:
             price = quote_map.get(pos.order.symbol).mid if quote_map.get(pos.order.symbol) else pos.order.price
@@ -62,6 +74,13 @@ class RiskManager:
             self.trading_halted = True
             self.halt_reason = f"Max drawdown reached: {drawdown * 100:.2f}%"
             logger.warning(self.halt_reason)
+
+        if self.daily_loss_limit_pct and self._daily_anchor_equity:
+            daily_loss = (self._daily_anchor_equity - self.last_equity) / self._daily_anchor_equity
+            if daily_loss >= self.daily_loss_limit_pct:
+                self.trading_halted = True
+                self.halt_reason = f"Daily loss limit reached: {daily_loss * 100:.2f}%"
+                logger.warning(self.halt_reason)
         return self.last_equity
 
     def evaluate_market(self, quotes: Iterable[PriceQuote]) -> None:
@@ -98,6 +117,10 @@ class RiskManager:
             return False, "Max consecutive failures reached"
 
         equity = max(self.last_equity, self.assumed_equity)
+        notional = size * price
+        if self.max_trade_risk_pct and equity > 0 and notional > equity * self.max_trade_risk_pct:
+            return False, f"Notional exceeds {self.max_trade_risk_pct * 100:.2f}% trade cap"
+
         net_size, _ = self._symbol_net_and_exposure(symbol, positions, quotes, price)
         direction = 1 if side == "buy" else -1
         new_net = net_size + direction * size
@@ -122,6 +145,10 @@ class RiskManager:
     def record_failure(self) -> None:
         self.consecutive_failures += 1
         logger.warning("Trade failure recorded; streak=%s", self.consecutive_failures)
+        if self.max_consecutive_failures and self.consecutive_failures >= self.max_consecutive_failures:
+            self.trading_halted = True
+            self.halt_reason = "Max consecutive failures reached"
+            logger.error(self.halt_reason)
 
     def record_success(self) -> None:
         if self.consecutive_failures:

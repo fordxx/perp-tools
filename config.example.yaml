@@ -15,8 +15,9 @@ max_drawdown_pct: 0.1
 max_consecutive_failures: 3
 max_symbol_exposure_pct: 0.2
 enforce_direction_consistency: true
-freeze_threshold_pct: 0.02
+freeze_threshold_pct: 0.005
 freeze_window_seconds: 1
+daily_loss_limit_pct: 0.08
 loop_interval_seconds: 2
 default_maker_fee_bps: 2.0
 default_taker_fee_bps: 5.0

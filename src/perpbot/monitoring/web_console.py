@@ -76,6 +76,8 @@ class TradingService:
             enforce_direction_consistency=cfg.enforce_direction_consistency,
             freeze_threshold_pct=cfg.freeze_threshold_pct,
             freeze_window_seconds=cfg.freeze_window_seconds,
+            max_trade_risk_pct=cfg.max_risk_pct,
+            daily_loss_limit_pct=cfg.daily_loss_limit_pct,
         )
         self.executor = ArbitrageExecutor(self.exchanges, self.guard, risk_manager=self.risk_manager)
         self.strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
