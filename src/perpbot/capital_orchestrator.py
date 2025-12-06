@@ -2,24 +2,23 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class CapitalLayerState:
-    """资金分层状态，记录当前层的目标权重与占用情况。"""
+class PoolState:
+    """三层极简模型下的单个资金池。"""
 
     name: str
-    target_pct: float
-    max_usage_pct: float
+    budget_pct: float
     pool: float = 0.0
     allocated: float = 0.0
 
     @property
     def available(self) -> float:
-        return max(self.pool * self.max_usage_pct - self.allocated, 0.0)
+        return max(self.pool - self.allocated, 0.0)
 
     def allocate(self, amount: float) -> bool:
         if amount <= self.available + 1e-9:
@@ -32,20 +31,15 @@ class CapitalLayerState:
 
 
 @dataclass
-class ExchangeCapitalProfile:
+class ExchangePoolProfile:
     exchange: str
     equity: float
-    layers: Dict[str, CapitalLayerState]
+    pools: Dict[str, PoolState]
     drawdown_pct: float = 0.0
     safe_mode: bool = False
     total_volume: float = 0.0
     total_fee: float = 0.0
     realized_pnl: float = 0.0
-
-    def allowed_layers(self, safe_layers: List[str]) -> List[str]:
-        if self.safe_mode:
-            return [l for l in self.layers if l in safe_layers]
-        return list(self.layers.keys())
 
 
 @dataclass
@@ -58,18 +52,15 @@ class CapitalReservation:
 
 
 class CapitalOrchestrator:
-    """资金调度与风险分层总控，负责在下单前分配/冻结资金。
-
-    设计约束：
-    - 作为独立模块存在，可被单独引用或删除，而不影响既有套利与风控主流程。
-    - 通过显式方法（update_* / reserve_for_strategy / release / record_volume_result）对外暴露接口，
-      不修改任何交易所、套利、风控模块内部逻辑。
-    - 支持在 demo/独立脚本中直接运行，便于验证资金分层的占用与释放行为。
-    """
+    """三层极简刷量优先模型的资金总控。"""
 
     def __init__(
         self,
         wu_size: float = 10_000.0,
+        wash_budget_pct: float = 0.7,
+        arb_budget_pct: float = 0.2,
+        reserve_pct: float = 0.1,
+        # 兼容旧配置参数，保持接口不报错
         layer_targets: Optional[Dict[str, float]] = None,
         layer_max_usage: Optional[Dict[str, float]] = None,
         safe_layers: Optional[List[str]] = None,
@@ -77,120 +68,117 @@ class CapitalOrchestrator:
         drawdown_limit_pct: float = 0.05,
     ) -> None:
         self.wu_size = wu_size
-        self.layer_targets = layer_targets or {
-            "L1": 0.2,
-            "L2": 0.3,
-            "L3": 0.25,
-            "L4": 0.1,
-            "L5": 0.15,
-        }
-        self.layer_max_usage = layer_max_usage or {
-            "L1": 1.0,
-            "L2": 1.0,
-            "L3": 1.0,
-            "L4": 1.0,
-            "L5": 1.0,
-        }
-        self.safe_layers = safe_layers or ["L1", "L4"]
-        self.allow_borrow_from_l5 = allow_borrow_from_l5
+        # 如传入旧的 layer_targets，则尝试从中推导三层比例
+        if layer_targets and {"L1", "L2", "L3", "L4", "L5"} <= set(layer_targets):
+            wash_budget_pct = layer_targets.get("L1", wash_budget_pct) + layer_targets.get("L2", 0.0)
+            arb_budget_pct = layer_targets.get("L3", arb_budget_pct)
+            reserve_pct = layer_targets.get("L4", 0.0) + layer_targets.get("L5", reserve_pct)
+        self.wash_budget_pct, self.arb_budget_pct, self.reserve_pct = self._normalize_budget(
+            wash_budget_pct, arb_budget_pct, reserve_pct
+        )
         self.drawdown_limit_pct = drawdown_limit_pct
-        self.exchange_profiles: Dict[str, ExchangeCapitalProfile] = {}
+        self.safe_layers = safe_layers or ["wash", "reserve"]
+        self.exchange_profiles: Dict[str, ExchangePoolProfile] = {}
 
-    def _ensure_profile(self, exchange: str) -> ExchangeCapitalProfile:
+    def _normalize_budget(self, wash: float, arb: float, reserve: float) -> Tuple[float, float, float]:
+        total = wash + arb + reserve
+        if total <= 0:
+            raise ValueError("资金占比配置非法，总和 <= 0")
+        if abs(total - 1.0) > 1e-6:
+            logger.warning("资金占比总和 %.4f 非 1.0，将自动归一化", total)
+            wash, arb, reserve = wash / total, arb / total, reserve / total
+        return wash, arb, reserve
+
+    def _ensure_profile(self, exchange: str) -> ExchangePoolProfile:
         if exchange not in self.exchange_profiles:
-            layers = {
-                name: CapitalLayerState(
-                    name=name,
-                    target_pct=pct,
-                    max_usage_pct=self.layer_max_usage.get(name, 1.0),
-                    pool=self.wu_size * pct,
-                )
-                for name, pct in self.layer_targets.items()
+            pools = {
+                "wash": PoolState(name="wash", budget_pct=self.wash_budget_pct, pool=self.wu_size * self.wash_budget_pct),
+                "arb": PoolState(name="arb", budget_pct=self.arb_budget_pct, pool=self.wu_size * self.arb_budget_pct),
+                "reserve": PoolState(
+                    name="reserve", budget_pct=self.reserve_pct, pool=self.wu_size * self.reserve_pct
+                ),
             }
-            self.exchange_profiles[exchange] = ExchangeCapitalProfile(
+            self.exchange_profiles[exchange] = ExchangePoolProfile(
                 exchange=exchange,
                 equity=self.wu_size,
-                layers=layers,
+                pools=pools,
             )
-            logger.info("初始化交易所资金分层: %s 目标资金 %.2f", exchange, self.wu_size)
+            logger.info("初始化交易所资金池(三层模型): %s 目标资金 %.2f", exchange, self.wu_size)
         return self.exchange_profiles[exchange]
 
     def update_equity(self, exchange: str, equity: float) -> None:
         profile = self._ensure_profile(exchange)
         profile.equity = equity
-        for layer in profile.layers.values():
-            layer.pool = equity * self.layer_targets.get(layer.name, 0.0)
+        profile.pools["wash"].pool = equity * self.wash_budget_pct
+        profile.pools["arb"].pool = equity * self.arb_budget_pct
+        profile.pools["reserve"].pool = equity * self.reserve_pct
         logger.debug("更新 %s 资金池: equity=%.2f", exchange, equity)
 
     def update_drawdown(self, exchange: str, drawdown_pct: float) -> None:
         profile = self._ensure_profile(exchange)
         profile.drawdown_pct = drawdown_pct
-        if drawdown_pct >= self.drawdown_limit_pct:
-            profile.safe_mode = True
-            logger.warning("%s 触发单所回撤限制，进入安全模式，仅开放 %s", exchange, ",".join(self.safe_layers))
-        else:
-            profile.safe_mode = False
+        profile.safe_mode = drawdown_pct >= self.drawdown_limit_pct
+        if profile.safe_mode:
+            logger.warning("%s 回撤 %.2f%% 触发安全模式，仅开放 %s", exchange, drawdown_pct * 100, ",".join(self.safe_layers))
 
-    def _borrow_from_l5(self, profile: ExchangeCapitalProfile, amount: float) -> bool:
-        l5 = profile.layers.get("L5")
-        if not l5:
-            return False
-        return l5.allocate(amount)
-
-    def _allocate_single(self, profile: ExchangeCapitalProfile, layer: str, amount: float) -> Optional[str]:
-        state = profile.layers.get(layer)
+    def _allocate_pool(self, profile: ExchangePoolProfile, pool: str, amount: float) -> bool:
+        state = profile.pools.get(pool)
         if not state:
-            return None
-        if state.allocate(amount):
-            return layer
-        if layer != "L5" and self.allow_borrow_from_l5:
-            borrowed = self._borrow_from_l5(profile, amount)
-            if borrowed:
-                logger.info("%s %s 资金不足，已直接从 L5 调度 %.2f", profile.exchange, layer, amount)
-                return "L5"
-        return None
+            return False
+        return state.allocate(amount)
 
     def reserve_for_strategy(
-        self,
-        exchanges: List[str],
-        amount: float,
-        strategy: str = "arbitrage",
+        self, exchanges: List[str], amount: float, strategy: str = "arbitrage"
     ) -> CapitalReservation:
+        pool = self._strategy_to_pool(strategy)
         allocations: Dict[str, Tuple[str, float]] = {}
-        target_layer = self._strategy_to_layer(strategy)
         for ex in exchanges:
-            profile = self._ensure_profile(ex)
-            if profile.safe_mode and target_layer not in self.safe_layers:
-                target_layer = self.safe_layers[0]
-            if target_layer not in profile.allowed_layers(self.safe_layers):
-                return CapitalReservation(False, reason=f"{ex} 当前仅允许 {','.join(self.safe_layers)}", allocations={})
-            used_layer = self._allocate_single(profile, target_layer, amount)
-            if not used_layer:
-                return CapitalReservation(False, reason=f"{ex} {target_layer} 资金不足", allocations={})
-            allocations[ex] = (used_layer, amount)
+            if self.reserve_for_pool(ex, pool, amount):
+                allocations[ex] = (pool, amount)
+            else:
+                return CapitalReservation(False, reason=f"{ex} {pool} 资金不足", allocations={})
         return CapitalReservation(True, allocations=allocations)
 
-    def release(self, reservation: CapitalReservation) -> None:
-        for ex, (layer, amount) in reservation.allocations.items():
+    def reserve_for_wash(self, exchange: str, amount: float) -> bool:
+        return self.reserve_for_pool(exchange, "wash", amount)
+
+    def reserve_for_arb(self, exchange: str, amount: float) -> bool:
+        return self.reserve_for_pool(exchange, "arb", amount)
+
+    def reserve_for_pool(self, exchange: str, pool: str, amount: float) -> bool:
+        profile = self._ensure_profile(exchange)
+        # 安全模式下仅允许 safe_layers
+        if profile.safe_mode and pool not in self.safe_layers:
+            return False
+        return self._allocate_pool(profile, pool, amount)
+
+    def release(self, reservation: Union[CapitalReservation, Tuple[str, float, str]]) -> None:
+        if isinstance(reservation, CapitalReservation):
+            allocations = reservation.allocations
+        else:
+            ex, amount, pool = reservation
+            allocations = {ex: (pool, amount)}
+
+        for ex, (pool, amount) in allocations.items():
             profile = self.exchange_profiles.get(ex)
             if not profile:
                 continue
-            state = profile.layers.get(layer)
+            state = profile.pools.get(pool)
             if state:
                 state.release(amount)
-        logger.debug("释放资金占用: %s", reservation.allocations)
+        logger.debug("释放资金占用: %s", allocations)
 
-    def _strategy_to_layer(self, strategy: str) -> str:
+    def _strategy_to_pool(self, strategy: str) -> str:
         mapping = {
-            "wash_trade": "L1",
-            "hft": "L2",
-            "flash": "L2",
-            "stat": "L2",
-            "mid_freq": "L3",
-            "funding": "L4",
-            "arbitrage": "L2",
+            "wash_trade": "wash",
+            "hft": "arb",
+            "flash": "arb",
+            "stat": "arb",
+            "mid_freq": "arb",
+            "funding": "reserve",
+            "arbitrage": "arb",
         }
-        return mapping.get(strategy, "L2")
+        return mapping.get(strategy, "arb")
 
     def record_volume_result(self, exchange: str, volume: float, fee: float, pnl: float) -> None:
         profile = self._ensure_profile(exchange)
@@ -210,11 +198,11 @@ class CapitalOrchestrator:
         snapshot: Dict[str, Dict[str, Dict[str, float]]] = {}
         for ex, profile in self.exchange_profiles.items():
             snapshot[ex] = {}
-            for name, layer in profile.layers.items():
+            for name, pool in profile.pools.items():
                 snapshot[ex][name] = {
-                    "pool": layer.pool,
-                    "allocated": layer.allocated,
-                    "available": layer.available,
+                    "pool": pool.pool,
+                    "allocated": pool.allocated,
+                    "available": pool.available,
                 }
         return snapshot
 

@@ -18,15 +18,21 @@ logging.basicConfig(level=logging.INFO)
 
 
 def main() -> None:
-    orchestrator = CapitalOrchestrator()
+    orchestrator = CapitalOrchestrator(wash_budget_pct=0.7, arb_budget_pct=0.2, reserve_pct=0.1)
 
     # 初始化两个交易所资金池
     orchestrator.update_equity("dex_a", 10_000)
-    orchestrator.update_equity("dex_b", 10_000)
+    orchestrator.update_equity("dex_b", 12_000)
 
-    # 模拟策略向 L2 申请 500 USDT 名义
-    reservation = orchestrator.reserve_for_strategy(["dex_a", "dex_b"], 500, strategy="arbitrage")
-    print("申请结果: ", reservation.approved, reservation.reason)
+    # 连续多次申请与释放刷量资金
+    for i in range(3):
+        approved = orchestrator.reserve_for_wash("dex_a", 1500)
+        print(f"第 {i+1} 次 dex_a 刷量申请: {approved}")
+        orchestrator.release(("dex_a", 1500, "wash"))
+
+    # 使用兼容接口一次性申请双所刷量名义
+    reservation = orchestrator.reserve_for_strategy(["dex_a", "dex_b"], 800, strategy="wash_trade")
+    print("批量申请结果: ", reservation.approved, reservation.reason)
     pprint(orchestrator.current_snapshot())
 
     # 模拟执行完成后释放
