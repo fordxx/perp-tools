@@ -45,6 +45,11 @@
         margin: 0 0 10px 0;
         font-size: 16px;
       }
+      .card .subtitle {
+        color: #9aa5c2;
+        font-size: 12px;
+        margin-bottom: 8px;
+      }
       table {
         width: 100%;
         border-collapse: collapse;
@@ -108,6 +113,36 @@
         grid-template-columns: 2fr 1fr;
         gap: 14px;
       }
+      .split {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 14px;
+        align-items: start;
+      }
+      .scrollable {
+        max-height: 320px;
+        overflow: auto;
+      }
+      .pill.success {
+        background: #15331f;
+        color: #6bea9e;
+      }
+      .pill.warning {
+        background: #2f2a14;
+        color: #f2c94c;
+      }
+      .pill.danger {
+        background: #3f1c1c;
+        color: #ff7b7b;
+      }
+      .metric {
+        font-size: 20px;
+        font-weight: bold;
+      }
+      .muted-small {
+        color: #9aa5c2;
+        font-size: 11px;
+      }
       @media (max-width: 960px) {
         .row {
           grid-template-columns: 1fr;
@@ -118,7 +153,10 @@
   <body>
     <header>
       <h1>PerpBot Web Arbitrage Console</h1>
-      <div id="statusBar" class="muted">Loading...</div>
+      <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+        <span id="socketStatus" class="pill warning">WS: connecting</span>
+        <div id="statusBar" class="muted">Loading...</div>
+      </div>
     </header>
     <div class="container">
       <div class="cards">
@@ -152,6 +190,12 @@
               <div class="muted">Confidence-weighted</div>
             </div>
           </div>
+        </div>
+        <div class="card">
+          <h2>Trade Stats</h2>
+          <div class="subtitle">Real-time success metrics</div>
+          <div class="metric" id="successRate">-</div>
+          <div class="muted-small">Avg Profit: <span id="avgProfit">-</span></div>
         </div>
       </div>
 
@@ -190,6 +234,7 @@
                 <th>Net %</th>
                 <th>Exp. PnL</th>
                 <th>Confidence</th>
+                <th>Priority</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -212,6 +257,31 @@
           </table>
         </div>
       </div>
+      <div class="split" style="margin-top: 14px">
+        <div class="card">
+          <h2>Alert History</h2>
+          <div class="subtitle">Triggered price alerts</div>
+          <div class="scrollable">
+            <table id="alertTable">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Condition</th>
+                  <th>Price</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Recent Alerts</h2>
+          <div class="subtitle">Latest notifications</div>
+          <ul id="alertList" style="list-style: none; padding: 0; margin: 0"></ul>
+        </div>
+      </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -223,6 +293,9 @@
               maximumFractionDigits: digits,
             })
           : "-";
+
+      const chartRef = { chart: null };
+      let socketLive = false;
 
       async function fetchJSON(url, options) {
         const res = await fetch(url, options);
@@ -258,7 +331,9 @@
           )}</td><td>${fmt(op.net_profit_pct * 100, 3)}%</td><td>${fmt(
             op.expected_pnl,
             4
-          )}</td><td>${fmt(op.confidence * 100, 1)}%</td>`;
+          )}</td><td>${fmt(op.confidence * 100, 1)}%</td><td>${
+            op.priority_score ? fmt(op.priority_score, 1) : "-"
+          }</td>`;
           tbody.appendChild(tr);
         });
         document.getElementById("arbCount").textContent = ops.length;
@@ -275,6 +350,43 @@
           )}</td><td>${fmt(p.entry_price)}</td><td>${p.open_ts}</td>`;
           tbody.appendChild(tr);
         });
+      }
+
+      function renderAlerts(alerts) {
+        const tbody = document.querySelector("#alertTable tbody");
+        tbody.innerHTML = "";
+        alerts
+          .slice()
+          .reverse()
+          .forEach((a) => {
+            const tr = document.createElement("tr");
+            const statusClass = a.success ? "pill success" : "pill danger";
+            tr.innerHTML = `<td>${new Date(a.timestamp).toLocaleTimeString()}</td><td>${a.symbol}</td><td>${
+              a.condition
+            }</td><td>${fmt(a.price)}</td><td><span class="${statusClass}">${
+              a.success ? "hit" : "fail"
+            }</span></td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderAlertList(alerts) {
+        const list = document.getElementById("alertList");
+        list.innerHTML = "";
+        (alerts || []).slice(-5).reverse().forEach((msg) => {
+          const li = document.createElement("li");
+          li.className = "muted-small";
+          li.textContent = msg;
+          list.appendChild(li);
+        });
+      }
+
+      function renderStats(stats) {
+        const successRate = typeof stats.success_rate === "number" ? stats.success_rate * 100 : null;
+        document.getElementById("successRate").textContent = successRate !== null ? `${fmt(successRate, 2)}%` : "-";
+        document.getElementById("avgProfit").textContent = stats.avg_profit
+          ? `$${fmt(stats.avg_profit, 4)}`
+          : "-";
       }
 
       function renderOverview(data) {
@@ -298,9 +410,10 @@
         document.getElementById("lastCycle").textContent = data.last_cycle_at || "-";
       }
 
-      function renderChart(ctx, history, chartRef) {
-        const labels = history.map((p) => new Date(p.ts).toLocaleTimeString());
-        const data = history.map((p) => p.value);
+      function renderChart(ctx, equityHistory, pnlHistory, chartRef) {
+        const labels = equityHistory.map((p) => new Date(p.ts).toLocaleTimeString());
+        const equityValues = equityHistory.map((p) => p.value);
+        const pnlValues = pnlHistory.map((p) => p.value);
         if (!chartRef.chart) {
           chartRef.chart = new Chart(ctx, {
             type: "line",
@@ -309,16 +422,24 @@
               datasets: [
                 {
                   label: "Equity",
-                  data,
+                  data: equityValues,
                   borderColor: "#6bea9e",
                   backgroundColor: "rgba(110,234,158,0.1)",
+                  tension: 0.25,
+                  pointRadius: 0,
+                },
+                {
+                  label: "PnL",
+                  data: pnlValues,
+                  borderColor: "#7ea8ff",
+                  backgroundColor: "rgba(126,168,255,0.12)",
                   tension: 0.25,
                   pointRadius: 0,
                 },
               ],
             },
             options: {
-              plugins: { legend: { display: false } },
+              plugins: { legend: { display: true, labels: { color: "#9aa5c2" } } },
               scales: {
                 x: { ticks: { color: "#9aa5c2" } },
                 y: { ticks: { color: "#9aa5c2" } },
@@ -327,28 +448,61 @@
           });
         } else {
           chartRef.chart.data.labels = labels;
-          chartRef.chart.data.datasets[0].data = data;
+          chartRef.chart.data.datasets[0].data = equityValues;
+          chartRef.chart.data.datasets[1].data = pnlValues;
           chartRef.chart.update();
         }
       }
 
-      const chartRef = { chart: null };
+      function handleData(data) {
+        renderOverview(data);
+        renderQuotes(data.quotes || []);
+        renderArb(data.arbitrage || []);
+        renderPositions(data.positions || []);
+        renderAlerts(data.alert_history || []);
+        renderAlertList(data.alerts || []);
+        renderStats(data.trade_stats || {});
+        if (data.equity_history) {
+          const ctx = document.getElementById("pnlChart");
+          renderChart(ctx, data.equity_history, data.pnl_history || [], chartRef);
+        }
+      }
 
       async function refresh() {
+        if (socketLive) return; // websocket pushing
         try {
           const data = await fetchJSON("/api/overview");
-          renderOverview(data);
-          renderQuotes(data.quotes || []);
-          renderArb(data.arbitrage || []);
-          renderPositions(data.positions || []);
-          if (data.equity_history) {
-            const ctx = document.getElementById("pnlChart");
-            renderChart(ctx, data.equity_history, chartRef);
-          }
+          handleData(data);
         } catch (err) {
           console.error(err);
           document.getElementById("statusBar").textContent = `Error: ${err.message}`;
         }
+      }
+
+      function connectSocket() {
+        const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+        const status = document.getElementById("socketStatus");
+        const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
+        ws.onopen = () => {
+          socketLive = true;
+          status.textContent = "WS: live";
+          status.className = "pill success";
+        };
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            handleData(data);
+          } catch (err) {
+            console.error("WS parse error", err);
+          }
+        };
+        ws.onclose = () => {
+          socketLive = false;
+          status.textContent = "WS: reconnecting";
+          status.className = "pill warning";
+          setTimeout(connectSocket, 2000);
+        };
+        ws.onerror = () => ws.close();
       }
 
       document.getElementById("startBtn").addEventListener("click", async () => {
@@ -370,8 +524,9 @@
         refresh();
       });
 
+      connectSocket();
       refresh();
-      setInterval(refresh, 3000);
+      setInterval(refresh, 4000);
     </script>
   </body>
 </html>

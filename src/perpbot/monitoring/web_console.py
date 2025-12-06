@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -8,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,7 +19,7 @@ from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.config import BotConfig
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
-from perpbot.models import ArbitrageOpportunity, Position, PriceQuote, TradingState
+from perpbot.models import ArbitrageOpportunity, AlertRecord, Position, PriceQuote, TradingState
 from perpbot.position_guard import PositionGuard
 from perpbot.persistence import AlertRecorder, TradeRecorder
 from perpbot.risk_manager import RiskManager
@@ -51,9 +52,24 @@ def _position_to_dict(position: Position) -> Dict:
     }
 
 
-def _arb_to_dict(op: ArbitrageOpportunity) -> Dict:
+def _alert_to_dict(record: AlertRecord) -> Dict:
+    return {
+        "timestamp": record.timestamp.isoformat(),
+        "symbol": record.symbol,
+        "condition": record.condition,
+        "price": record.price,
+        "message": record.message,
+        "success": record.success,
+    }
+
+
+def _arb_to_dict(op: ArbitrageOpportunity, weights: Optional[dict] = None) -> Dict:
     data = asdict(op)
     data["discovered_at"] = op.discovered_at.isoformat()
+    try:
+        data["priority_score"] = op.priority_score(weights=weights)
+    except Exception:
+        data["priority_score"] = None
     return data
 
 
@@ -104,6 +120,7 @@ class TradingService:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._max_history = 500
+        self._max_alert_history = 200
 
     def start(self, trading_enabled: bool = True) -> None:
         self.state.trading_enabled = trading_enabled
@@ -184,6 +201,10 @@ class TradingService:
                 start_trading_cb=self.resume_trading,
                 alert_recorder=self.alert_recorder.record,
             )
+            if len(self.state.alert_history) > self._max_alert_history:
+                self.state.alert_history = self.state.alert_history[-self._max_alert_history :]
+            if len(self.state.triggered_alerts) > self._max_alert_history:
+                self.state.triggered_alerts = self.state.triggered_alerts[-self._max_alert_history :]
 
             if self.risk_manager.trading_halted:
                 self.state.status = f"halted: {self.risk_manager.halt_reason}"
@@ -226,7 +247,7 @@ class TradingService:
     def snapshot(self) -> Dict:
         with self._lock:
             quotes = [_quote_to_dict(q) for q in self.state.quotes.values() if q.symbol in self.cfg.symbols]
-            arbitrage = [_arb_to_dict(op) for op in self.state.recent_arbitrage]
+            arbitrage = [_arb_to_dict(op, self.cfg.priority_weights) for op in self.state.recent_arbitrage]
             positions = [_position_to_dict(p) for p in self.state.account_positions or self.state.open_positions.values()]
             return {
                 "status": self.state.status,
@@ -241,6 +262,8 @@ class TradingService:
                 "arbitrage": arbitrage,
                 "positions": positions,
                 "alerts": self.state.triggered_alerts,
+                "alert_history": [_alert_to_dict(a) for a in self.state.alert_history[-self._max_alert_history :]],
+                "trade_stats": self.recorder.stats() if self.recorder else {},
             }
 
     def _record_equity_point(self, ts: datetime, equity: float, pnl: float) -> None:
@@ -282,6 +305,10 @@ def create_web_app(cfg: BotConfig, service: Optional[TradingService] = None) -> 
     def positions():
         return service.snapshot()["positions"]
 
+    @app.get("/api/alerts")
+    def alerts():
+        return service.snapshot().get("alert_history", [])
+
     @app.post("/api/control/start")
     def start_trading():
         service.resume_trading()
@@ -301,6 +328,20 @@ def create_web_app(cfg: BotConfig, service: Optional[TradingService] = None) -> 
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"min_profit_pct": service.state.min_profit_pct}
+
+    @app.websocket("/ws")
+    async def websocket_updates(websocket: WebSocket):  # pragma: no cover - runtime socket
+        await websocket.accept()
+        interval = max(1.0, cfg.loop_interval_seconds)
+        try:
+            while True:
+                await websocket.send_json(service.snapshot())
+                await asyncio.sleep(interval)
+        except WebSocketDisconnect:
+            logger.info("WebSocket client disconnected")
+        except Exception as exc:
+            logger.exception("WebSocket error: %s", exc)
+            await websocket.close()
 
     @app.get("/")
     def index():  # pragma: no cover - file response

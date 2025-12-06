@@ -11,7 +11,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - **Concurrent pricing** with shared WebSocket price cache and asyncio-gather REST fallbacks, plus per-exchange rate limiting to avoid throttling.
 - **Trade recording and analytics hooks** that persist every arbitrage attempt to CSV/SQLite for later reliability scoring and dashboarding.
 - **Smart alerts** with flexible conditions (breakouts, ranges, percent changes, spreads, volatility) that can notify across Telegram/Lark/webhooks/console/audio, auto-start trading, or fire venue-agnostic auto-orders with full history logging.
-- **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel, real-time position view, an equity/PnL curve, and controls to start/pause arbitrage or retune the minimum profit threshold.
+- **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel with priority/confidence scores, real-time position view, equity/PnL curve, alert history, and controls to start/pause arbitrage or retune the minimum profit threshold. WebSocket pushes keep the UI live without refreshes.
 - **Config-driven setup** via `config.example.yaml`.
 
 ## Project Layout
