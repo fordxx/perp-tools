@@ -114,3 +114,9 @@ capital_layer_max_usage:
 capital_safe_layers: ["L1", "L4"]
 capital_allow_borrow_from_l5: true
 capital_drawdown_limit_pct: 0.05
+hedge_min_notional: 300
+hedge_max_notional: 800
+hedge_hold_seconds: [10, 60]
+hedge_slippage_bps_limit: 30
+hedge_time_skew_ms: 800
+hedge_loss_limit_pct: 0.02

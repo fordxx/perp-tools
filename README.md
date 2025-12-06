@@ -28,6 +28,7 @@
 - `src/perpbot/monitoring/static/index.html` —— 轻量化实时控制面板。
 - `src/perpbot/cli.py` —— CLI 入口，可跑单次交易循环或启动控制台服务。
 - `src/perpbot/capital_orchestrator.py` —— 资金分层调度与安全模式切换的总控模块。
+- `src/perpbot/hedge_volume_engine.py` —— 跨所永续对冲刷量引擎，基于 L1 资金层分配名义并执行双边对冲。
 
 ## 资金调度与分层设计
 
@@ -45,6 +46,16 @@
   5. `current_snapshot` 提供 Web/监控端的分层水位，用于可视化 L1-L5 的占用与剩余额度。
 
 - **对接方式**：`ArbitrageExecutor` 已在下单前向 `CapitalOrchestrator` 申请额度，`cli.py` 与 Web `TradingService` 默认加载配置中的五层比例（L1 20%、L2 30%、L3 25%、L4 10%、L5 15%）并为每个交易所初始化 1 WU 资金池，未来可扩展为实时余额/回撤驱动的动态调整。
+
+## 跨所永续对冲刷量（hedge_volume_engine）
+
+- **目标**：使用两家交易所的永续合约同时开多/开空对冲，产生成交量并控制风险暴露。
+- **资金来源**：下单前向 `CapitalOrchestrator` 的 L1 层申请 300–800 USDT（可配）名义额度，缺口可暂借 L5；执行后自动释放并通过 `record_volume_result` 回传 volume/fee/pnl。
+- **流程**：预检查余额/盘口/合约状态 → 并发开仓（时间差阈值控制）→ 随机持仓 10–60 秒 → 并发平仓 → 记录结果、累计亏损保护。
+- **风控**：
+  - 预估滑点超阈值直接放弃；
+  - 仅一边成交则立即回滚；
+  - 单所刷量累计亏损超过阈值（默认 2% WU）自动暂停该所刷量。
 
 ## 快速开始
 

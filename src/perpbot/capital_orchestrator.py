@@ -38,6 +38,9 @@ class ExchangeCapitalProfile:
     layers: Dict[str, CapitalLayerState]
     drawdown_pct: float = 0.0
     safe_mode: bool = False
+    total_volume: float = 0.0
+    total_fee: float = 0.0
+    realized_pnl: float = 0.0
 
     def allowed_layers(self, safe_layers: List[str]) -> List[str]:
         if self.safe_mode:
@@ -181,6 +184,20 @@ class CapitalOrchestrator:
             "arbitrage": "L2",
         }
         return mapping.get(strategy, "L2")
+
+    def record_volume_result(self, exchange: str, volume: float, fee: float, pnl: float) -> None:
+        profile = self._ensure_profile(exchange)
+        profile.total_volume += volume
+        profile.total_fee += fee
+        profile.realized_pnl += pnl
+        logger.info(
+            "%s 刷量统计: volume=%.2f, fee=%.2f, pnl=%.4f, 累计pnl=%.4f",
+            exchange,
+            volume,
+            fee,
+            pnl,
+            profile.realized_pnl,
+        )
 
     def current_snapshot(self) -> Dict[str, Dict[str, Dict[str, float]]]:
         snapshot: Dict[str, Dict[str, Dict[str, float]]] = {}

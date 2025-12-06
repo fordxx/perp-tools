@@ -62,6 +62,12 @@ class BotConfig:
     capital_safe_layers: List[str] = field(default_factory=lambda: ["L1", "L4"])
     capital_allow_borrow_from_l5: bool = True
     capital_drawdown_limit_pct: float = 0.05
+    hedge_min_notional: float = 300.0
+    hedge_max_notional: float = 800.0
+    hedge_hold_seconds: List[int] = field(default_factory=lambda: [10, 60])
+    hedge_slippage_bps_limit: float = 30.0
+    hedge_time_skew_ms: int = 800
+    hedge_loss_limit_pct: float = 0.02
 
 
 def load_config(path: str) -> BotConfig:
@@ -125,4 +131,10 @@ def load_config(path: str) -> BotConfig:
         capital_safe_layers=data.get("capital_safe_layers", ["L1", "L4"]),
         capital_allow_borrow_from_l5=data.get("capital_allow_borrow_from_l5", True),
         capital_drawdown_limit_pct=data.get("capital_drawdown_limit_pct", 0.05),
+        hedge_min_notional=data.get("hedge_min_notional", 300.0),
+        hedge_max_notional=data.get("hedge_max_notional", 800.0),
+        hedge_hold_seconds=data.get("hedge_hold_seconds", [10, 60]),
+        hedge_slippage_bps_limit=data.get("hedge_slippage_bps_limit", 30.0),
+        hedge_time_skew_ms=data.get("hedge_time_skew_ms", 800),
+        hedge_loss_limit_pct=data.get("hedge_loss_limit_pct", 0.02),
     )
