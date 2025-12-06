@@ -14,7 +14,7 @@ import httpx
 import websockets
 
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import Order, OrderRequest, Position, PriceQuote
+from perpbot.models import Order, OrderBookDepth, OrderRequest, Position, PriceQuote
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,18 @@ class BinanceClient(ExchangeClient):
             ask=float(data["askPrice"]),
         )
         return quote
+
+    def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
+        if not self._client:
+            raise RuntimeError("Client not connected")
+        sym = self._normalize_symbol(symbol)
+        resp = self._client.get("/fapi/v1/depth", params={"symbol": sym, "limit": depth})
+        resp.raise_for_status()
+        data = resp.json()
+        return OrderBookDepth(
+            bids=[(float(p), float(q)) for p, q in data.get("bids", [])],
+            asks=[(float(p), float(q)) for p, q in data.get("asks", [])],
+        )
 
     def place_open_order(self, request: OrderRequest) -> Order:
         sym = self._normalize_symbol(request.symbol)

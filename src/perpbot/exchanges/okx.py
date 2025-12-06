@@ -14,7 +14,7 @@ import httpx
 import websockets
 
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import Order, OrderRequest, Position, PriceQuote
+from perpbot.models import Order, OrderBookDepth, OrderRequest, Position, PriceQuote
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,16 @@ class OKXClient(ExchangeClient):
             symbol=symbol,
             bid=float(data.get("bidPx", 0)),
             ask=float(data.get("askPx", 0)),
+        )
+
+    def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
+        inst_id = self._format_instrument(symbol)
+        resp = httpx.get("https://www.okx.com/api/v5/market/books", params={"instId": inst_id, "sz": depth})
+        resp.raise_for_status()
+        data = resp.json().get("data", [{}])[0]
+        return OrderBookDepth(
+            bids=[(float(p), float(q)) for p, q, *_ in data.get("bids", [])],
+            asks=[(float(p), float(q)) for p, q, *_ in data.get("asks", [])],
         )
 
     def place_open_order(self, request: OrderRequest) -> Order:

@@ -1,15 +1,29 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import random
 import string
+import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Callable, Iterable, List, Optional
 
+import httpx
+import websockets
 from dotenv import load_dotenv
 
-from perpbot.models import AlertCondition, Order, OrderRequest, Position, PriceQuote, TradingState
+from perpbot.models import (
+    AlertCondition,
+    Order,
+    OrderBookDepth,
+    OrderRequest,
+    Position,
+    PriceQuote,
+    TradingState,
+)
 
 
 EXCHANGE_NAMES = [
@@ -40,6 +54,10 @@ class ExchangeClient(ABC):
 
     @abstractmethod
     def get_current_price(self, symbol: str) -> PriceQuote:
+        ...
+
+    @abstractmethod
+    def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         ...
 
     @abstractmethod
@@ -77,116 +95,290 @@ class ExchangeClient(ABC):
         return self.place_close_order(position, current_price)
 
 
-class SimulatedExchangeClient(ExchangeClient):
-    def __init__(self, name: str, base_price: float = 100.0, fee_bps: float = 5):
+class RESTWebSocketExchangeClient(ExchangeClient):
+    """Generic REST + WebSocket exchange client template.
+
+    Concrete venues should inherit and override endpoints or signing logic as
+    required by their APIs. This class centralises consistent logging,
+    credential loading, and graceful retries.
+    """
+
+    ticker_endpoint: str = "/api/v1/market/ticker"
+    orderbook_endpoint: str = "/api/v1/market/depth"
+    order_endpoint: str = "/api/v1/trade/order"
+    cancel_endpoint: str = "/api/v1/trade/cancel"
+    open_orders_endpoint: str = "/api/v1/trade/open-orders"
+    positions_endpoint: str = "/api/v1/account/positions"
+    ws_orders_channel: str = "orders"
+
+    def __init__(
+        self,
+        name: str,
+        env_prefix: str,
+        default_base_url: str,
+        default_testnet_url: Optional[str] = None,
+        default_ws_url: Optional[str] = None,
+        default_testnet_ws_url: Optional[str] = None,
+    ) -> None:
         self.name = name
-        self.price = base_price
-        self.fee_bps = fee_bps
-        self._handler: Optional[Callable[[dict], None]] = None
+        self.env_prefix = env_prefix
+        self.default_base_url = default_base_url
+        self.default_testnet_url = default_testnet_url or default_base_url
+        self.default_ws_url = default_ws_url
+        self.default_testnet_ws_url = default_testnet_ws_url or default_ws_url
+
+        self.api_key: Optional[str] = None
+        self.api_secret: Optional[str] = None
+        self.passphrase: Optional[str] = None
+        self.base_url: Optional[str] = None
+        self.ws_url: Optional[str] = None
+        self._client: Optional[httpx.Client] = None
+        self._order_handler: Optional[Callable[[dict], None]] = None
+        self._ws_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def _env(self, suffix: str, default: Optional[str] = None) -> Optional[str]:
+        return os.getenv(f"{self.env_prefix}_{suffix}", default)
 
     def connect(self) -> None:
-        logger.info("Connected simulated client for %s", self.name)
+        load_dotenv()
+        self.api_key = self._env("API_KEY")
+        self.api_secret = self._env("API_SECRET")
+        self.passphrase = self._env("PASSPHRASE")
+        if not self.api_key:
+            raise ValueError(f"{self.name} API key missing from environment")
+
+        env = self._env("ENV", "testnet").lower()
+        self.base_url = self._env(
+            "BASE_URL", self.default_testnet_url if env == "testnet" else self.default_base_url
+        )
+        self.ws_url = self._env(
+            "WS_URL", self.default_testnet_ws_url if env == "testnet" else self.default_ws_url
+        )
+        self._client = httpx.Client(base_url=self.base_url, headers=self._auth_headers(), timeout=10)
+        logger.info("Connected %s client (env=%s)", self.name, env)
+        if self.ws_url:
+            self._start_ws()
+
+    def _auth_headers(self) -> dict:
+        headers = {}
+        if self.api_key:
+            headers["X-API-KEY"] = self.api_key
+        return headers
+
+    def _sign_payload(self, payload: str) -> Optional[str]:
+        if not self.api_secret:
+            return None
+        import hmac
+        from hashlib import sha256
+
+        signature = hmac.new(self.api_secret.encode(), payload.encode(), sha256).hexdigest()
+        return signature
+
+    def _request(self, method: str, path: str, params: Optional[dict] = None, json_body: Optional[dict] = None) -> httpx.Response:
+        if not self._client:
+            raise RuntimeError("Client not connected")
+        params = params or {}
+        payload = f"{int(time.time() * 1000)}{method}{path}{json_body or params}"
+        signature = self._sign_payload(payload)
+        headers = self._auth_headers()
+        if signature:
+            headers["X-SIGNATURE"] = signature
+        logger.debug("%s %s %s", self.name, method, path)
+        response = self._client.request(method, path, params=params, json=json_body, headers=headers)
+        response.raise_for_status()
+        return response
+
+    def _parse_orderbook(self, data: dict) -> OrderBookDepth:
+        bids = data.get("bids") or data.get("bid") or []
+        asks = data.get("asks") or data.get("ask") or []
+        return OrderBookDepth(
+            bids=[(float(p), float(q)) for p, q in bids],
+            asks=[(float(p), float(q)) for p, q in asks],
+        )
 
     def get_current_price(self, symbol: str) -> PriceQuote:
-        return self.fetch_price(symbol)
+        resp = self._request("GET", self.ticker_endpoint, params={"symbol": symbol})
+        data = resp.json()
+        if isinstance(data, dict):
+            payload = data.get("data", data)
+        else:
+            payload = data[0]
+        bid = float(payload.get("bid") or payload.get("bidPrice") or payload.get("bestBid", 0))
+        ask = float(payload.get("ask") or payload.get("askPrice") or payload.get("bestAsk", 0))
+        ob_data = payload.get("orderbook")
+        order_book = self._parse_orderbook(ob_data) if isinstance(ob_data, dict) else None
+        return PriceQuote(exchange=self.name, symbol=symbol, bid=bid, ask=ask, order_book=order_book)
 
-    def _jitter(self) -> float:
-        return random.uniform(-0.15, 0.15)
-
-    def fetch_price(self, symbol: str) -> PriceQuote:
-        drift = self._jitter()
-        mid = max(1.0, self.price * (1 + drift))
-        spread = max(0.01 * mid, 0.02)
-        quote = PriceQuote(
-            exchange=self.name,
-            symbol=symbol,
-            bid=mid - spread / 2,
-            ask=mid + spread / 2,
-        )
-        self.price = quote.mid
-        return quote
-
-    def place_order(self, request: OrderRequest) -> Order:
-        price = request.limit_price if request.limit_price is not None else self.price
-        return Order(
-            id=_random_id(),
-            exchange=self.name,
-            symbol=request.symbol,
-            side=request.side,
-            size=request.size,
-            price=price,
-        )
-
-    def close_position(self, position: Position, current_price: float) -> Order:
-        side = "sell" if position.order.side == "buy" else "buy"
-        return Order(
-            id=_random_id("close"),
-            exchange=self.name,
-            symbol=position.order.symbol,
-            side=side,
-            size=position.order.size,
-            price=current_price,
-        )
+    def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
+        resp = self._request("GET", self.orderbook_endpoint, params={"symbol": symbol, "depth": depth})
+        data = resp.json()
+        book_data = data.get("data", data) if isinstance(data, dict) else data
+        depth_obj = self._parse_orderbook(book_data)
+        return depth_obj
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        return self.place_order(request)
+        body = {
+            "symbol": request.symbol,
+            "side": request.side,
+            "type": "limit" if request.limit_price is not None else "market",
+            "size": request.size,
+        }
+        if request.limit_price is not None:
+            body["price"] = request.limit_price
+        resp = self._request("POST", self.order_endpoint, json_body=body)
+        data = resp.json()
+        order_id = str(data.get("orderId") or data.get("id") or _random_id())
+        price = float(data.get("price") or request.limit_price or 0)
+        return Order(id=order_id, exchange=self.name, symbol=request.symbol, side=request.side, size=request.size, price=price)
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
-        return self.close_position(position, current_price)
+        closing_side = "sell" if position.order.side == "buy" else "buy"
+        body = {
+            "symbol": position.order.symbol,
+            "side": closing_side,
+            "type": "market",
+            "size": position.order.size,
+            "reduceOnly": True,
+        }
+        resp = self._request("POST", self.order_endpoint, json_body=body)
+        data = resp.json()
+        order_id = str(data.get("orderId") or data.get("id") or _random_id("close"))
+        price = float(data.get("price") or current_price)
+        return Order(id=order_id, exchange=self.name, symbol=position.order.symbol, side=closing_side, size=position.order.size, price=price)
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        logger.info("Cancelled simulated order %s on %s", order_id, self.name)
+        params = {"orderId": order_id}
+        if symbol:
+            params["symbol"] = symbol
+        self._request("POST", self.cancel_endpoint, json_body=params)
+        logger.info("Cancelled %s order %s", self.name, order_id)
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        return []
+        params = {"symbol": symbol} if symbol else None
+        resp = self._request("GET", self.open_orders_endpoint, params=params)
+        payload = resp.json()
+        orders_data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        orders: List[Order] = []
+        for raw in orders_data or []:
+            orders.append(
+                Order(
+                    id=str(raw.get("orderId") or raw.get("id") or _random_id()),
+                    exchange=self.name,
+                    symbol=raw.get("symbol", symbol or ""),
+                    side=str(raw.get("side", "")).lower(),
+                    size=float(raw.get("size", raw.get("qty", 0))),
+                    price=float(raw.get("price", 0) or 0),
+                )
+            )
+        return orders
 
     def get_account_positions(self) -> List[Position]:
-        return []
+        resp = self._request("GET", self.positions_endpoint)
+        payload = resp.json()
+        positions_data = payload.get("data", payload) if isinstance(payload, dict) else payload
+        positions: List[Position] = []
+        for raw in positions_data or []:
+            size = float(raw.get("size", 0))
+            if size == 0:
+                continue
+            side = str(raw.get("side", "")).lower() or ("buy" if size > 0 else "sell")
+            symbol = raw.get("symbol", "")
+            entry = float(raw.get("entryPrice", raw.get("avgPrice", 0)))
+            order = Order(id=_random_id("pos"), exchange=self.name, symbol=symbol, side=side, size=abs(size), price=entry)
+            positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
+        return positions
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        self._handler = handler
-        logger.info("Registered simulated order handler for %s", self.name)
+        self._order_handler = handler
+        logger.info("Registered %s order update handler", self.name)
+
+    def _start_ws(self) -> None:
+        if not self.ws_url:
+            return
+        self._ws_thread = threading.Thread(target=self._run_ws, daemon=True)
+        self._ws_thread.start()
+
+    def _ws_subscribe_message(self) -> dict:
+        return {"op": "subscribe", "channel": self.ws_orders_channel}
+
+    def _run_ws(self) -> None:
+        async def _consume() -> None:
+            assert self.ws_url
+            while not self._stop_event.is_set():
+                try:
+                    async with websockets.connect(self.ws_url, ping_interval=15) as ws:
+                        await ws.send(json.dumps(self._ws_subscribe_message()))
+                        async for msg in ws:
+                            if not self._order_handler:
+                                continue
+                            try:
+                                data = json.loads(msg)
+                                self._order_handler(data)
+                            except Exception:
+                                logger.exception("Error handling %s order stream message", self.name)
+                except Exception as exc:  # pragma: no cover - network dependent
+                    logger.exception("%s order stream error: %s", self.name, exc)
+                    await asyncio.sleep(5)
+
+        asyncio.run(_consume())
 
 
 def provision_exchanges() -> List[ExchangeClient]:
     load_dotenv()
     exchanges: List[ExchangeClient] = []
 
-    for name in EXCHANGE_NAMES:
-        if name == "binance":
-            try:
-                from .binance import BinanceClient
+    from perpbot.exchanges.binance import BinanceClient
+    from perpbot.exchanges.okx import OKXClient
+    from perpbot.exchanges.edgex import EdgeXClient
+    from perpbot.exchanges.backpack import BackpackClient
+    from perpbot.exchanges.paradex import ParadexClient
+    from perpbot.exchanges.aster import AsterClient
+    from perpbot.exchanges.grvt import GRVTClient
+    from perpbot.exchanges.extended import ExtendedClient
 
-                client: ExchangeClient = BinanceClient(
-                    use_testnet=os.getenv("BINANCE_ENV", "testnet").lower() == "testnet"
-                )
-                client.connect()
-                exchanges.append(client)
-                continue
-            except Exception as exc:  # pragma: no cover - safety net for runtime issues
-                logger.exception("Falling back to simulated Binance client: %s", exc)
+    exchange_builders = [
+        (
+            "binance",
+            lambda: BinanceClient(use_testnet=os.getenv("BINANCE_ENV", "testnet").lower() == "testnet"),
+            ["BINANCE_API_KEY", "BINANCE_API_SECRET"],
+        ),
+        (
+            "okx",
+            lambda: OKXClient(use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"),
+            ["OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"],
+        ),
+        ("edgex", lambda: EdgeXClient(), ["EDGEX_API_KEY", "EDGEX_API_SECRET"]),
+        ("backpack", lambda: BackpackClient(), ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"]),
+        ("paradex", lambda: ParadexClient(), ["PARADEX_API_KEY", "PARADEX_API_SECRET"]),
+        ("aster", lambda: AsterClient(), ["ASTER_API_KEY", "ASTER_API_SECRET"]),
+        ("grvt", lambda: GRVTClient(), ["GRVT_API_KEY", "GRVT_API_SECRET"]),
+        ("extended", lambda: ExtendedClient(), ["EXTENDED_API_KEY", "EXTENDED_API_SECRET"]),
+    ]
 
-        if name == "okx":
-            try:
-                from .okx import OKXClient
+    for name, builder, required_keys in exchange_builders:
+        missing = [k for k in required_keys if not os.getenv(k)]
+        if missing:
+            logger.warning("Skipping %s: missing credentials %s", name, missing)
+            continue
+        try:
+            client = builder()
+            client.connect()
+            exchanges.append(client)
+        except Exception as exc:  # pragma: no cover - runtime resilience
+            logger.exception("Failed to initialise %s client: %s", name, exc)
 
-                client = OKXClient(
-                    use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"
-                )
-                client.connect()
-                exchanges.append(client)
-                continue
-            except Exception as exc:  # pragma: no cover
-                logger.exception("Falling back to simulated OKX client: %s", exc)
-
-        exchanges.append(SimulatedExchangeClient(name))
     return exchanges
 
 
 def update_state_with_quotes(state: TradingState, exchanges: Iterable[ExchangeClient], symbols: Iterable[str]) -> None:
     for ex in exchanges:
         for sym in symbols:
-            quote = ex.fetch_price(sym)
+            quote = ex.get_current_price(sym)
+            try:
+                quote.order_book = ex.get_orderbook(sym)
+            except Exception:
+                logger.exception("Failed to fetch orderbook for %s on %s", sym, ex.name)
             state.quotes[f"{ex.name}:{sym}"] = quote
 
 
