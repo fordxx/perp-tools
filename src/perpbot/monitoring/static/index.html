@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PerpBot Arbitrage Console</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #0b1021;
+        color: #e9edf5;
+        margin: 0;
+        padding: 0;
+      }
+      header {
+        background: #121a35;
+        padding: 16px 24px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid #1f2a52;
+      }
+      h1 {
+        margin: 0;
+        font-size: 20px;
+      }
+      .container {
+        padding: 20px;
+      }
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+      }
+      .card {
+        background: #11182f;
+        border: 1px solid #1b2647;
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .card h2 {
+        margin: 0 0 10px 0;
+        font-size: 16px;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      th,
+      td {
+        padding: 6px 8px;
+        border-bottom: 1px solid #1f2a52;
+        text-align: left;
+        font-size: 13px;
+      }
+      th {
+        color: #7ea8ff;
+      }
+      button {
+        background: #2f80ed;
+        color: #fff;
+        border: none;
+        padding: 8px 12px;
+        border-radius: 6px;
+        cursor: pointer;
+        margin-right: 8px;
+      }
+      button.secondary {
+        background: #6c7a99;
+      }
+      input[type="number"] {
+        background: #0f172a;
+        border: 1px solid #1f2a52;
+        color: #fff;
+        padding: 6px;
+        border-radius: 6px;
+        width: 100px;
+        margin-right: 8px;
+      }
+      .status {
+        font-weight: bold;
+      }
+      .status.running {
+        color: #6bea9e;
+      }
+      .status.paused {
+        color: #f2c94c;
+      }
+      .status.halted {
+        color: #ff7b7b;
+      }
+      .muted {
+        color: #9aa5c2;
+        font-size: 12px;
+      }
+      .pill {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #1f2a52;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>PerpBot Web Arbitrage Console</h1>
+      <div id="statusBar" class="muted">Loading...</div>
+    </header>
+    <div class="container">
+      <div class="cards">
+        <div class="card">
+          <h2>Controls</h2>
+          <div style="margin-bottom: 8px">
+            <button id="startBtn">Start</button>
+            <button id="pauseBtn" class="secondary">Pause</button>
+          </div>
+          <div>
+            <label for="profitInput">Min Profit Threshold (%)</label><br />
+            <input id="profitInput" type="number" step="0.01" min="0" />
+            <button id="updateThreshold">Update</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Account</h2>
+          <div>Equity: <span id="equity">-</span></div>
+          <div>PNL: <span id="pnl">-</span></div>
+          <div>Last Cycle: <span id="lastCycle" class="muted">-</span></div>
+        </div>
+        <div class="card">
+          <h2>Arbitrage</h2>
+          <div>Opportunities: <span id="arbCount">0</span></div>
+          <div>Threshold: <span id="thresholdDisplay">-</span></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 14px">
+        <h2>BTC / ETH Quotes</h2>
+        <table id="quotesTable">
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Bid</th>
+              <th>Ask</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top: 14px">
+        <h2>Arbitrage Spreads</h2>
+        <table id="arbTable">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Buy @</th>
+              <th>Sell @</th>
+              <th>Size</th>
+              <th>Net %</th>
+              <th>Exp. PnL</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card" style="margin-top: 14px">
+        <h2>Positions</h2>
+        <table id="positionsTable">
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Size</th>
+              <th>Entry</th>
+              <th>Opened</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <script>
+      const fmt = (num, digits = 2) =>
+        typeof num === "number" && !Number.isNaN(num)
+          ? num.toLocaleString(undefined, {
+              minimumFractionDigits: digits,
+              maximumFractionDigits: digits,
+            })
+          : "-";
+
+      async function fetchJSON(url, options) {
+        const res = await fetch(url, options);
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || res.statusText);
+        }
+        return res.json();
+      }
+
+      function renderQuotes(quotes) {
+        const tbody = document.querySelector("#quotesTable tbody");
+        tbody.innerHTML = "";
+        quotes
+          .sort((a, b) => a.exchange.localeCompare(b.exchange))
+          .forEach((q) => {
+            const tr = document.createElement("tr");
+            tr.innerHTML = `<td>${q.exchange}</td><td>${q.symbol}</td><td>${fmt(
+              q.bid
+            )}</td><td>${fmt(q.ask)}</td>`;
+            tbody.appendChild(tr);
+          });
+      }
+
+      function renderArb(ops) {
+        const tbody = document.querySelector("#arbTable tbody");
+        tbody.innerHTML = "";
+        ops.forEach((op) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${op.symbol}</td><td>${op.buy_exchange} @ ${fmt(
+            op.buy_price
+          )}</td><td>${op.sell_exchange} @ ${fmt(op.sell_price)}</td><td>${fmt(
+            op.size,
+            4
+          )}</td><td>${fmt(op.net_profit_pct * 100, 3)}%</td><td>${fmt(
+            op.expected_pnl,
+            4
+          )}</td>`;
+          tbody.appendChild(tr);
+        });
+        document.getElementById("arbCount").textContent = ops.length;
+      }
+
+      function renderPositions(positions) {
+        const tbody = document.querySelector("#positionsTable tbody");
+        tbody.innerHTML = "";
+        positions.forEach((p) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${p.exchange}</td><td>${p.symbol}</td><td>${p.side}</td><td>${fmt(
+            p.size,
+            4
+          )}</td><td>${fmt(p.entry_price)}</td><td>${p.open_ts}</td>`;
+          tbody.appendChild(tr);
+        });
+      }
+
+      function renderOverview(data) {
+        const statusBar = document.getElementById("statusBar");
+        let statusClass = "status ";
+        if (data.status?.startsWith("halted")) {
+          statusClass += "halted";
+        } else if (data.trading_enabled) {
+          statusClass += "running";
+        } else {
+          statusClass += "paused";
+        }
+        statusBar.innerHTML = `<span class="${statusClass}">${data.status}</span>`;
+        document.getElementById("equity").textContent = `$${fmt(data.equity)}`;
+        document.getElementById("pnl").textContent = `$${fmt(data.pnl)}`;
+        document.getElementById("thresholdDisplay").textContent = `${fmt(
+          data.min_profit_pct * 100,
+          3
+        )}%`;
+        document.getElementById("profitInput").value = (data.min_profit_pct * 100).toFixed(3);
+        document.getElementById("lastCycle").textContent = data.last_cycle_at || "-";
+      }
+
+      async function refresh() {
+        try {
+          const data = await fetchJSON("/api/overview");
+          renderOverview(data);
+          renderQuotes(data.quotes || []);
+          renderArb(data.arbitrage || []);
+          renderPositions(data.positions || []);
+        } catch (err) {
+          console.error(err);
+          document.getElementById("statusBar").textContent = `Error: ${err.message}`;
+        }
+      }
+
+      document.getElementById("startBtn").addEventListener("click", async () => {
+        await fetchJSON("/api/control/start", { method: "POST" });
+        refresh();
+      });
+      document.getElementById("pauseBtn").addEventListener("click", async () => {
+        await fetchJSON("/api/control/pause", { method: "POST" });
+        refresh();
+      });
+      document.getElementById("updateThreshold").addEventListener("click", async () => {
+        const value = parseFloat(document.getElementById("profitInput").value);
+        if (Number.isNaN(value)) return;
+        await fetchJSON("/api/control/threshold", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ min_profit_pct: value / 100 }),
+        });
+        refresh();
+      });
+
+      refresh();
+      setInterval(refresh, 3000);
+    </script>
+  </body>
+</html>

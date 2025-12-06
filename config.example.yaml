@@ -16,6 +16,7 @@ max_symbol_exposure_pct: 0.2
 enforce_direction_consistency: true
 freeze_threshold_pct: 0.02
 freeze_window_seconds: 1
+loop_interval_seconds: 2
 default_maker_fee_bps: 2.0
 default_taker_fee_bps: 5.0
 default_slippage_bps: 1.5

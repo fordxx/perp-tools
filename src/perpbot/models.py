@@ -128,3 +128,10 @@ class TradingState:
     open_positions: Dict[str, Position] = field(default_factory=dict)
     recent_arbitrage: List[ArbitrageOpportunity] = field(default_factory=list)
     triggered_alerts: List[str] = field(default_factory=list)
+    account_positions: List[Position] = field(default_factory=list)
+    equity: float = 0.0
+    pnl: float = 0.0
+    last_cycle_at: Optional[datetime] = None
+    trading_enabled: bool = True
+    status: str = "initializing"
+    min_profit_pct: float = 0.0

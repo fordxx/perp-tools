@@ -8,7 +8,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - **Take-profit strategy** that opens positions and auto-closes after reaching a configurable profit threshold.
 - **Arbitrage scanner and executor** that discovers cross-exchange price edges, enforces risk limits, and fires two-sided orders with automatic hedging.
 - **Smart alerts** that trigger notifications or optional auto-orders when price rules are met.
-- **FastAPI dashboard** for real-time visibility into quotes, positions, alerts, and arbitrage opportunities.
+- **FastAPI web console** with live BTC/ETH quotes across exchanges, arbitrage spreads, positions/PnL, and controls to start/pause arbitrage or retune the minimum profit threshold.
 - **Config-driven setup** via `config.example.yaml`.
 
 ## Project Layout
@@ -21,7 +21,8 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - `src/perpbot/position_guard.py` — per-trade risk limits and cooldown enforcement.
 - `src/perpbot/risk_manager.py` — portfolio-level guardrails for drawdown, exposure, direction consistency, streak limits, and fast-market freezes.
 - `src/perpbot/monitoring/alerts.py` — rule-based alert evaluation with optional auto-orders.
-- `src/perpbot/monitoring/dashboard.py` — FastAPI monitoring API.
+- `src/perpbot/monitoring/web_console.py` — FastAPI web console and background trading service.
+- `src/perpbot/monitoring/static/index.html` — lightweight HTML dashboard for real-time control and visibility.
 - `src/perpbot/cli.py` — CLI entrypoint to run a single trading cycle or launch the dashboard server.
 
 ## Getting Started
@@ -44,17 +45,17 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
    PYTHONPATH=src python -m perpbot.cli cycle --config config.example.yaml
    ```
 
-4. Launch the monitoring API (defaults to port 8000):
+4. Launch the web console (defaults to port 8000):
 
    ```bash
    PYTHONPATH=src python -m perpbot.cli serve --config config.example.yaml --port 8000
    ```
 
-   The API exposes `GET /`, `/quotes`, `/positions`, `/arbitrage`, and `/alerts`.
+   Open `http://localhost:8000/` to view the live BTC/ETH board, spreads, PnL, and toggle arbitrage on/off. API endpoints are available under `/api/*` for programmatic control (`/api/overview`, `/api/control/start`, `/api/control/pause`, `/api/control/threshold`, plus `/api/quotes`, `/api/arbitrage`, and `/api/positions`).
 
 ### Risk and execution settings
 
-`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `max_consecutive_failures`, `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings to halt trading during violent moves.
+`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `max_consecutive_failures`, `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings to halt trading during violent moves. `loop_interval_seconds` controls how often the background loop refreshes quotes and evaluates spreads, while `arbitrage_min_profit_pct` can be tuned live from the web console.
 
 ### Environment & credentials
 

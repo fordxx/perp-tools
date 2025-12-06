@@ -26,6 +26,7 @@ class BotConfig:
     enforce_direction_consistency: bool = True
     freeze_threshold_pct: float = 0.02
     freeze_window_seconds: int = 1
+    loop_interval_seconds: float = 2.0
     default_maker_fee_bps: float = 2.0
     default_taker_fee_bps: float = 5.0
     default_slippage_bps: float = 1.0
@@ -53,6 +54,7 @@ def load_config(path: str) -> BotConfig:
         enforce_direction_consistency=data.get("enforce_direction_consistency", True),
         freeze_threshold_pct=data.get("freeze_threshold_pct", 0.02),
         freeze_window_seconds=data.get("freeze_window_seconds", 1),
+        loop_interval_seconds=data.get("loop_interval_seconds", 2.0),
         default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
         default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
         default_slippage_bps=data.get("default_slippage_bps", 1.0),

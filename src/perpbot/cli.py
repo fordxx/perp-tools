@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from typing import List
 
 import uvicorn
@@ -12,7 +13,7 @@ from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.config import BotConfig, load_config
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
-from perpbot.monitoring.dashboard import create_dashboard_app
+from perpbot.monitoring.web_console import create_web_app
 from perpbot.models import TradingState
 from perpbot.position_guard import PositionGuard
 from perpbot.risk_manager import RiskManager
@@ -57,6 +58,7 @@ def render_arbitrage(state: TradingState) -> None:
 
 def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     exchanges = provision_exchanges()
+    state.min_profit_pct = cfg.arbitrage_min_profit_pct
     guard = PositionGuard(
         max_risk_pct=cfg.max_risk_pct,
         assumed_equity=cfg.assumed_equity,
@@ -80,11 +82,15 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         except Exception:
             # Non-fatal in case an exchange does not support the query
             pass
+    state.account_positions = positions
     executor = ArbitrageExecutor(exchanges, guard, risk_manager=risk_manager)
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)
     risk_manager.update_equity(positions, state.quotes.values())
     risk_manager.evaluate_market(state.quotes.values())
+    state.equity = risk_manager.last_equity
+    state.pnl = risk_manager.last_equity - cfg.assumed_equity
+    state.last_cycle_at = datetime.utcnow()
     if risk_manager.trading_halted:
         console.print(f"[red]Trading halted: {risk_manager.halt_reason}[/red]")
         return
@@ -161,9 +167,7 @@ def main() -> None:
     if args.command == "cycle":
         single_cycle(cfg, state)
     elif args.command == "serve":
-        # warm up some data for the dashboard
-        single_cycle(cfg, state)
-        app = create_dashboard_app(state)
+        app = create_web_app(cfg)
         uvicorn.run(app, host="0.0.0.0", port=args.port)
 
 

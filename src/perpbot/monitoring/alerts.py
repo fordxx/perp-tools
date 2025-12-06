@@ -6,7 +6,12 @@ from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import AlertCondition, OrderRequest, TradingState
 
 
-def process_alerts(state: TradingState, alerts: Iterable[AlertCondition], exchanges: Iterable[ExchangeClient]) -> List[str]:
+def process_alerts(
+    state: TradingState,
+    alerts: Iterable[AlertCondition],
+    exchanges: Iterable[ExchangeClient],
+    execute_orders: bool = True,
+) -> List[str]:
     messages: List[str] = []
     for alert in alerts:
         quote = next((q for q in state.quotes.values() if q.symbol == alert.symbol), None)
@@ -18,7 +23,7 @@ def process_alerts(state: TradingState, alerts: Iterable[AlertCondition], exchan
         if alert.direction == "below" and price > alert.price:
             continue
         messages.append(f"Alert: {alert.symbol} {alert.direction} {alert.price} (now {price:.2f})")
-        if alert.action == "auto-order" and alert.side and alert.size > 0:
+        if execute_orders and alert.action == "auto-order" and alert.side and alert.size > 0:
             exchange = next((ex for ex in exchanges if ex.name == quote.exchange), None)
             if exchange:
                 exchange.place_order(
