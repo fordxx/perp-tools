@@ -7,6 +7,7 @@ from typing import Dict, Iterable, Optional, Sequence
 
 from perpbot.arbitrage.profit import ProfitContext, calculate_real_profit, chunk_order_sizes, resolve_exchange_cost
 from perpbot.arbitrage.scanner import ArbitrageOpportunity, DEX_ONLY_PAIRS
+from perpbot.capital_orchestrator import CapitalOrchestrator, CapitalReservation
 from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import ExchangeCost, OrderRequest, Position
 from perpbot.persistence import TradeRecorder
@@ -35,12 +36,14 @@ class ArbitrageExecutor:
         risk_manager: Optional[RiskManager] = None,
         exchange_costs: Optional[Dict[str, ExchangeCost]] = None,
         recorder: Optional[TradeRecorder] = None,
+        capital_orchestrator: Optional[CapitalOrchestrator] = None,
     ):
         self.exchanges: Dict[str, ExchangeClient] = {ex.name: ex for ex in exchanges}
         self.guard = guard
         self.risk_manager = risk_manager
         self.exchange_costs = exchange_costs or {}
         self.recorder = recorder
+        self.capital_orchestrator = capital_orchestrator
 
     def execute(
         self,
@@ -48,6 +51,7 @@ class ArbitrageExecutor:
         prefer_limit: bool = True,
         positions: Optional[Sequence[Position]] = None,
         quotes=None,
+        strategy: str = "arbitrage",
     ) -> ExecutionResult:
         buy_ex = self.exchanges.get(opportunity.buy_exchange)
         sell_ex = self.exchanges.get(opportunity.sell_exchange)
@@ -78,6 +82,8 @@ class ArbitrageExecutor:
             msg = "仓位保护阻止了本次下单"
             logger.warning("%s: notional %.4f exceeds %s%% of equity", msg, notional, self.guard.max_risk_pct * 100)
             return ExecutionResult(opportunity, status="blocked", error=msg)
+
+        reservation: Optional[CapitalReservation] = None
 
         if self.risk_manager:
             positions = positions or self.risk_manager.collect_positions(self.exchanges.values())
@@ -118,6 +124,14 @@ class ArbitrageExecutor:
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
         try:
+            if self.capital_orchestrator:
+                reservation = self.capital_orchestrator.reserve_for_strategy(
+                    [buy_ex.name, sell_ex.name], amount=notional, strategy=strategy
+                )
+                if not reservation.approved:
+                    msg = reservation.reason or "资金分配失败"
+                    logger.warning("资金调度拒绝本次套利: %s", msg)
+                    return ExecutionResult(opportunity, status="blocked", error=msg)
             chunks = list(chunk_order_sizes(opportunity.size, opportunity.buy_price))
             logger.info(
                 "执行套利: %s 笔拆单 %s -> %s (预期净收益 %.4f%%)",
@@ -183,6 +197,9 @@ class ArbitrageExecutor:
             if self.recorder:
                 self.recorder.record_trade(opportunity, success=False, actual_profit=0.0, error_message=str(exc))
             return ExecutionResult(opportunity, status="failed", error=str(exc))
+        finally:
+            if reservation:
+                self.capital_orchestrator.release(reservation)
 
     def _hedge_incomplete_legs(
         self,

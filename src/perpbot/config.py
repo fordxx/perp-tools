@@ -52,6 +52,16 @@ class BotConfig:
     trade_record_path: str = "data/trades.csv"
     alert_record_path: str = "data/alerts.csv"
     notifications: AlertNotificationConfig = field(default_factory=AlertNotificationConfig)
+    capital_wu_size: float = 10_000.0
+    capital_layer_targets: Dict[str, float] = field(
+        default_factory=lambda: {"L1": 0.2, "L2": 0.3, "L3": 0.25, "L4": 0.1, "L5": 0.15}
+    )
+    capital_layer_max_usage: Dict[str, float] = field(
+        default_factory=lambda: {"L1": 1.0, "L2": 1.0, "L3": 1.0, "L4": 1.0, "L5": 1.0}
+    )
+    capital_safe_layers: List[str] = field(default_factory=lambda: ["L1", "L4"])
+    capital_allow_borrow_from_l5: bool = True
+    capital_drawdown_limit_pct: float = 0.05
 
 
 def load_config(path: str) -> BotConfig:
@@ -105,4 +115,14 @@ def load_config(path: str) -> BotConfig:
         trade_record_path=data.get("trade_record_path", "data/trades.csv"),
         alert_record_path=data.get("alert_record_path", "data/alerts.csv"),
         notifications=notifications,
+        capital_wu_size=data.get("capital_wu_size", 10_000.0),
+        capital_layer_targets=data.get(
+            "capital_layer_targets", {"L1": 0.2, "L2": 0.3, "L3": 0.25, "L4": 0.1, "L5": 0.15}
+        ),
+        capital_layer_max_usage=data.get(
+            "capital_layer_max_usage", {"L1": 1.0, "L2": 1.0, "L3": 1.0, "L4": 1.0, "L5": 1.0}
+        ),
+        capital_safe_layers=data.get("capital_safe_layers", ["L1", "L4"]),
+        capital_allow_borrow_from_l5=data.get("capital_allow_borrow_from_l5", True),
+        capital_drawdown_limit_pct=data.get("capital_drawdown_limit_pct", 0.05),
     )

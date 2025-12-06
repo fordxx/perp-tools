@@ -11,6 +11,7 @@ from rich.table import Table
 from perpbot.arbitrage.arbitrage_executor import ArbitrageExecutor
 from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.arbitrage.volatility import SpreadVolatilityTracker
+from perpbot.capital_orchestrator import CapitalOrchestrator
 from perpbot.config import BotConfig, load_config
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
@@ -67,6 +68,14 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         assumed_equity=cfg.assumed_equity,
         cooldown_seconds=cfg.risk_cooldown_seconds,
     )
+    capital = CapitalOrchestrator(
+        wu_size=cfg.capital_wu_size,
+        layer_targets=cfg.capital_layer_targets,
+        layer_max_usage=cfg.capital_layer_max_usage,
+        safe_layers=cfg.capital_safe_layers,
+        allow_borrow_from_l5=cfg.capital_allow_borrow_from_l5,
+        drawdown_limit_pct=cfg.capital_drawdown_limit_pct,
+    )
     recorder = TradeRecorder(cfg.trade_record_path)
     alert_recorder = AlertRecorder(cfg.alert_record_path)
     volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
@@ -91,6 +100,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             ex_positions = ex.get_account_positions()
             positions.extend(ex_positions)
             guard.update_equity_from_positions(ex_positions)
+            capital.update_equity(ex.name, cfg.assumed_equity)
         except Exception:
             # 某些交易所不支持该查询时忽略即可
             pass
@@ -101,6 +111,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         risk_manager=risk_manager,
         exchange_costs=cfg.exchange_costs,
         recorder=recorder,
+        capital_orchestrator=capital,
     )
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)

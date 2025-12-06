@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from perpbot.arbitrage.arbitrage_executor import ArbitrageExecutor
 from perpbot.arbitrage.scanner import find_arbitrage_opportunities
 from perpbot.arbitrage.volatility import SpreadVolatilityTracker
+from perpbot.capital_orchestrator import CapitalOrchestrator
 from perpbot.config import BotConfig
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
@@ -93,6 +94,14 @@ class TradingService:
             assumed_equity=cfg.assumed_equity,
             cooldown_seconds=cfg.risk_cooldown_seconds,
         )
+        self.capital = CapitalOrchestrator(
+            wu_size=cfg.capital_wu_size,
+            layer_targets=cfg.capital_layer_targets,
+            layer_max_usage=cfg.capital_layer_max_usage,
+            safe_layers=cfg.capital_safe_layers,
+            allow_borrow_from_l5=cfg.capital_allow_borrow_from_l5,
+            drawdown_limit_pct=cfg.capital_drawdown_limit_pct,
+        )
         self.risk_manager = RiskManager(
             assumed_equity=cfg.assumed_equity,
             max_drawdown_pct=cfg.max_drawdown_pct,
@@ -114,7 +123,13 @@ class TradingService:
             risk_manager=self.risk_manager,
             exchange_costs=self.cfg.exchange_costs,
             recorder=self.recorder,
+            capital_orchestrator=self.capital,
         )
+        for ex in self.exchanges:
+            try:
+                self.capital.update_equity(ex.name, cfg.assumed_equity)
+            except Exception:
+                pass
         self.strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()

@@ -27,6 +27,24 @@
 - `src/perpbot/monitoring/web_console.py` —— FastAPI Web 控制台与后台交易服务。
 - `src/perpbot/monitoring/static/index.html` —— 轻量化实时控制面板。
 - `src/perpbot/cli.py` —— CLI 入口，可跑单次交易循环或启动控制台服务。
+- `src/perpbot/capital_orchestrator.py` —— 资金分层调度与安全模式切换的总控模块。
+
+## 资金调度与分层设计
+
+- **类结构**：`CapitalOrchestrator` 内部包含 `ExchangeCapitalProfile`（按交易所维度记录五层资金池、安全模式与回撤状态）和 `CapitalLayerState`（每层的目标权重、最大占用、可用/占用金额）。
+- **核心状态**：
+  - `wu_size`（单所基准资金，默认 1 WU = 10,000 USDT）
+  - `layer_targets` / `layer_max_usage`（L1-L5 目标比例、最大占用比例）
+  - `safe_layers`（触发单所回撤≥5%时只允许的层级，默认 L1+L4）
+  - `exchange_profiles`（每所的资金池快照、当日回撤、是否安全模式）
+- **工作流程**：
+  1. 策略/执行器在下单前调用 `reserve_for_strategy(exchanges, amount, strategy)`，根据策略映射优先分配 L1-L4（不足时可从 L5 借用）。
+  2. 若资金不足或交易所处于安全模式，会返回拒绝理由，执行器直接跳过下单。
+  3. 下单完成后调用 `release(reservation)` 归还占用，保持实时可用额度。
+  4. 当监测到单所回撤超过 `capital_drawdown_limit_pct` 时，`update_drawdown` 会将该所切换至安全模式，只允许“刷量对冲 + 费率层”并可自动降仓/熔断。
+  5. `current_snapshot` 提供 Web/监控端的分层水位，用于可视化 L1-L5 的占用与剩余额度。
+
+- **对接方式**：`ArbitrageExecutor` 已在下单前向 `CapitalOrchestrator` 申请额度，`cli.py` 与 Web `TradingService` 默认加载配置中的五层比例（L1 20%、L2 30%、L3 25%、L4 10%、L5 15%）并为每个交易所初始化 1 WU 资金池，未来可扩展为实时余额/回撤驱动的动态调整。
 
 ## 快速开始
 
