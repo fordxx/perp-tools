@@ -7,6 +7,9 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - **Modular exchange layer** with stub clients for all requested venues.
 - **Take-profit strategy** that opens positions and auto-closes after reaching a configurable profit threshold.
 - **Arbitrage scanner and executor** that discovers cross-exchange price edges, enforces risk limits, and fires two-sided orders with automatic hedging.
+- **Dynamic profit gating** that adjusts the minimum profit floor using recent spread volatility and scores opportunities by profitability, liquidity, and venue reliability before execution.
+- **Concurrent pricing** with shared WebSocket price cache and asyncio-gather REST fallbacks, plus per-exchange rate limiting to avoid throttling.
+- **Trade recording and analytics hooks** that persist every arbitrage attempt to CSV/SQLite for later reliability scoring and dashboarding.
 - **Smart alerts** that trigger notifications or optional auto-orders when price rules are met.
 - **FastAPI web console** with live BTC/ETH quotes across exchanges, an arbitrage opportunity panel, real-time position view, an equity/PnL curve, and controls to start/pause arbitrage or retune the minimum profit threshold.
 - **Config-driven setup** via `config.example.yaml`.
@@ -55,7 +58,7 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
 
 ### Risk and execution settings
 
-`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `daily_loss_limit_pct` (default 8% stop for the UTC day), `max_consecutive_failures` (halts after three misses), `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings (default 0.5% move inside one second) to halt trading during violent moves. `loop_interval_seconds` controls how often the background loop refreshes quotes and evaluates spreads, while `arbitrage_min_profit_pct` can be tuned live from the web console.
+`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `daily_loss_limit_pct` (default 8% stop for the UTC day), `max_consecutive_failures` (halts after three misses), `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings (default 0.5% move inside one second) to halt trading during violent moves. `loop_interval_seconds` controls how often the background loop refreshes quotes and evaluates spreads, while `arbitrage_min_profit_pct` can be tuned live from the web console. Dynamic safeguards now cover slippage caps, partial-fill hedging with timeouts, exchange-level circuit breakers, balance concentration warnings, and volatility-driven profit targets (`high_vol_min_profit_pct` vs `low_vol_min_profit_pct`) with priority-score gating.
 
 ### Environment & credentials
 

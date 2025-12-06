@@ -10,12 +10,14 @@ from rich.table import Table
 
 from perpbot.arbitrage.arbitrage_executor import ArbitrageExecutor
 from perpbot.arbitrage.scanner import find_arbitrage_opportunities
+from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.config import BotConfig, load_config
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
 from perpbot.monitoring.web_console import create_web_app
 from perpbot.models import TradingState
 from perpbot.position_guard import PositionGuard
+from perpbot.persistence import TradeRecorder
 from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
@@ -59,11 +61,14 @@ def render_arbitrage(state: TradingState) -> None:
 def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     exchanges = provision_exchanges()
     state.min_profit_pct = cfg.arbitrage_min_profit_pct
+    state.per_exchange_limit = cfg.per_exchange_limit
     guard = PositionGuard(
         max_risk_pct=cfg.max_risk_pct,
         assumed_equity=cfg.assumed_equity,
         cooldown_seconds=cfg.risk_cooldown_seconds,
     )
+    recorder = TradeRecorder(cfg.trade_record_path)
+    volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
     risk_manager = RiskManager(
         assumed_equity=cfg.assumed_equity,
         max_drawdown_pct=cfg.max_drawdown_pct,
@@ -74,6 +79,10 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         freeze_window_seconds=cfg.freeze_window_seconds,
         max_trade_risk_pct=cfg.max_risk_pct,
         daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+        max_slippage_bps=cfg.max_slippage_bps,
+        order_fill_timeout_seconds=cfg.order_fill_timeout_seconds,
+        circuit_breaker_failures=cfg.circuit_breaker_failures,
+        balance_concentration_pct=cfg.balance_concentration_pct,
     )
     positions = []
     for ex in exchanges:
@@ -85,7 +94,13 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             # Non-fatal in case an exchange does not support the query
             pass
     state.account_positions = positions
-    executor = ArbitrageExecutor(exchanges, guard, risk_manager=risk_manager, exchange_costs=cfg.exchange_costs)
+    executor = ArbitrageExecutor(
+        exchanges,
+        guard,
+        risk_manager=risk_manager,
+        exchange_costs=cfg.exchange_costs,
+        recorder=recorder,
+    )
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)
     risk_manager.update_equity(positions, state.quotes.values())
@@ -116,6 +131,13 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         min_profit_abs=cfg.arbitrage_trade_size * next(iter(state.quotes.values())).mid
         if state.quotes
         else 0.0,
+        volatility_tracker=volatility_tracker,
+        high_vol_min_profit_pct=cfg.high_vol_min_profit_pct,
+        low_vol_min_profit_pct=cfg.low_vol_min_profit_pct,
+        volatility_high_threshold=cfg.volatility_high_threshold_pct,
+        priority_threshold=cfg.priority_score_threshold,
+        priority_weights=cfg.priority_weights,
+        reliability_scores=cfg.reliability_scores,
     )
     state.recent_arbitrage = opportunities
 

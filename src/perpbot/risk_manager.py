@@ -23,6 +23,10 @@ class RiskManager:
         freeze_window_seconds: int = 1,
         max_trade_risk_pct: float = 0.05,
         daily_loss_limit_pct: float = 0.08,
+        max_slippage_bps: float = 50.0,
+        order_fill_timeout_seconds: int = 5,
+        circuit_breaker_failures: int = 3,
+        balance_concentration_pct: float = 0.5,
     ):
         self.assumed_equity = max(assumed_equity, 1.0)
         self.peak_equity = self.assumed_equity
@@ -44,6 +48,11 @@ class RiskManager:
         self._last_price: Dict[str, Tuple[float, datetime]] = {}
         self._daily_anchor_equity = self.assumed_equity
         self._daily_anchor_date = datetime.utcnow().date()
+        self.max_slippage_bps = max_slippage_bps
+        self.order_fill_timeout_seconds = order_fill_timeout_seconds
+        self.circuit_breaker_failures = circuit_breaker_failures
+        self.balance_concentration_pct = balance_concentration_pct
+        self.exchange_failures: Dict[str, int] = {}
 
     def collect_positions(self, exchanges: Iterable) -> List[Position]:
         positions: List[Position] = []
@@ -154,6 +163,32 @@ class RiskManager:
         if self.consecutive_failures:
             logger.info("Resetting failure streak after success")
         self.consecutive_failures = 0
+
+    def check_slippage(self, intended_price: float, current_price: float) -> Tuple[bool, Optional[str]]:
+        move = abs(current_price - intended_price) / max(intended_price, 1e-9)
+        if move * 10_000 > self.max_slippage_bps:
+            return False, f"Slippage {move*100:.3f}% exceeds limit"
+        return True, None
+
+    def record_exchange_failure(self, exchange: str) -> None:
+        self.exchange_failures[exchange] = self.exchange_failures.get(exchange, 0) + 1
+        logger.warning("Recorded failure for %s (count=%s)", exchange, self.exchange_failures[exchange])
+
+    def exchange_blocked(self, exchange: str) -> bool:
+        return self.exchange_failures.get(exchange, 0) >= self.circuit_breaker_failures
+
+    def evaluate_balances(self, balances: Dict[str, float]) -> Optional[str]:
+        if not balances:
+            return None
+        total = sum(balances.values())
+        if total <= 0:
+            return None
+        for ex, bal in balances.items():
+            if bal / total >= self.balance_concentration_pct:
+                msg = f"Balance concentration on {ex}: {bal/total*100:.2f}%"
+                logger.warning(msg)
+                return msg
+        return None
 
     def _symbol_net_and_exposure(
         self,

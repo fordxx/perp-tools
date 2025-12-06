@@ -35,6 +35,21 @@ class BotConfig:
     retry_cost_bps: float = 0.5
     exchange_costs: Dict[str, ExchangeCost] = field(default_factory=dict)
     alerts: List[AlertCondition] = field(default_factory=list)
+    volatility_window_minutes: int = 5
+    volatility_high_threshold_pct: float = 0.03
+    high_vol_min_profit_pct: float = 0.002
+    low_vol_min_profit_pct: float = 0.005
+    priority_score_threshold: float = 70.0
+    priority_weights: Dict[str, float] = field(
+        default_factory=lambda: {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
+    )
+    reliability_scores: Dict[str, float] = field(default_factory=dict)
+    max_slippage_bps: float = 50.0
+    order_fill_timeout_seconds: int = 5
+    circuit_breaker_failures: int = 3
+    balance_concentration_pct: float = 0.5
+    per_exchange_limit: int = 2
+    trade_record_path: str = "data/trades.csv"
 
 
 def load_config(path: str) -> BotConfig:
@@ -70,4 +85,19 @@ def load_config(path: str) -> BotConfig:
         retry_cost_bps=data.get("retry_cost_bps", 0.5),
         exchange_costs=exchange_costs,
         alerts=alerts,
+        volatility_window_minutes=data.get("volatility_window_minutes", 5),
+        volatility_high_threshold_pct=data.get("volatility_high_threshold_pct", 0.03),
+        high_vol_min_profit_pct=data.get("high_vol_min_profit_pct", 0.002),
+        low_vol_min_profit_pct=data.get("low_vol_min_profit_pct", 0.005),
+        priority_score_threshold=data.get("priority_score_threshold", 70.0),
+        priority_weights=data.get(
+            "priority_weights", {"profit_pct": 0.4, "profit_abs": 0.3, "liquidity": 0.2, "reliability": 0.1}
+        ),
+        reliability_scores=data.get("reliability_scores", {}),
+        max_slippage_bps=data.get("max_slippage_bps", 50.0),
+        order_fill_timeout_seconds=data.get("order_fill_timeout_seconds", 5),
+        circuit_breaker_failures=data.get("circuit_breaker_failures", 3),
+        balance_concentration_pct=data.get("balance_concentration_pct", 0.5),
+        per_exchange_limit=data.get("per_exchange_limit", 2),
+        trade_record_path=data.get("trade_record_path", "data/trades.csv"),
     )

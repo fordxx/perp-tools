@@ -18,11 +18,30 @@ enforce_direction_consistency: true
 freeze_threshold_pct: 0.005
 freeze_window_seconds: 1
 daily_loss_limit_pct: 0.08
+volatility_window_minutes: 5
+volatility_high_threshold_pct: 0.03
+high_vol_min_profit_pct: 0.002
+low_vol_min_profit_pct: 0.005
+priority_score_threshold: 70
+priority_weights:
+  profit_pct: 0.4
+  profit_abs: 0.3
+  liquidity: 0.2
+  reliability: 0.1
+reliability_scores:
+  edgex: 95
+  paradex: 90
 loop_interval_seconds: 2
 default_maker_fee_bps: 2.0
 default_taker_fee_bps: 5.0
 default_slippage_bps: 1.5
 retry_cost_bps: 0.5
+max_slippage_bps: 75
+order_fill_timeout_seconds: 5
+circuit_breaker_failures: 3
+balance_concentration_pct: 0.5
+per_exchange_limit: 2
+trade_record_path: data/trades.csv
 exchange_costs:
   edgex:
     maker_fee_bps: 1.5

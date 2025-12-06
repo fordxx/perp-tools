@@ -14,11 +14,13 @@ from fastapi.staticfiles import StaticFiles
 
 from perpbot.arbitrage.arbitrage_executor import ArbitrageExecutor
 from perpbot.arbitrage.scanner import find_arbitrage_opportunities
+from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.config import BotConfig
 from perpbot.exchanges.base import provision_exchanges, update_state_with_quotes
 from perpbot.monitoring.alerts import process_alerts
 from perpbot.models import ArbitrageOpportunity, Position, PriceQuote, TradingState
 from perpbot.position_guard import PositionGuard
+from perpbot.persistence import TradeRecorder
 from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
@@ -64,9 +66,11 @@ class TradingService:
 
     def __init__(self, cfg: BotConfig):
         self.cfg = cfg
-        self.state = TradingState(min_profit_pct=cfg.arbitrage_min_profit_pct)
+        self.state = TradingState(min_profit_pct=cfg.arbitrage_min_profit_pct, per_exchange_limit=cfg.per_exchange_limit)
         self.state.trading_enabled = True
         self.exchanges = provision_exchanges()
+        self.volatility_tracker = SpreadVolatilityTracker(window_minutes=cfg.volatility_window_minutes)
+        self.recorder = TradeRecorder(cfg.trade_record_path)
         self.guard = PositionGuard(
             max_risk_pct=cfg.max_risk_pct,
             assumed_equity=cfg.assumed_equity,
@@ -82,12 +86,17 @@ class TradingService:
             freeze_window_seconds=cfg.freeze_window_seconds,
             max_trade_risk_pct=cfg.max_risk_pct,
             daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+            max_slippage_bps=cfg.max_slippage_bps,
+            order_fill_timeout_seconds=cfg.order_fill_timeout_seconds,
+            circuit_breaker_failures=cfg.circuit_breaker_failures,
+            balance_concentration_pct=cfg.balance_concentration_pct,
         )
         self.executor = ArbitrageExecutor(
             self.exchanges,
             self.guard,
             risk_manager=self.risk_manager,
             exchange_costs=self.cfg.exchange_costs,
+            recorder=self.recorder,
         )
         self.strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
         self._stop_event = threading.Event()
@@ -155,6 +164,13 @@ class TradingService:
                 min_profit_abs=self.cfg.arbitrage_trade_size * next(iter(self.state.quotes.values())).mid
                 if self.state.quotes
                 else 0.0,
+                volatility_tracker=self.volatility_tracker,
+                high_vol_min_profit_pct=self.cfg.high_vol_min_profit_pct,
+                low_vol_min_profit_pct=self.cfg.low_vol_min_profit_pct,
+                volatility_high_threshold=self.cfg.volatility_high_threshold_pct,
+                priority_threshold=self.cfg.priority_score_threshold,
+                priority_weights=self.cfg.priority_weights,
+                reliability_scores=self.cfg.reliability_scores,
             )
             self.state.recent_arbitrage = opportunities
 

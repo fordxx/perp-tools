@@ -428,15 +428,19 @@ def provision_exchanges() -> List[ExchangeClient]:
 
 
 def update_state_with_quotes(state: TradingState, exchanges: Iterable[ExchangeClient], symbols: Iterable[str]) -> None:
-    for ex in exchanges:
-        for sym in symbols:
-            quote = ex.get_current_price(sym)
-            quote.venue_type = getattr(ex, "venue_type", "dex")
-            try:
-                quote.order_book = ex.get_orderbook(sym)
-            except Exception:
-                logger.exception("Failed to fetch orderbook for %s on %s", sym, ex.name)
-            state.quotes[f"{ex.name}:{sym}"] = quote
+    from perpbot.exchanges.pricing import WebsocketPriceMonitor, fetch_quotes_concurrently
+
+    monitor = getattr(state, "price_monitor", None)
+    if monitor is None:
+        monitor = WebsocketPriceMonitor()
+        state.price_monitor = monitor  # type: ignore[attr-defined]
+
+    async def _collect():
+        return await fetch_quotes_concurrently(exchanges, symbols, per_exchange_limit=getattr(state, "per_exchange_limit", 2), monitor=monitor)
+
+    quotes = asyncio.run(_collect())
+    for quote in quotes:
+        state.quotes[f"{quote.exchange}:{quote.symbol}"] = quote
 
 
 def evaluate_alerts(state: TradingState, alerts: Iterable[AlertCondition]) -> List[AlertCondition]:
