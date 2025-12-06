@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Sequence
 
 from perpbot.arbitrage.scanner import ArbitrageOpportunity
 from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import OrderRequest, Position
 from perpbot.position_guard import PositionGuard
+from perpbot.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,23 @@ class ExecutionResult:
 class ArbitrageExecutor:
     """Execute two-sided arbitrage opportunities with risk controls and hedging."""
 
-    def __init__(self, exchanges: Iterable[ExchangeClient], guard: PositionGuard):
+    def __init__(
+        self,
+        exchanges: Iterable[ExchangeClient],
+        guard: PositionGuard,
+        risk_manager: Optional[RiskManager] = None,
+    ):
         self.exchanges: Dict[str, ExchangeClient] = {ex.name: ex for ex in exchanges}
         self.guard = guard
+        self.risk_manager = risk_manager
 
-    def execute(self, opportunity: ArbitrageOpportunity, prefer_limit: bool = True) -> ExecutionResult:
+    def execute(
+        self,
+        opportunity: ArbitrageOpportunity,
+        prefer_limit: bool = True,
+        positions: Optional[Sequence[Position]] = None,
+        quotes=None,
+    ) -> ExecutionResult:
         buy_ex = self.exchanges.get(opportunity.buy_exchange)
         sell_ex = self.exchanges.get(opportunity.sell_exchange)
         if not buy_ex or not sell_ex:
@@ -41,6 +54,21 @@ class ArbitrageExecutor:
             msg = "Trade blocked by position guard"
             logger.warning("%s: notional %.4f exceeds %s%% of equity", msg, notional, self.guard.max_risk_pct * 100)
             return ExecutionResult(opportunity, status="blocked", error=msg)
+
+        if self.risk_manager:
+            positions = positions or self.risk_manager.collect_positions(self.exchanges.values())
+            allowed, reason = self.risk_manager.can_trade(
+                opportunity.symbol,
+                side="buy",
+                size=opportunity.size,
+                price=opportunity.buy_price,
+                positions=positions,
+                quotes=quotes,
+            )
+            if not allowed:
+                msg = reason or "Blocked by risk manager"
+                logger.warning("Arbitrage blocked: %s", msg)
+                return ExecutionResult(opportunity, status="blocked", error=msg)
 
         buy_order = None
         sell_order = None
@@ -67,6 +95,8 @@ class ArbitrageExecutor:
             )
             buy_order = buy_ex.place_open_order(buy_req)
             sell_order = sell_ex.place_open_order(sell_req)
+            if self.risk_manager:
+                self.risk_manager.record_success()
             self.guard.mark_success()
             return ExecutionResult(
                 opportunity,
@@ -78,6 +108,8 @@ class ArbitrageExecutor:
             logger.exception("Arbitrage leg failed: %s", exc)
             self._hedge_incomplete_legs(opportunity, buy_ex, sell_ex, buy_order, sell_order)
             self.guard.mark_failure()
+            if self.risk_manager:
+                self.risk_manager.record_failure()
             return ExecutionResult(opportunity, status="failed", error=str(exc))
 
     def _hedge_incomplete_legs(

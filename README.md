@@ -19,6 +19,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - `src/perpbot/arbitrage/scanner.py` — cross-exchange arbitrage detector with depth-aware, cost-adjusted signal generation.
 - `src/perpbot/arbitrage/arbitrage_executor.py` — two-sided arbitrage executor with hedging when a leg fails.
 - `src/perpbot/position_guard.py` — per-trade risk limits and cooldown enforcement.
+- `src/perpbot/risk_manager.py` — portfolio-level guardrails for drawdown, exposure, direction consistency, streak limits, and fast-market freezes.
 - `src/perpbot/monitoring/alerts.py` — rule-based alert evaluation with optional auto-orders.
 - `src/perpbot/monitoring/dashboard.py` — FastAPI monitoring API.
 - `src/perpbot/cli.py` — CLI entrypoint to run a single trading cycle or launch the dashboard server.
@@ -53,7 +54,7 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
 
 ### Risk and execution settings
 
-`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt.
+`config.example.yaml` exposes `max_risk_pct`, `assumed_equity`, and `risk_cooldown_seconds` to cap per-trade exposure (default 5% of account), provide an equity seed when balances are unavailable, and pause trading briefly after a failed arbitrage attempt. Additional risk controls include `max_drawdown_pct`, `max_consecutive_failures`, `max_symbol_exposure_pct`, `enforce_direction_consistency`, and freeze settings to halt trading during violent moves.
 
 ### Environment & credentials
 

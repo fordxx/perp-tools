@@ -15,6 +15,7 @@ from perpbot.monitoring.alerts import process_alerts
 from perpbot.monitoring.dashboard import create_dashboard_app
 from perpbot.models import TradingState
 from perpbot.position_guard import PositionGuard
+from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
 
 console = Console()
@@ -61,15 +62,35 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         assumed_equity=cfg.assumed_equity,
         cooldown_seconds=cfg.risk_cooldown_seconds,
     )
+    risk_manager = RiskManager(
+        assumed_equity=cfg.assumed_equity,
+        max_drawdown_pct=cfg.max_drawdown_pct,
+        max_consecutive_failures=cfg.max_consecutive_failures,
+        max_symbol_exposure_pct=cfg.max_symbol_exposure_pct,
+        enforce_direction_consistency=cfg.enforce_direction_consistency,
+        freeze_threshold_pct=cfg.freeze_threshold_pct,
+        freeze_window_seconds=cfg.freeze_window_seconds,
+    )
+    positions = []
     for ex in exchanges:
         try:
-            guard.update_equity_from_positions(ex.get_account_positions())
+            ex_positions = ex.get_account_positions()
+            positions.extend(ex_positions)
+            guard.update_equity_from_positions(ex_positions)
         except Exception:
             # Non-fatal in case an exchange does not support the query
             pass
-    executor = ArbitrageExecutor(exchanges, guard)
+    executor = ArbitrageExecutor(exchanges, guard, risk_manager=risk_manager)
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)
+    risk_manager.update_equity(positions, state.quotes.values())
+    risk_manager.evaluate_market(state.quotes.values())
+    if risk_manager.trading_halted:
+        console.print(f"[red]Trading halted: {risk_manager.halt_reason}[/red]")
+        return
+    if risk_manager.is_frozen():
+        console.print(f"[yellow]Market temporarily frozen: {risk_manager.freeze_reason()}[/yellow]")
+        return
 
     # Auto alerts and monitoring
     process_alerts(state, cfg.alerts, exchanges)
@@ -88,13 +109,26 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
 
     # Execute opportunities with hedging and risk controls
     for op in opportunities:
-        result = executor.execute(op)
+        positions = risk_manager.collect_positions(exchanges)
+        allowed, reason = risk_manager.can_trade(
+            op.symbol,
+            side="buy",
+            size=op.size,
+            price=op.buy_price,
+            positions=positions,
+            quotes=state.quotes.values(),
+        )
+        if not allowed:
+            console.print(f"[yellow]Skipping arbitrage: {reason or 'risk block'}[/yellow]")
+            continue
+
+        result = executor.execute(op, positions=positions, quotes=state.quotes.values())
         if result.status == "filled":
             console.print(
                 f"[green]Executed arbitrage {op.symbol}: buy {op.buy_exchange} / sell {op.sell_exchange}[/green]"
             )
         elif result.status == "blocked":
-            console.print("[yellow]Skipped arbitrage due to risk guard[/yellow]")
+            console.print(f"[yellow]Skipped arbitrage due to risk guard: {result.error}[/yellow]")
         else:
             console.print(f"[red]Arbitrage execution failed: {result.error}[/red]")
 

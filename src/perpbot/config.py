@@ -20,6 +20,12 @@ class BotConfig:
     max_risk_pct: float = 0.05
     risk_cooldown_seconds: int = 30
     assumed_equity: float = 10_000.0
+    max_drawdown_pct: float = 0.1
+    max_consecutive_failures: int = 3
+    max_symbol_exposure_pct: float = 0.2
+    enforce_direction_consistency: bool = True
+    freeze_threshold_pct: float = 0.02
+    freeze_window_seconds: int = 1
     default_maker_fee_bps: float = 2.0
     default_taker_fee_bps: float = 5.0
     default_slippage_bps: float = 1.0
@@ -41,6 +47,12 @@ def load_config(path: str) -> BotConfig:
         max_risk_pct=data.get("max_risk_pct", 0.05),
         risk_cooldown_seconds=data.get("risk_cooldown_seconds", 30),
         assumed_equity=data.get("assumed_equity", 10_000.0),
+        max_drawdown_pct=data.get("max_drawdown_pct", 0.1),
+        max_consecutive_failures=data.get("max_consecutive_failures", 3),
+        max_symbol_exposure_pct=data.get("max_symbol_exposure_pct", 0.2),
+        enforce_direction_consistency=data.get("enforce_direction_consistency", True),
+        freeze_threshold_pct=data.get("freeze_threshold_pct", 0.02),
+        freeze_window_seconds=data.get("freeze_window_seconds", 1),
         default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
         default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
         default_slippage_bps=data.get("default_slippage_bps", 1.0),
