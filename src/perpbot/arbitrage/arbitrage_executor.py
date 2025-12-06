@@ -4,9 +4,10 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence
 
+from perpbot.arbitrage.profit import ProfitContext, calculate_real_profit, chunk_order_sizes, resolve_exchange_cost
 from perpbot.arbitrage.scanner import ArbitrageOpportunity, DEX_ONLY_PAIRS
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import OrderRequest, Position
+from perpbot.models import ExchangeCost, OrderRequest, Position
 from perpbot.position_guard import PositionGuard
 from perpbot.risk_manager import RiskManager
 
@@ -30,10 +31,12 @@ class ArbitrageExecutor:
         exchanges: Iterable[ExchangeClient],
         guard: PositionGuard,
         risk_manager: Optional[RiskManager] = None,
+        exchange_costs: Optional[Dict[str, ExchangeCost]] = None,
     ):
         self.exchanges: Dict[str, ExchangeClient] = {ex.name: ex for ex in exchanges}
         self.guard = guard
         self.risk_manager = risk_manager
+        self.exchange_costs = exchange_costs or {}
 
     def execute(
         self,
@@ -82,29 +85,45 @@ class ArbitrageExecutor:
 
         buy_order = None
         sell_order = None
+        failure_bias = 0.0
+        if self.risk_manager and getattr(self.risk_manager, "consecutive_failures", 0) > 0:
+            failure_bias = min(0.5, self.risk_manager.consecutive_failures / 10)
+        profit_ctx = ProfitContext(
+            buy_cost=resolve_exchange_cost(buy_ex.name, self.exchange_costs, ExchangeCost()),
+            sell_cost=resolve_exchange_cost(sell_ex.name, self.exchange_costs, ExchangeCost()),
+            failure_probability=failure_bias,
+        )
+        expected_profit = calculate_real_profit(opportunity, notional, profit_ctx)
+        if expected_profit.net_profit_abs <= 0:
+            msg = "Arbitrage no longer profitable"
+            logger.warning(msg)
+            return ExecutionResult(opportunity, status="blocked", error=msg)
         try:
-            buy_req = OrderRequest(
-                symbol=opportunity.symbol,
-                side="buy",
-                size=opportunity.size,
-                limit_price=opportunity.buy_price if prefer_limit else None,
-            )
-            sell_req = OrderRequest(
-                symbol=opportunity.symbol,
-                side="sell",
-                size=opportunity.size,
-                limit_price=opportunity.sell_price if prefer_limit else None,
-            )
-
+            chunks = list(chunk_order_sizes(opportunity.size, opportunity.buy_price))
             logger.info(
-                "Executing arbitrage: buy %.4f %s @ %s, sell @ %s",
-                opportunity.size,
-                opportunity.symbol,
+                "Executing arbitrage: %s chunks across %s -> %s (expected net %.4f%%)",
+                len(chunks),
                 opportunity.buy_exchange,
                 opportunity.sell_exchange,
+                expected_profit.net_profit_pct * 100,
             )
-            buy_order = buy_ex.place_open_order(buy_req)
-            sell_order = sell_ex.place_open_order(sell_req)
+
+            for chunk in chunks:
+                buy_req = OrderRequest(
+                    symbol=opportunity.symbol,
+                    side="buy",
+                    size=chunk,
+                    limit_price=opportunity.buy_price if prefer_limit else None,
+                )
+                sell_req = OrderRequest(
+                    symbol=opportunity.symbol,
+                    side="sell",
+                    size=chunk,
+                    limit_price=opportunity.sell_price if prefer_limit else None,
+                )
+
+                buy_order = buy_ex.place_open_order(buy_req)
+                sell_order = sell_ex.place_open_order(sell_req)
             if self.risk_manager:
                 self.risk_manager.record_success()
             self.guard.mark_success()

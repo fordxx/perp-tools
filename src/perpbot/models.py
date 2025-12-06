@@ -105,6 +105,13 @@ class Balance:
 
 
 @dataclass
+class ExchangeCost:
+    maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 0.0
+    funding_rate: float = 0.0
+
+
+@dataclass
 class Position:
     id: str
     order: Order
@@ -127,7 +134,18 @@ class ArbitrageOpportunity:
     expected_pnl: float
     net_profit_pct: float
     confidence: float = 1.0
+    profit: Optional["ProfitResult"] = None
     discovered_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class ProfitResult:
+    gross_spread_pct: float
+    fees_pct: float
+    slippage_pct: float
+    funding_cost_pct: float
+    net_profit_pct: float
+    net_profit_abs: float
 
 
 @dataclass

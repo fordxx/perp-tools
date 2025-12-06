@@ -3,7 +3,8 @@ from __future__ import annotations
 from itertools import permutations
 from typing import Iterable, List
 
-from perpbot.models import ArbitrageOpportunity, PriceQuote
+from perpbot.arbitrage.profit import ProfitContext, calculate_real_profit, resolve_exchange_cost
+from perpbot.models import ArbitrageOpportunity, ExchangeCost, PriceQuote
 
 DEX_ONLY_PAIRS = {
     ("edgex", "paradex"),
@@ -19,12 +20,6 @@ def _effective_price(quote: PriceQuote, side: str, size: float, slippage_bps: fl
     return quote.executable_price(side, size, default_slippage_bps=slippage_bps)
 
 
-def _fee_bps(quote: PriceQuote, default_maker_fee_bps: float, default_taker_fee_bps: float) -> tuple[float, float]:
-    maker = quote.maker_fee_bps if quote.maker_fee_bps is not None else default_maker_fee_bps
-    taker = quote.taker_fee_bps if quote.taker_fee_bps is not None else default_taker_fee_bps
-    return maker, taker
-
-
 def find_arbitrage_opportunities(
     quotes: Iterable[PriceQuote],
     trade_size: float,
@@ -32,8 +27,9 @@ def find_arbitrage_opportunities(
     default_maker_fee_bps: float = 2.0,
     default_taker_fee_bps: float = 5.0,
     default_slippage_bps: float = 1.0,
-    retry_cost_bps: float = 0.5,
     failure_probability: float = 0.05,
+    exchange_costs: dict[str, ExchangeCost] | None = None,
+    min_profit_abs: float = 0.0,
 ) -> List[ArbitrageOpportunity]:
     """
     Discover executable arbitrage signals across exchanges using depth-aware prices
@@ -45,6 +41,12 @@ def find_arbitrage_opportunities(
         grouped.setdefault(quote.symbol, []).append(quote)
 
     opportunities: List[ArbitrageOpportunity] = []
+    default_cost = ExchangeCost(
+        maker_fee_bps=default_maker_fee_bps,
+        taker_fee_bps=default_taker_fee_bps,
+        funding_rate=0.0,
+    )
+    cost_map = exchange_costs or {}
     for symbol, sym_quotes in grouped.items():
         dex_quotes = [q for q in sym_quotes if q.venue_type == "dex"]
         if len(dex_quotes) < 2:
@@ -61,37 +63,31 @@ def find_arbitrage_opportunities(
             if buy_price is None or sell_price is None:
                 continue
 
-            _, buy_taker_fee = _fee_bps(buy, default_maker_fee_bps, default_taker_fee_bps)
-            _, sell_taker_fee = _fee_bps(sell, default_maker_fee_bps, default_taker_fee_bps)
-
-            gross_pnl = (sell_price - buy_price) * trade_size
-            fee_cost = trade_size * (
-                buy_price * (buy_taker_fee / 10_000) + sell_price * (sell_taker_fee / 10_000)
-            )
-            funding_cost = trade_size * (
-                buy_price * (buy.funding_rate or 0.0) + sell_price * (sell.funding_rate or 0.0)
-            )
-            retry_cost = trade_size * (
-                buy_price * (retry_cost_bps / 10_000) + sell_price * (retry_cost_bps / 10_000)
-            )
-
-            net_pnl = gross_pnl - fee_cost - funding_cost - retry_cost
             success_prob = max(0.0, min(1.0, 1 - failure_probability))
-            expected_pnl = net_pnl * success_prob
-            net_profit_pct = expected_pnl / (buy_price * trade_size)
+            candidate = ArbitrageOpportunity(
+                symbol=symbol,
+                buy_exchange=buy.exchange,
+                sell_exchange=sell.exchange,
+                buy_price=buy_price,
+                sell_price=sell_price,
+                size=trade_size,
+                expected_pnl=0.0,
+                net_profit_pct=0.0,
+                confidence=success_prob,
+            )
 
-            if expected_pnl > 0 and net_profit_pct >= min_profit_pct:
-                opportunities.append(
-                    ArbitrageOpportunity(
-                        symbol=symbol,
-                        buy_exchange=buy.exchange,
-                        sell_exchange=sell.exchange,
-                        buy_price=buy_price,
-                        sell_price=sell_price,
-                        size=trade_size,
-                        expected_pnl=expected_pnl,
-                        net_profit_pct=net_profit_pct,
-                        confidence=success_prob,
-                    )
-                )
+            buy_cost = resolve_exchange_cost(buy.exchange, cost_map, default_cost)
+            sell_cost = resolve_exchange_cost(sell.exchange, cost_map, default_cost)
+            ctx = ProfitContext(
+                buy_cost=buy_cost,
+                sell_cost=sell_cost,
+                failure_probability=failure_probability,
+            )
+            profit = calculate_real_profit(candidate, buy_price * trade_size, ctx)
+            candidate.expected_pnl = profit.net_profit_abs
+            candidate.net_profit_pct = profit.net_profit_pct
+            candidate.profit = profit
+
+            if profit.net_profit_abs > 0 and profit.net_profit_pct >= min_profit_pct and profit.net_profit_abs >= min_profit_abs:
+                opportunities.append(candidate)
     return opportunities

@@ -83,7 +83,12 @@ class TradingService:
             max_trade_risk_pct=cfg.max_risk_pct,
             daily_loss_limit_pct=cfg.daily_loss_limit_pct,
         )
-        self.executor = ArbitrageExecutor(self.exchanges, self.guard, risk_manager=self.risk_manager)
+        self.executor = ArbitrageExecutor(
+            self.exchanges,
+            self.guard,
+            risk_manager=self.risk_manager,
+            exchange_costs=self.cfg.exchange_costs,
+        )
         self.strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -145,8 +150,11 @@ class TradingService:
                 default_maker_fee_bps=self.cfg.default_maker_fee_bps,
                 default_taker_fee_bps=self.cfg.default_taker_fee_bps,
                 default_slippage_bps=self.cfg.default_slippage_bps,
-                retry_cost_bps=self.cfg.retry_cost_bps,
                 failure_probability=self.cfg.failure_probability,
+                exchange_costs=self.cfg.exchange_costs,
+                min_profit_abs=self.cfg.arbitrage_trade_size * next(iter(self.state.quotes.values())).mid
+                if self.state.quotes
+                else 0.0,
             )
             self.state.recent_arbitrage = opportunities
 

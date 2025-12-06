@@ -85,7 +85,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
             # Non-fatal in case an exchange does not support the query
             pass
     state.account_positions = positions
-    executor = ArbitrageExecutor(exchanges, guard, risk_manager=risk_manager)
+    executor = ArbitrageExecutor(exchanges, guard, risk_manager=risk_manager, exchange_costs=cfg.exchange_costs)
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     update_state_with_quotes(state, exchanges, cfg.symbols)
     risk_manager.update_equity(positions, state.quotes.values())
@@ -111,8 +111,11 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         default_maker_fee_bps=cfg.default_maker_fee_bps,
         default_taker_fee_bps=cfg.default_taker_fee_bps,
         default_slippage_bps=cfg.default_slippage_bps,
-        retry_cost_bps=cfg.retry_cost_bps,
         failure_probability=cfg.failure_probability,
+        exchange_costs=cfg.exchange_costs,
+        min_profit_abs=cfg.arbitrage_trade_size * next(iter(state.quotes.values())).mid
+        if state.quotes
+        else 0.0,
     )
     state.recent_arbitrage = opportunities
 

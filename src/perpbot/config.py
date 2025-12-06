@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import yaml
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List
 
-from perpbot.models import AlertCondition
+from perpbot.models import AlertCondition, ExchangeCost
 
 DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT"]
 
@@ -33,6 +33,7 @@ class BotConfig:
     default_taker_fee_bps: float = 5.0
     default_slippage_bps: float = 1.0
     retry_cost_bps: float = 0.5
+    exchange_costs: Dict[str, ExchangeCost] = field(default_factory=dict)
     alerts: List[AlertCondition] = field(default_factory=list)
 
 
@@ -40,6 +41,10 @@ def load_config(path: str) -> BotConfig:
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     alerts = [AlertCondition(**a) for a in data.get("alerts", [])]
+    exchange_costs = {
+        name: ExchangeCost(**cfg)
+        for name, cfg in (data.get("exchange_costs", {}) or {}).items()
+    }
     return BotConfig(
         symbols=data.get("symbols", DEFAULT_SYMBOLS),
         position_size=data.get("position_size", 0.01),
@@ -63,5 +68,6 @@ def load_config(path: str) -> BotConfig:
         default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
         default_slippage_bps=data.get("default_slippage_bps", 1.0),
         retry_cost_bps=data.get("retry_cost_bps", 0.5),
+        exchange_costs=exchange_costs,
         alerts=alerts,
     )

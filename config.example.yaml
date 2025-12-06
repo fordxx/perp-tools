@@ -23,6 +23,31 @@ default_maker_fee_bps: 2.0
 default_taker_fee_bps: 5.0
 default_slippage_bps: 1.5
 retry_cost_bps: 0.5
+exchange_costs:
+  edgex:
+    maker_fee_bps: 1.5
+    taker_fee_bps: 2.5
+    funding_rate: 0.0
+  paradex:
+    maker_fee_bps: 1.5
+    taker_fee_bps: 2.5
+    funding_rate: 0.0
+  backpack:
+    maker_fee_bps: 2.0
+    taker_fee_bps: 3.0
+    funding_rate: 0.0
+  aster:
+    maker_fee_bps: 1.8
+    taker_fee_bps: 2.8
+    funding_rate: 0.0
+  grvt:
+    maker_fee_bps: 1.6
+    taker_fee_bps: 2.6
+    funding_rate: 0.0
+  extended:
+    maker_fee_bps: 1.6
+    taker_fee_bps: 2.6
+    funding_rate: 0.0
 alerts:
   - symbol: BTC/USDT
     direction: above
