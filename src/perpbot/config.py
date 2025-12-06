@@ -15,6 +15,12 @@ class BotConfig:
     position_size: float = 0.01
     profit_target_pct: float = 0.01
     arbitrage_edge: float = 0.003
+    arbitrage_min_profit_pct: float = 0.0005
+    arbitrage_trade_size: float = 0.01
+    default_maker_fee_bps: float = 2.0
+    default_taker_fee_bps: float = 5.0
+    default_slippage_bps: float = 1.0
+    retry_cost_bps: float = 0.5
     alerts: List[AlertCondition] = field(default_factory=list)
 
 
@@ -27,5 +33,11 @@ def load_config(path: str) -> BotConfig:
         position_size=data.get("position_size", 0.01),
         profit_target_pct=data.get("profit_target_pct", 0.01),
         arbitrage_edge=data.get("arbitrage_edge", 0.003),
+        arbitrage_min_profit_pct=data.get("arbitrage_min_profit_pct", 0.0005),
+        arbitrage_trade_size=data.get("arbitrage_trade_size", data.get("position_size", 0.01)),
+        default_maker_fee_bps=data.get("default_maker_fee_bps", 2.0),
+        default_taker_fee_bps=data.get("default_taker_fee_bps", 5.0),
+        default_slippage_bps=data.get("default_slippage_bps", 1.0),
+        retry_cost_bps=data.get("retry_cost_bps", 0.5),
         alerts=alerts,
     )

@@ -16,7 +16,7 @@ This project bootstraps a modular automated trading bot that supports multiple e
 - `src/perpbot/models.py` — shared domain models for orders, positions, quotes, alerts, and state.
 - `src/perpbot/exchanges/base.py` — exchange interface plus simulated clients for each exchange.
 - `src/perpbot/strategy/take_profit.py` — take-profit trading loop and position lifecycle.
-- `src/perpbot/arbitrage/scanner.py` — cross-exchange arbitrage detector.
+- `src/perpbot/arbitrage/scanner.py` — cross-exchange arbitrage detector with depth-aware, cost-adjusted signal generation.
 - `src/perpbot/monitoring/alerts.py` — rule-based alert evaluation with optional auto-orders.
 - `src/perpbot/monitoring/dashboard.py` — FastAPI monitoring API.
 - `src/perpbot/cli.py` — CLI entrypoint to run a single trading cycle or launch the dashboard server.
@@ -35,7 +35,7 @@ This repository ships a working simulation-oriented scaffold: the CLI, monitorin
 
 2. Review and adjust settings in `config.example.yaml` (copy to `config.yaml` if desired).
 
-3. Run a single trading/monitoring cycle to see quotes, arbitrage edges, and auto-take-profit behavior (set `PYTHONPATH=src` so the package is discoverable):
+3. Run a single trading/monitoring cycle to see quotes, cost-adjusted arbitrage edges, and auto-take-profit behavior (set `PYTHONPATH=src` so the package is discoverable):
 
    ```bash
    PYTHONPATH=src python -m perpbot.cli cycle --config config.example.yaml

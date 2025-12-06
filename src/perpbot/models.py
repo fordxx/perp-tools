@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 
 Side = Literal["buy", "sell"]
@@ -14,11 +14,58 @@ class PriceQuote:
     symbol: str
     bid: float
     ask: float
+    order_book: Optional["OrderBookDepth"] = None
+    maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 0.0
+    funding_rate: float = 0.0
+    slippage_bps: float = 0.0
     ts: datetime = field(default_factory=datetime.utcnow)
 
     @property
     def mid(self) -> float:
         return (self.bid + self.ask) / 2
+
+    def executable_price(self, side: Side, size: float, default_slippage_bps: float = 0.0) -> Optional[float]:
+        """Return the volume-weighted executable price for the requested size.
+
+        If order book depth is unavailable, fall back to best bid/ask and apply
+        slippage pessimistically.
+        """
+
+        depth_price = None
+        if self.order_book:
+            depth_price = self.order_book.volume_weighted_price(side, size)
+
+        if depth_price is None:
+            best = self.ask if side == "buy" else self.bid
+            depth_price = best
+
+        slippage = self.slippage_bps or default_slippage_bps
+        if slippage:
+            adjust = 1 + slippage / 10_000 if side == "buy" else 1 - slippage / 10_000
+            depth_price *= adjust
+
+        return depth_price
+
+
+@dataclass
+class OrderBookDepth:
+    bids: Sequence[Tuple[float, float]] = field(default_factory=list)
+    asks: Sequence[Tuple[float, float]] = field(default_factory=list)
+
+    def volume_weighted_price(self, side: Side, size: float) -> Optional[float]:
+        levels = self.asks if side == "buy" else self.bids
+        remaining = size
+        notional = 0.0
+        for price, qty in levels:
+            take = min(remaining, qty)
+            notional += price * take
+            remaining -= take
+            if remaining <= 0:
+                break
+        if remaining > 1e-9:
+            return None
+        return notional / size
 
 
 @dataclass
@@ -59,7 +106,9 @@ class ArbitrageOpportunity:
     sell_exchange: str
     buy_price: float
     sell_price: float
-    edge: float
+    size: float
+    expected_pnl: float
+    net_profit_pct: float
     discovered_at: datetime = field(default_factory=datetime.utcnow)
 
 

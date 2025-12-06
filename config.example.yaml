@@ -5,6 +5,12 @@ symbols:
 position_size: 0.1
 profit_target_pct: 0.02
 arbitrage_edge: 0.005
+arbitrage_min_profit_pct: 0.0005
+arbitrage_trade_size: 0.05
+default_maker_fee_bps: 2.0
+default_taker_fee_bps: 5.0
+default_slippage_bps: 1.5
+retry_cost_bps: 0.5
 alerts:
   - symbol: BTC/USDT
     direction: above

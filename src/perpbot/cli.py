@@ -37,9 +37,18 @@ def render_arbitrage(state: TradingState) -> None:
     table.add_column("Symbol")
     table.add_column("Buy @")
     table.add_column("Sell @")
-    table.add_column("Edge")
+    table.add_column("Size")
+    table.add_column("Net %")
+    table.add_column("Exp. PnL")
     for op in state.recent_arbitrage:
-        table.add_row(op.symbol, op.buy_exchange, op.sell_exchange, f"{op.edge*100:.2f}%")
+        table.add_row(
+            op.symbol,
+            op.buy_exchange,
+            op.sell_exchange,
+            f"{op.size:.4f}",
+            f"{op.net_profit_pct*100:.3f}%",
+            f"{op.expected_pnl:.4f}",
+        )
     console.print(table)
 
 
@@ -52,7 +61,15 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     process_alerts(state, cfg.alerts, exchanges)
 
     # Discover arbitrage
-    opportunities = find_arbitrage_opportunities(state.quotes.values(), cfg.arbitrage_edge)
+    opportunities = find_arbitrage_opportunities(
+        state.quotes.values(),
+        cfg.arbitrage_trade_size,
+        min_profit_pct=cfg.arbitrage_min_profit_pct,
+        default_maker_fee_bps=cfg.default_maker_fee_bps,
+        default_taker_fee_bps=cfg.default_taker_fee_bps,
+        default_slippage_bps=cfg.default_slippage_bps,
+        retry_cost_bps=cfg.retry_cost_bps,
+    )
     state.recent_arbitrage = opportunities
 
     # Fire strategy using a lightweight momentum signal derived from spread
