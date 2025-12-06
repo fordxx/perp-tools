@@ -19,11 +19,16 @@ class PriceQuote:
     taker_fee_bps: float = 0.0
     funding_rate: float = 0.0
     slippage_bps: float = 0.0
+    venue_type: Literal["dex", "cex"] = "dex"
     ts: datetime = field(default_factory=datetime.utcnow)
 
     @property
     def mid(self) -> float:
         return (self.bid + self.ask) / 2
+
+    @property
+    def is_dex(self) -> bool:
+        return self.venue_type == "dex"
 
     def executable_price(self, side: Side, size: float, default_slippage_bps: float = 0.0) -> Optional[float]:
         """Return the volume-weighted executable price for the requested size.

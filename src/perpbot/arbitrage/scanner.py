@@ -5,6 +5,15 @@ from typing import Iterable, List
 
 from perpbot.models import ArbitrageOpportunity, PriceQuote
 
+DEX_ONLY_PAIRS = {
+    ("edgex", "paradex"),
+    ("paradex", "edgex"),
+    ("backpack", "aster"),
+    ("aster", "backpack"),
+    ("grvt", "extended"),
+    ("extended", "grvt"),
+}
+
 
 def _effective_price(quote: PriceQuote, side: str, size: float, slippage_bps: float) -> float | None:
     return quote.executable_price(side, size, default_slippage_bps=slippage_bps)
@@ -36,11 +45,14 @@ def find_arbitrage_opportunities(
 
     opportunities: List[ArbitrageOpportunity] = []
     for symbol, sym_quotes in grouped.items():
-        if len(sym_quotes) < 2:
+        dex_quotes = [q for q in sym_quotes if q.venue_type == "dex"]
+        if len(dex_quotes) < 2:
             continue
 
-        for buy, sell in permutations(sym_quotes, 2):
+        for buy, sell in permutations(dex_quotes, 2):
             if buy.exchange == sell.exchange:
+                continue
+            if (buy.exchange, sell.exchange) not in DEX_ONLY_PAIRS:
                 continue
 
             buy_price = _effective_price(buy, "buy", trade_size, default_slippage_bps)

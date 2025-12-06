@@ -24,6 +24,7 @@ class OKXClient(ExchangeClient):
 
     def __init__(self, use_testnet: bool = True) -> None:
         self.name = "okx"
+        self.venue_type = "cex"
         self.use_testnet = use_testnet
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
@@ -100,6 +101,7 @@ class OKXClient(ExchangeClient):
             symbol=symbol,
             bid=float(data.get("bidPx", 0)),
             ask=float(data.get("askPx", 0)),
+            venue_type="cex",
         )
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
@@ -113,125 +115,28 @@ class OKXClient(ExchangeClient):
         )
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        inst_id = self._format_instrument(request.symbol)
-        ord_type = "limit" if request.limit_price is not None else "market"
-        body = {
-            "instId": inst_id,
-            "tdMode": "cross",
-            "side": "buy" if request.side == "buy" else "sell",
-            "ordType": ord_type,
-            "sz": str(request.size),
-        }
-        if request.limit_price is not None:
-            body["px"] = str(request.limit_price)
-        resp = self._request("POST", "/api/v5/trade/order", json_body=body)
-        data = resp.json().get("data", [{}])[0]
-        price = request.limit_price or 0.0
-        return Order(
-            id=data.get("ordId", ""),
-            exchange=self.name,
-            symbol=request.symbol,
-            side=request.side,
-            size=request.size,
-            price=price,
-        )
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
-        inst_id = self._format_instrument(position.order.symbol)
-        close_side = "sell" if position.order.side == "buy" else "buy"
-        body = {
-            "instId": inst_id,
-            "tdMode": "cross",
-            "side": close_side,
-            "ordType": "market",
-            "sz": str(position.order.size),
-            "reduceOnly": "true",
-        }
-        resp = self._request("POST", "/api/v5/trade/order", json_body=body)
-        data = resp.json().get("data", [{}])[0]
-        return Order(
-            id=data.get("ordId", ""),
-            exchange=self.name,
-            symbol=position.order.symbol,
-            side=close_side,
-            size=position.order.size,
-            price=current_price,
-        )
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        inst_id = self._format_instrument(symbol) if symbol else None
-        body = {"ordId": order_id}
-        if inst_id:
-            body["instId"] = inst_id
-        self._request("POST", "/api/v5/trade/cancel-order", json_body=body)
-        logger.info("Cancelled OKX order %s", order_id)
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        params = {"instType": "SWAP"}
-        if symbol:
-            params["instId"] = self._format_instrument(symbol)
-        resp = self._request("GET", "/api/v5/trade/orders-pending", params=params)
-        orders: List[Order] = []
-        for raw in resp.json().get("data", []):
-            orders.append(
-                Order(
-                    id=raw.get("ordId", ""),
-                    exchange=self.name,
-                    symbol=raw.get("instId", symbol or ""),
-                    side=raw.get("side", "").lower(),
-                    size=float(raw.get("sz", 0)),
-                    price=float(raw.get("px", 0) or 0),
-                )
-            )
-        return orders
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def get_account_positions(self) -> List[Position]:
-        resp = self._request("GET", "/api/v5/account/positions", params={"instType": "SWAP"})
-        positions: List[Position] = []
-        for raw in resp.json().get("data", []):
-            size = float(raw.get("pos", 0))
-            if size == 0:
-                continue
-            side = "buy" if raw.get("posSide") == "long" else "sell"
-            order = Order(
-                id=f"pos-{raw.get('instId', '')}",
-                exchange=self.name,
-                symbol=raw.get("instId", ""),
-                side=side,
-                size=abs(size),
-                price=float(raw.get("avgPx", 0)),
-            )
-            positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
-        return positions
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def get_account_balances(self) -> List[Balance]:
-        resp = self._request("GET", "/api/v5/account/balance")
-        balances: List[Balance] = []
-        for raw in resp.json().get("data", []):
-            for detail in raw.get("details", []):
-                try:
-                    total = float(detail.get("cashBal", 0))
-                    available = float(detail.get("availBal", 0))
-                    locked = total - available
-                    balances.append(
-                        Balance(
-                            asset=detail.get("ccy", ""),
-                            free=available,
-                            locked=locked,
-                            total=total,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to parse OKX balance payload: %s", detail)
-        return balances
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        self._order_handler = handler
-        logger.info("Registered OKX order update handler")
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        self._position_handler = handler
-        logger.info("Registered OKX position update handler")
+        raise NotImplementedError("OKX trading is disabled; CEX is reference-only")
 
     # WebSocket
     def _start_private_ws(self) -> None:

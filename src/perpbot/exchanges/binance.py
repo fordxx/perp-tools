@@ -24,6 +24,7 @@ class BinanceClient(ExchangeClient):
 
     def __init__(self, use_testnet: bool = True) -> None:
         self.name = "binance"
+        self.venue_type = "cex"
         self.use_testnet = use_testnet
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
@@ -112,6 +113,7 @@ class BinanceClient(ExchangeClient):
             symbol=symbol,
             bid=float(data["bidPrice"]),
             ask=float(data["askPrice"]),
+            venue_type="cex",
         )
         return quote
 
@@ -128,116 +130,25 @@ class BinanceClient(ExchangeClient):
         )
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        sym = self._normalize_symbol(request.symbol)
-        order_type = "LIMIT" if request.limit_price is not None else "MARKET"
-        params = {
-            "symbol": sym,
-            "side": request.side.upper(),
-            "type": order_type,
-            "quantity": request.size,
-        }
-        if request.limit_price is not None:
-            params.update({"price": request.limit_price, "timeInForce": "GTC"})
-        resp = self._signed_request("POST", "/fapi/v1/order", params)
-        data = resp.json()
-        price = float(data.get("avgPrice") or data.get("price") or request.limit_price or 0)
-        return Order(
-            id=str(data.get("orderId")),
-            exchange=self.name,
-            symbol=request.symbol,
-            side=request.side,
-            size=request.size,
-            price=price,
-        )
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
-        sym = self._normalize_symbol(position.order.symbol)
-        side = "SELL" if position.order.side == "buy" else "BUY"
-        params = {
-            "symbol": sym,
-            "side": side,
-            "type": "MARKET",
-            "quantity": position.order.size,
-            "reduceOnly": "true",
-        }
-        resp = self._signed_request("POST", "/fapi/v1/order", params)
-        data = resp.json()
-        price = float(data.get("avgPrice") or current_price)
-        return Order(
-            id=str(data.get("orderId")),
-            exchange=self.name,
-            symbol=position.order.symbol,
-            side="sell" if position.order.side == "buy" else "buy",
-            size=position.order.size,
-            price=price,
-        )
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        if not symbol:
-            raise ValueError("symbol is required to cancel an order on Binance")
-        sym = self._normalize_symbol(symbol)
-        self._signed_request("DELETE", "/fapi/v1/order", {"symbol": sym, "orderId": order_id})
-        logger.info("Cancelled Binance order %s (%s)", order_id, symbol)
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        params = {"symbol": self._normalize_symbol(symbol)} if symbol else None
-        resp = self._signed_request("GET", "/fapi/v1/openOrders", params)
-        orders = []
-        for raw in resp.json():
-            orders.append(
-                Order(
-                    id=str(raw.get("orderId")),
-                    exchange=self.name,
-                    symbol=(symbol or raw.get("symbol")),
-                    side=raw.get("side", "").lower(),
-                    size=float(raw.get("origQty", 0)),
-                    price=float(raw.get("price", 0)),
-                )
-            )
-        return orders
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def get_account_positions(self) -> List[Position]:
-        resp = self._signed_request("GET", "/fapi/v2/positionRisk")
-        positions: List[Position] = []
-        for raw in resp.json():
-            size = float(raw.get("positionAmt", 0))
-            if size == 0:
-                continue
-            side = "buy" if size > 0 else "sell"
-            size_abs = abs(size)
-            symbol = raw.get("symbol", "")
-            order = Order(
-                id=f"pos-{symbol}",
-                exchange=self.name,
-                symbol=symbol,
-                side=side,
-                size=size_abs,
-                price=float(raw.get("entryPrice", 0)),
-            )
-            positions.append(Position(id=order.id, order=order, target_profit_pct=0.0))
-        return positions
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def get_account_balances(self) -> List[Balance]:
-        resp = self._signed_request("GET", "/fapi/v2/balance")
-        balances: List[Balance] = []
-        for raw in resp.json():
-            try:
-                balances.append(
-                    Balance(
-                        asset=raw.get("asset", ""),
-                        free=float(raw.get("availableBalance", 0)),
-                        locked=float(raw.get("balance", 0)) - float(raw.get("availableBalance", 0)),
-                        total=float(raw.get("balance", 0)),
-                    )
-                )
-            except Exception:
-                logger.exception("Failed to parse Binance balance row: %s", raw)
-        return balances
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        self._order_handler = handler
-        logger.info("Registered Binance order update handler")
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        self._position_handler = handler
-        logger.info("Registered Binance position update handler")
+        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")

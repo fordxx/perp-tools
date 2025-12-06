@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence
 
-from perpbot.arbitrage.scanner import ArbitrageOpportunity
+from perpbot.arbitrage.scanner import ArbitrageOpportunity, DEX_ONLY_PAIRS
 from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import OrderRequest, Position
 from perpbot.position_guard import PositionGuard
@@ -48,6 +48,16 @@ class ArbitrageExecutor:
             msg = "Missing exchange client for opportunity"
             logger.error("%s %s/%s", msg, opportunity.buy_exchange, opportunity.sell_exchange)
             return ExecutionResult(opportunity, status="failed", error=msg)
+
+        if getattr(buy_ex, "venue_type", "dex") != "dex" or getattr(sell_ex, "venue_type", "dex") != "dex":
+            msg = "CEX venues cannot be used for arbitrage execution"
+            logger.warning(msg)
+            return ExecutionResult(opportunity, status="blocked", error=msg)
+
+        if (buy_ex.name, sell_ex.name) not in DEX_ONLY_PAIRS:
+            msg = "Arbitrage pair not permitted"
+            logger.warning("%s: %s -> %s", msg, buy_ex.name, sell_ex.name)
+            return ExecutionResult(opportunity, status="blocked", error=msg)
 
         notional = opportunity.buy_price * opportunity.size
         if not self.guard.allow_trade(notional):

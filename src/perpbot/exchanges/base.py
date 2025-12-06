@@ -48,6 +48,7 @@ def _random_id(prefix: str = "ord") -> str:
 
 class ExchangeClient(ABC):
     name: str
+    venue_type: str = "dex"
 
     @abstractmethod
     def connect(self) -> None:
@@ -130,9 +131,11 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         default_testnet_url: Optional[str] = None,
         default_ws_url: Optional[str] = None,
         default_testnet_ws_url: Optional[str] = None,
+        venue_type: str = "dex",
     ) -> None:
         self.name = name
         self.env_prefix = env_prefix
+        self.venue_type = venue_type
         self.default_base_url = default_base_url
         self.default_testnet_url = default_testnet_url or default_base_url
         self.default_ws_url = default_ws_url
@@ -389,31 +392,35 @@ def provision_exchanges() -> List[ExchangeClient]:
     exchange_builders = [
         (
             "binance",
+            "cex",
             lambda: BinanceClient(use_testnet=os.getenv("BINANCE_ENV", "testnet").lower() == "testnet"),
             ["BINANCE_API_KEY", "BINANCE_API_SECRET"],
         ),
         (
             "okx",
+            "cex",
             lambda: OKXClient(use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"),
             ["OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"],
         ),
-        ("edgex", lambda: EdgeXClient(), ["EDGEX_API_KEY", "EDGEX_API_SECRET"]),
-        ("backpack", lambda: BackpackClient(), ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"]),
-        ("paradex", lambda: ParadexClient(), ["PARADEX_API_KEY", "PARADEX_API_SECRET"]),
-        ("aster", lambda: AsterClient(), ["ASTER_API_KEY", "ASTER_API_SECRET"]),
-        ("grvt", lambda: GRVTClient(), ["GRVT_API_KEY", "GRVT_API_SECRET"]),
-        ("extended", lambda: ExtendedClient(), ["EXTENDED_API_KEY", "EXTENDED_API_SECRET"]),
+        ("edgex", "dex", lambda: EdgeXClient(), ["EDGEX_API_KEY", "EDGEX_API_SECRET"]),
+        ("backpack", "dex", lambda: BackpackClient(), ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"]),
+        ("paradex", "dex", lambda: ParadexClient(), ["PARADEX_API_KEY", "PARADEX_API_SECRET"]),
+        ("aster", "dex", lambda: AsterClient(), ["ASTER_API_KEY", "ASTER_API_SECRET"]),
+        ("grvt", "dex", lambda: GRVTClient(), ["GRVT_API_KEY", "GRVT_API_SECRET"]),
+        ("extended", "dex", lambda: ExtendedClient(), ["EXTENDED_API_KEY", "EXTENDED_API_SECRET"]),
     ]
 
-    for name, builder, required_keys in exchange_builders:
+    for name, venue_type, builder, required_keys in exchange_builders:
         missing = [k for k in required_keys if not os.getenv(k)]
         if missing:
             logger.warning("Skipping %s: missing credentials %s", name, missing)
             continue
         try:
             client = builder()
+            client.venue_type = venue_type
             client.connect()
             exchanges.append(client)
+            logger.info("Provisioned %s exchange (%s)", name, venue_type)
         except Exception as exc:  # pragma: no cover - runtime resilience
             logger.exception("Failed to initialise %s client: %s", name, exc)
 
@@ -424,6 +431,7 @@ def update_state_with_quotes(state: TradingState, exchanges: Iterable[ExchangeCl
     for ex in exchanges:
         for sym in symbols:
             quote = ex.get_current_price(sym)
+            quote.venue_type = getattr(ex, "venue_type", "dex")
             try:
                 quote.order_book = ex.get_orderbook(sym)
             except Exception:
