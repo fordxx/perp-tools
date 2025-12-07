@@ -90,9 +90,9 @@ class BinanceClient(ExchangeClient):
         """Fetch current bid/ask price from Binance Testnet.
 
         三层兜底机制：
-        1. fetch_ticker 的 bid/ask
-        2. fetch_ticker 的 last
-        3. fetch_order_book 的盘口价
+        1. Testnet fetch_ticker 的 bid/ask
+        2. 主网 fetch_ticker 兜底（仅用于行情）
+        3. 主网 fetch_order_book 兜底
 
         严禁返回 bid=0 或 ask=0
         """
@@ -101,7 +101,7 @@ class BinanceClient(ExchangeClient):
 
         ccxt_symbol = self._normalize_symbol(symbol)
 
-        # 第一层：尝试 fetch_ticker
+        # 第一层：尝试 Testnet fetch_ticker
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
 
         bid = ticker.get('bid')
@@ -121,22 +121,38 @@ class BinanceClient(ExchangeClient):
                 venue_type="cex",
             )
 
-        # 第二层：尝试使用 last 兜底
-        last = ticker.get('last')
-        if last is not None and last > 0:
-            logger.warning("⚠️ Binance %s: bid/ask invalid, using last=%.2f as fallback", symbol, last)
-            return PriceQuote(
-                exchange=self.name,
-                symbol=symbol,
-                bid=float(last),
-                ask=float(last),
-                venue_type="cex",
-            )
+        # 第二层：切换到主网 public 行情兜底
+        logger.warning("⚠️ Binance Testnet %s: bid/ask invalid, switching to mainnet public ticker", symbol)
 
-        # 第三层：尝试使用 order book 兜底
-        logger.warning("⚠️ Binance %s: ticker invalid, fetching order book", symbol)
+        import ccxt
+        mainnet_exchange = ccxt.binance()  # 主网仅用于行情
+
         try:
-            book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
+            mainnet_ticker = mainnet_exchange.fetch_ticker(ccxt_symbol)
+
+            bid = mainnet_ticker.get('bid')
+            ask = mainnet_ticker.get('ask')
+            last = mainnet_ticker.get('last') or mainnet_ticker.get('close')
+
+            # 检查主网 ticker bid/ask 是否有效
+            bid_valid = bid is not None and bid > 0
+            ask_valid = ask is not None and ask > 0
+
+            if bid_valid and ask_valid:
+                logger.info("✅ Binance %s: using mainnet ticker bid=%.2f ask=%.2f",
+                           symbol, bid, ask)
+                return PriceQuote(
+                    exchange=self.name,
+                    symbol=symbol,
+                    bid=float(bid),
+                    ask=float(ask),
+                    venue_type="cex",
+                )
+
+            # 第三层：主网 ticker 依然无效，尝试主网 order book
+            logger.warning("⚠️ Binance %s: mainnet ticker invalid, fetching mainnet order book", symbol)
+
+            book = mainnet_exchange.fetch_order_book(ccxt_symbol, limit=5)
 
             bids = book.get('bids', [])
             asks = book.get('asks', [])
@@ -146,7 +162,7 @@ class BinanceClient(ExchangeClient):
                 book_ask = asks[0][0]
 
                 if book_bid > 0 and book_ask > 0:
-                    logger.info("✅ Binance %s: using order book bid=%.2f ask=%.2f",
+                    logger.info("✅ Binance %s: using mainnet order book bid=%.2f ask=%.2f",
                                symbol, book_bid, book_ask)
                     return PriceQuote(
                         exchange=self.name,
@@ -155,13 +171,15 @@ class BinanceClient(ExchangeClient):
                         ask=float(book_ask),
                         venue_type="cex",
                     )
-        except Exception as e:
-            logger.error("❌ Binance %s: order book fetch failed: %s", symbol, e)
 
-        # 三层兜底全部失败
+        except Exception as e:
+            logger.error("❌ Binance %s: mainnet fallback failed: %s", symbol, e)
+
+        # 所有兜底全部失败
         raise RuntimeError(
-            f"INVALID PRICE from Binance Testnet for {symbol}: "
-            f"ticker bid={bid}, ask={ask}, last={last}, order_book failed"
+            f"🚨 INVALID BINANCE PRICE AFTER MAINNET FALLBACK for {symbol}: "
+            f"testnet bid={ticker.get('bid')}, ask={ticker.get('ask')}, "
+            f"mainnet fallback failed"
         )
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
