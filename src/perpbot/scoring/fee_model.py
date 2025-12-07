@@ -53,33 +53,66 @@ class FeeModel:
     管理所有交易所的手续费配置，计算交易成本
     """
 
-    # 默认费率配置
+    # 默认费率配置（按优先级排序）
     DEFAULT_FEES = {
-        "binance": ExchangeFeeConfig(
-            exchange="binance",
-            maker_fee=0.0002,   # 0.02%
-            taker_fee=0.0004,   # 0.04%
+        # === S 级：负手续费交易所（最优） ===
+        "grvt": ExchangeFeeConfig(
+            exchange="grvt",
+            maker_fee=-0.000001,  # -0.0001% (Level 1 返现)
+            taker_fee=0.00045,    # 0.045%
         ),
-        "okx": ExchangeFeeConfig(
-            exchange="okx",
-            maker_fee=0.0002,
-            taker_fee=0.0005,   # 0.05%
+        "extended": ExchangeFeeConfig(
+            exchange="extended",
+            maker_fee=0.0,        # 0% (基础费率，市占返佣另计)
+            taker_fee=0.00025,    # 0.025%
         ),
+
+        # === A 级：零手续费交易所 ===
+        "paradex": ExchangeFeeConfig(
+            exchange="paradex",
+            maker_fee=0.0,        # 0% (当前政策)
+            taker_fee=0.0,        # 0% (当前政策)
+        ),
+
+        # === B 级：低手续费交易所 ===
         "edgex": ExchangeFeeConfig(
             exchange="edgex",
-            maker_fee=-0.0001,  # -0.01% (负费率，maker 返佣！)
-            taker_fee=0.0003,   # 0.03%
-            wash_rebate_pct=0.5,  # 50% 返佣
+            maker_fee=0.00012,    # 0.012%
+            taker_fee=0.00038,    # 0.038%
         ),
-        "bybit": ExchangeFeeConfig(
-            exchange="bybit",
-            maker_fee=0.0001,
-            taker_fee=0.0006,   # 0.06%
+        "aster": ExchangeFeeConfig(
+            exchange="aster",
+            maker_fee=0.00005,    # 0.005%
+            taker_fee=0.0004,     # 0.04%
         ),
         "hyperliquid": ExchangeFeeConfig(
             exchange="hyperliquid",
-            maker_fee=-0.00005, # -0.005% (maker 返佣)
-            taker_fee=0.00025,  # 0.025%
+            maker_fee=-0.00005,   # -0.005% (maker 返佣)
+            taker_fee=0.00025,    # 0.025%
+        ),
+
+        # === C 级：中等手续费交易所 ===
+        "backpack": ExchangeFeeConfig(
+            exchange="backpack",
+            maker_fee=0.0002,     # 0.02% (Tier 1)
+            taker_fee=0.0005,     # 0.05% (Tier 1)
+        ),
+        "bybit": ExchangeFeeConfig(
+            exchange="bybit",
+            maker_fee=0.0001,     # 0.01%
+            taker_fee=0.0006,     # 0.06%
+        ),
+
+        # === 仅用于行情参考 ===
+        "binance": ExchangeFeeConfig(
+            exchange="binance",
+            maker_fee=0.0002,     # 0.02%
+            taker_fee=0.0004,     # 0.04%
+        ),
+        "okx": ExchangeFeeConfig(
+            exchange="okx",
+            maker_fee=0.0002,     # 0.02%
+            taker_fee=0.0005,     # 0.05%
         ),
     }
 
