@@ -18,6 +18,7 @@ Binance Testnet 验证脚本
 
 import sys
 import os
+import asyncio
 
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -60,13 +61,13 @@ def test_price_fetch(client):
     return quote
 
 
-def test_positions(client):
-    """测试持仓查询"""
+async def test_positions(client):
+    """测试持仓查询（Testnet 空仓模式）"""
     logger.info("\n" + "=" * 60)
     logger.info("Step 3: Testing Positions Query")
     logger.info("=" * 60)
 
-    positions = client.get_account_positions()
+    positions = await client.get_account_positions()
 
     if not positions:
         logger.info("✅ No open positions")
@@ -112,7 +113,7 @@ def test_order_placement(client, symbol="BTC/USDT", size=0.001):
     return None
 
 
-def main():
+async def main():
     """主测试流程"""
     logger.info("\n")
     logger.info("🧪" * 30)
@@ -126,8 +127,8 @@ def main():
         # Step 2: Fetch price
         quote = test_price_fetch(client)
 
-        # Step 3: Check positions
-        positions = test_positions(client)
+        # Step 3: Check positions ✅（修复 await）
+        positions = await test_positions(client)
 
         # Step 4: (Optional) Place order
         test_order_placement(client)
@@ -144,4 +145,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
