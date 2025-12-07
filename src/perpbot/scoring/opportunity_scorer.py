@@ -44,7 +44,7 @@ class OpportunityScore:
     total_revenue: float           # 总收入
 
     # 成本分解
-    taker_fee_cost: float          # Taker 手续费
+    taker_fee_cost: float          # Taker 手续费（兼容旧版，现已拆分为 open/close）
     slippage_cost: float           # 滑点成本
     latency_penalty: float         # 延迟惩罚
     capital_time_cost: float       # 资金时间成本
@@ -61,6 +61,15 @@ class OpportunityScore:
 
     # 最终评分
     final_score: float             # 综合评分
+
+    # === 新增：执行模式相关 ===
+    execution_mode: Optional[str] = None          # 执行模式
+    open_order_type: Optional[str] = None         # 开仓订单类型（"maker" or "taker"）
+    close_order_type: Optional[str] = None        # 平仓订单类型
+    open_fee_cost: Optional[float] = None         # 开仓手续费
+    close_fee_cost: Optional[float] = None        # 平仓手续费
+    maker_fill_probability: Optional[float] = None  # Maker 填单概率（0-1）
+    may_fallback: bool = False                    # 是否可能 fallback
 
     # 元数据
     metadata: Dict = None
@@ -93,6 +102,10 @@ class OpportunityScorer:
         capital_cost_rate_annual: float = 0.05,  # 年化资金成本 5%
         reliability_weight: float = 1.0,
         min_pnl_threshold: float = 0.01,  # 最小 PnL 阈值（USDT）
+        # === 新增：执行模式参数 ===
+        execution_mode: Optional[str] = None,  # "safe_taker_only", "hybrid_hedge_taker", None=自动
+        maker_tracker: Optional[object] = None,  # MakerTracker 实例
+        fill_estimator: Optional[object] = None,  # MakerFillEstimator 实例
     ):
         """
         初始化评分引擎
@@ -113,9 +126,15 @@ class OpportunityScorer:
         self.reliability_weight = reliability_weight
         self.min_pnl_threshold = min_pnl_threshold
 
+        # 执行模式相关
+        self.execution_mode = execution_mode
+        self.maker_tracker = maker_tracker
+        self.fill_estimator = fill_estimator
+
         logger.info(
             f"初始化机会评分引擎: capital_cost={capital_cost_rate_annual*100:.1f}%, "
-            f"reliability={reliability_weight}, min_pnl={min_pnl_threshold}"
+            f"reliability={reliability_weight}, min_pnl={min_pnl_threshold}, "
+            f"execution_mode={execution_mode or 'auto'}"
         )
 
     def score_arbitrage_opportunity(
@@ -131,6 +150,11 @@ class OpportunityScorer:
         buy_latency_ms: Optional[float] = None,
         sell_latency_ms: Optional[float] = None,
         risk_factors: Optional[Dict] = None,
+        # === 新增：执行模式相关参数 ===
+        buy_liquidity_score: float = 0.8,  # 买入流动性评分
+        sell_liquidity_score: float = 0.8,  # 卖出流动性评分
+        buy_orderbook: Optional[object] = None,  # 买入盘口
+        sell_orderbook: Optional[object] = None,  # 卖出盘口
     ) -> OpportunityScore:
         """
         评分套利机会
@@ -165,10 +189,82 @@ class OpportunityScorer:
             buy_exchange, sell_exchange, symbol, notional, holding_hours
         )
 
-        # 3. 手续费成本
-        fee_cost = self.fee_model.calculate_cross_exchange_fee(
-            buy_exchange, sell_exchange, notional
+        # 3. 手续费成本（根据执行模式决定）
+        execution_mode_str = self.execution_mode or "hybrid_hedge_taker"
+        open_order_type = "taker"
+        close_order_type = "taker"
+        maker_fill_prob = None
+        may_fallback = False
+
+        # 检查是否已降级
+        if self.maker_tracker and self.maker_tracker.is_degraded(buy_exchange, sell_exchange):
+            execution_mode_str = "safe_taker_only"
+
+        # 决定订单类型
+        if execution_mode_str == "safe_taker_only":
+            # 双边 taker
+            open_order_type = "taker"
+            close_order_type = "taker"
+        elif execution_mode_str == "hybrid_hedge_taker":
+            # 混合模式：对冲腿 taker + 返佣腿 maker
+            if buy_liquidity_score >= sell_liquidity_score:
+                # 买入流动性好 → 买入 taker，卖出 maker
+                open_order_type = "taker"
+                close_order_type = "maker"
+            else:
+                # 卖出流动性好 → 卖出 taker，买入 maker
+                open_order_type = "maker"
+                close_order_type = "taker"
+            may_fallback = True
+
+            # 估算 maker 填单概率
+            if self.fill_estimator:
+                mid_price = (buy_price + sell_price) / 2
+                maker_exchange = sell_exchange if close_order_type == "maker" else buy_exchange
+                maker_price = sell_price if close_order_type == "maker" else buy_price
+                maker_side = "sell" if close_order_type == "maker" else "buy"
+                maker_orderbook = sell_orderbook if close_order_type == "maker" else buy_orderbook
+
+                maker_fill_prob = self.fill_estimator.estimate_fill_probability(
+                    order_price=maker_price,
+                    mid_price=mid_price,
+                    side=maker_side,
+                    notional=notional,
+                    orderbook_depth=maker_orderbook,
+                )
+
+        # 计算开仓和平仓手续费
+        open_fee_cost = notional * self.fee_model.get_fee(
+            buy_exchange, symbol, "buy", open_order_type
         )
+        close_fee_cost = notional * self.fee_model.get_fee(
+            sell_exchange, symbol, "sell", close_order_type
+        )
+        fee_cost = open_fee_cost + close_fee_cost
+
+        # 如果使用 maker，考虑 fallback 到 taker 的概率
+        if may_fallback and maker_fill_prob is not None and maker_fill_prob < 1.0:
+            # 期望费用 = 成交概率 * maker费用 + (1-概率) * taker费用
+            maker_exchange_name = sell_exchange if close_order_type == "maker" else buy_exchange
+            taker_fee_cost = notional * self.fee_model.get_fee(
+                maker_exchange_name, symbol,
+                "sell" if close_order_type == "maker" else "buy",
+                "taker"
+            )
+            maker_fee_cost = open_fee_cost if open_order_type == "maker" else close_fee_cost
+
+            # 调整费用：考虑 fallback 概率
+            expected_fee = (
+                maker_fill_prob * maker_fee_cost +
+                (1 - maker_fill_prob) * taker_fee_cost
+            )
+
+            if open_order_type == "maker":
+                open_fee_cost = expected_fee
+            else:
+                close_fee_cost = expected_fee
+
+            fee_cost = open_fee_cost + close_fee_cost
 
         # 4. 滑点成本
         slippage_cost = self.slippage_model.estimate_cross_exchange_slippage(
@@ -233,6 +329,14 @@ class OpportunityScorer:
             time_cost_sec=time_cost_sec,
             risk_score=risk_score,
             final_score=final_score,
+            # 执行模式相关
+            execution_mode=execution_mode_str,
+            open_order_type=open_order_type,
+            close_order_type=close_order_type,
+            open_fee_cost=open_fee_cost,
+            close_fee_cost=close_fee_cost,
+            maker_fill_probability=maker_fill_prob,
+            may_fallback=may_fallback,
             metadata={
                 "buy_exchange": buy_exchange,
                 "sell_exchange": sell_exchange,

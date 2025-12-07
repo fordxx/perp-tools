@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 class ExchangeFeeConfig:
     """交易所费率配置"""
     exchange: str
-    maker_fee: float = 0.0002    # 0.02% (默认)
+    maker_fee: float = 0.0002    # 0.02% (默认，可以为负表示返佣)
     taker_fee: float = 0.0005    # 0.05% (默认)
 
     # 刷量返佣（可选）
@@ -27,6 +27,23 @@ class ExchangeFeeConfig:
 
     # VIP 等级调整（可选）
     vip_discount: float = 0.0     # VIP 折扣（0-1）
+
+    def get_fee(self, order_type: str) -> float:
+        """
+        获取指定订单类型的费率
+
+        Args:
+            order_type: "maker" 或 "taker"
+
+        Returns:
+            费率（可以为负表示返佣）
+        """
+        if order_type == "maker":
+            return self.maker_fee * (1 - self.vip_discount)
+        elif order_type == "taker":
+            return self.taker_fee * (1 - self.vip_discount)
+        else:
+            raise ValueError(f"无效的 order_type: {order_type}，必须是 'maker' 或 'taker'")
 
 
 class FeeModel:
@@ -50,7 +67,7 @@ class FeeModel:
         ),
         "edgex": ExchangeFeeConfig(
             exchange="edgex",
-            maker_fee=0.0001,   # 0.01% (更低)
+            maker_fee=-0.0001,  # -0.01% (负费率，maker 返佣！)
             taker_fee=0.0003,   # 0.03%
             wash_rebate_pct=0.5,  # 50% 返佣
         ),
@@ -58,6 +75,11 @@ class FeeModel:
             exchange="bybit",
             maker_fee=0.0001,
             taker_fee=0.0006,   # 0.06%
+        ),
+        "hyperliquid": ExchangeFeeConfig(
+            exchange="hyperliquid",
+            maker_fee=-0.00005, # -0.005% (maker 返佣)
+            taker_fee=0.00025,  # 0.025%
         ),
     }
 
@@ -106,7 +128,7 @@ class FeeModel:
             symbol: 交易对
 
         Returns:
-            Maker 费率
+            Maker 费率（可能为负表示返佣）
         """
         config = self.configs.get(exchange)
 
@@ -118,6 +140,33 @@ class FeeModel:
         fee = config.maker_fee * (1 - config.vip_discount)
 
         return fee
+
+    def get_fee(
+        self,
+        exchange: str,
+        symbol: str,
+        side: str,  # "buy" or "sell"
+        order_type: str,  # "maker" or "taker"
+    ) -> float:
+        """
+        获取指定订单的费率（统一接口）
+
+        Args:
+            exchange: 交易所
+            symbol: 交易对
+            side: 买卖方向（"buy" 或 "sell"）
+            order_type: 订单类型（"maker" 或 "taker"）
+
+        Returns:
+            费率（可能为负表示返佣）
+        """
+        config = self.configs.get(exchange)
+
+        if not config:
+            logger.warning(f"交易所 {exchange} 未配置费率，使用默认值")
+            return 0.0005 if order_type == "taker" else 0.0002
+
+        return config.get_fee(order_type)
 
     def calculate_fee_cost(
         self,
