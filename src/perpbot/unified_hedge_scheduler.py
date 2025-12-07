@@ -23,10 +23,10 @@ import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Set
 from enum import Enum
+from typing import Callable, Dict, Optional, Set
 
-from perpbot.core_capital_orchestrator import CoreCapitalOrchestrator
+from perpbot.core_capital_orchestrator import CoreCapitalOrchestrator, PoolType
 from perpbot.enhanced_risk_manager import EnhancedRiskManager, DecisionType, MarketData
 from perpbot.models.hedge_job import HedgeJob
 
@@ -79,6 +79,9 @@ class UnifiedHedgeScheduler:
         max_global_concurrent: int = 50,
         max_concurrent_per_exchange: int = 10,
         enable_auto_schedule: bool = True,
+        dynamic_volume_bias: Optional[Dict[str, float]] = None,
+        exchange_capital_weight: Optional[Dict[str, float]] = None,
+        exchange_concurrency_limit: Optional[Dict[str, int]] = None,
     ):
         """
         初始化调度器
@@ -96,6 +99,13 @@ class UnifiedHedgeScheduler:
         self.max_global_concurrent = max_global_concurrent
         self.max_concurrent_per_exchange = max_concurrent_per_exchange
         self.enable_auto_schedule = enable_auto_schedule
+
+        # 动态权重&限制（可热更新）
+        self.dynamic_volume_bias: Dict[str, float] = dynamic_volume_bias or {}
+        self.exchange_capital_weight: Dict[str, float] = exchange_capital_weight or {}
+        self.exchange_concurrency_limit: Dict[str, int] = (
+            exchange_concurrency_limit or {}
+        )
 
         # 任务队列
         self.pending_jobs: deque[HedgeJob] = deque()
@@ -215,6 +225,24 @@ class UnifiedHedgeScheduler:
                 rejected_count += 1
                 continue
 
+            # 并发限制检查（动态 per-exchange）
+            if not self._can_run_on_exchanges(job.exchanges, exchange_concurrent):
+                logger.debug(
+                    f"Job {job.job_id[:8]}... skipped: exchange concurrent limit"
+                )
+                skipped_count += 1
+                continue
+
+            pool_type = self._get_pool_type_for_job(job)
+
+            # 动态资金权重检查
+            if not self._within_capital_window(job, pool_type):
+                logger.debug(
+                    f"Job {job.job_id[:8]}... skipped: capital window exceeded"
+                )
+                skipped_count += 1
+                continue
+
             # 资金检查
             can_reserve, reason = self.capital.can_reserve_for_job(job)
             if not can_reserve:
@@ -222,8 +250,15 @@ class UnifiedHedgeScheduler:
                 skipped_count += 1
                 continue
 
+            # 根据 ExecutionProfile + DynamicBias + CapitalWeight 计算最终评分
+            adjusted_score = self._calculate_final_score(
+                base_score=evaluation.final_score,
+                exchanges=job.exchanges,
+                risk_evaluation=evaluation,
+            )
+
             # 加入候选列表
-            candidates.append((job, evaluation.final_score))
+            candidates.append((job, adjusted_score))
 
         # 按 final_score 降序排序
         candidates.sort(key=lambda x: x[1], reverse=True)
@@ -364,6 +399,30 @@ class UnifiedHedgeScheduler:
             ],
         }
 
+    def update_exchange_configs(
+        self,
+        dynamic_volume_bias: Optional[Dict[str, float]] = None,
+        exchange_capital_weight: Optional[Dict[str, float]] = None,
+        exchange_concurrency_limit: Optional[Dict[str, int]] = None,
+    ) -> None:
+        """动态更新交易所的调度权重与并发限制"""
+
+        if dynamic_volume_bias is not None:
+            self.dynamic_volume_bias = dict(dynamic_volume_bias)
+
+        if exchange_capital_weight is not None:
+            self.exchange_capital_weight = dict(exchange_capital_weight)
+
+        if exchange_concurrency_limit is not None:
+            self.exchange_concurrency_limit = dict(exchange_concurrency_limit)
+
+        logger.info(
+            "Scheduler configs updated: "
+            f"bias={len(self.dynamic_volume_bias)}, "
+            f"cap_weight={len(self.exchange_capital_weight)}, "
+            f"concurrency={len(self.exchange_concurrency_limit)}"
+        )
+
     def _get_exchange_concurrent_counts(self) -> Dict[str, int]:
         """获取各交易所当前并发任务数"""
         counts = defaultdict(int)
@@ -388,9 +447,77 @@ class UnifiedHedgeScheduler:
             是否可以运行
         """
         for exchange in exchanges:
-            if current_counts.get(exchange, 0) >= self.max_concurrent_per_exchange:
+            limit = self._get_exchange_concurrency_limit(exchange)
+            if current_counts.get(exchange, 0) >= limit:
                 return False
         return True
+
+    def _get_exchange_bias(self, exchange: str) -> float:
+        """获取交易所的动态成交量偏置"""
+        return self.dynamic_volume_bias.get(exchange, 1.0)
+
+    def _get_exchange_cap_weight(self, exchange: str) -> float:
+        """获取交易所的资金权重"""
+        return self.exchange_capital_weight.get(exchange, 1.0)
+
+    def _get_exchange_concurrency_limit(self, exchange: str) -> int:
+        """获取交易所的并发上限（可动态配置）"""
+        return self.exchange_concurrency_limit.get(exchange, self.max_concurrent_per_exchange)
+
+    def _get_pool_type_for_job(self, job: HedgeJob) -> PoolType:
+        """确定任务使用的资金池类型"""
+        strategy = getattr(job, "strategy_type", "").lower()
+        if "wash" in strategy or "hedge" in strategy:
+            return PoolType.WASH
+        if "arb" in strategy:
+            return PoolType.ARB
+        return PoolType.ARB
+
+    def _get_pool_available(self, exchange: str, pool_type: PoolType) -> float:
+        """获取指定交易所某资金池的可用额度"""
+        capital = self.capital._ensure_exchange(exchange)
+        pool = capital.get_pool(pool_type)
+        return pool.available
+
+    def _within_capital_window(self, job: HedgeJob, pool_type: PoolType) -> bool:
+        """基于资金权重的有效名义仓位上限校验"""
+        for exchange in job.exchanges:
+            cap_weight = self._get_exchange_cap_weight(exchange)
+            max_notional = self._get_pool_available(exchange, pool_type) * cap_weight
+            if job.notional > max_notional:
+                logger.debug(
+                    f"[{exchange}] notional {job.notional:.2f} exceeds weighted max {max_notional:.2f}"
+                )
+                return False
+        return True
+
+    def _aggregate_exchange_factor(
+        self, exchanges: Set[str], value_fn: Callable[[str], float]
+    ) -> float:
+        """聚合多交易所的配置参数（取最保守值）"""
+        if not exchanges:
+            return 1.0
+        values = [value_fn(ex) for ex in exchanges]
+        return min(values)
+
+    def _calculate_risk_penalty(self, risk_evaluation) -> float:
+        """根据安全得分计算风险惩罚"""
+        return max(0.0, 100.0 - getattr(risk_evaluation, "safety_score", 0.0))
+
+    def _calculate_final_score(
+        self,
+        base_score: float,
+        exchanges: Set[str],
+        risk_evaluation,
+    ) -> float:
+        """应用 DynamicBias + CapitalWeight + 风险惩罚的最终评分"""
+
+        bias_factor = self._aggregate_exchange_factor(exchanges, self._get_exchange_bias)
+        cap_factor = self._aggregate_exchange_factor(exchanges, self._get_exchange_cap_weight)
+        risk_penalty = self._calculate_risk_penalty(risk_evaluation)
+
+        final_score = base_score * bias_factor * cap_factor - risk_penalty
+        return max(final_score, 0.0)
 
     def pause_auto_schedule(self):
         """暂停自动调度"""
