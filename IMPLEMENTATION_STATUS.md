@@ -73,11 +73,38 @@ PYTHONPATH=src python -m perpbot.demos.scheduler_demo
 
 ---
 
+### Phase 4: Unified Monitoring State (完成度: 100%)
+
+**文件**:
+- `src/perpbot/monitoring/unified_monitoring_state.py`
+- `src/perpbot/monitoring/__init__.py`
+- `src/perpbot/demos/monitoring_demo.py`
+
+**状态**: ✅ **已完成并测试**
+
+**功能**:
+- [x] 统一监控状态管理器
+- [x] 全局统计聚合 (GlobalStats)
+- [x] 交易所资金状态 (ExchangeCapitalStats)
+- [x] 交易所运行状态 (ExchangeStats)
+- [x] 任务统计 (JobsStats)
+- [x] 风控统计 (RiskStats)
+- [x] 市场数据快照 (MarketStats)
+- [x] 自动状态拉取（从 Capital/Risk/Scheduler）
+- [x] JSON 导出功能
+- [x] 系统健康检查
+- [x] 完整 Demo (`src/perpbot/demos/monitoring_demo.py`)
+
+**测试**: ✅ 通过
+```bash
+PYTHONPATH=src python -m perpbot.demos.monitoring_demo
+```
+
+---
+
 ## 📋 待完成模块
 
-### Phase 4: Unified Monitoring State (完成度: 0%)
-
-**文件**: `src/perpbot/monitoring/unified_monitoring_state.py` (待创建)
+### Phase 5: System Integration (完成度: 0%)
 
 **规划**:
 ```python
@@ -217,11 +244,12 @@ class UnifiedTradingSystem:
 | **3** | HedgeJob Model | ✅ 100% | models/hedge_job.py | 242 |
 | **3** | UnifiedHedgeScheduler | ✅ 100% | unified_hedge_scheduler.py | 373 |
 | **3** | Demo | ✅ 100% | demos/scheduler_demo.py | 455 |
-| **4** | UnifiedMonitoringState | ⏸️  待创建 | monitoring/unified_state.py | ~400 |
+| **4** | UnifiedMonitoringState | ✅ 100% | monitoring/unified_monitoring_state.py | 576 |
+| **4** | Demo | ✅ 100% | demos/monitoring_demo.py | 346 |
 | **5** | System Integration | ⏸️  待创建 | integration/unified_system.py | ~300 |
 | **5** | Full System Demo | ⏸️  待创建 | demos/full_system_demo.py | ~400 |
 
-**总体进度**: 3/5 Phase 完成 (60%)
+**总体进度**: 4/5 Phase 完成 (80%)
 
 ---
 
@@ -229,21 +257,18 @@ class UnifiedTradingSystem:
 
 ### 下一步行动 (按优先级)
 
-1. **实现 UnifiedMonitoringState** (`src/perpbot/monitoring/unified_monitoring_state.py`)
-   - 状态数据类定义
-   - 更新方法
-   - 导出方法
+1. **创建系统集成** (`src/perpbot/integration/unified_system.py`)
+   - 统一系统类（集成所有模块）
+   - 主循环（tick 调用各模块）
+   - API 接口（对外提供统一入口）
+   - 启动/停止/暂停控制
 
-2. **创建系统集成** (`src/perpbot/integration/unified_system.py`)
-   - 统一系统类
-   - 主循环
-   - API 接口
-
-3. **创建完整 Demo**
-   - 模拟交易场景
-   - 多任务并发
+2. **创建完整 Demo** (`src/perpbot/demos/full_system_demo.py`)
+   - 完整交易流程模拟
+   - 多任务并发场景
    - 风控触发演示
-   - 监控状态展示
+   - 监控状态实时展示
+   - Web API 示例
 
 ---
 
@@ -317,5 +342,14 @@ print(f"Decision: {evaluation.decision}, Score: {evaluation.final_score}")
 
 ---
 
-**最后更新**: 2025-12-06
-**当前状态**: Phase 1-3 完成 (60%)，Phase 4-5 待实现
+**最后更新**: 2025-12-07
+**当前状态**: Phase 1-4 完成 (80%)，Phase 5 待实现
+
+**核心功能已完成**：
+- ✅ 资金中枢 (Capital Orchestrator)
+- ✅ 风控中枢 (Risk Manager)
+- ✅ 任务调度器 (Hedge Scheduler)
+- ✅ 监控系统 (Monitoring State)
+
+**待完成**：
+- ⏸️ 系统集成与完整 Demo
