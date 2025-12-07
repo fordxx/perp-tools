@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-import hmac
-import json
 import logging
-import threading
-import time
-from hashlib import sha256
+import os
 from typing import Callable, List, Optional
-from urllib.parse import urlencode
 
-import httpx
-import websockets
+from dotenv import load_dotenv
 
 from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import Balance, Order, OrderBookDepth, OrderRequest, Position, PriceQuote
@@ -20,135 +13,318 @@ logger = logging.getLogger(__name__)
 
 
 class BinanceClient(ExchangeClient):
-    """USDT-M Futures client using REST + WebSocket user data stream."""
+    """Binance USDT-M Futures client using CCXT (Testnet only).
+
+    ✅ 100% Testnet Mode - Mainnet connection is absolutely forbidden.
+    ✅ Uses ccxt.binanceusdm with set_sandbox_mode(True).
+    ✅ Auto-disables trading if credentials are missing.
+    """
 
     def __init__(self, use_testnet: bool = True) -> None:
+        # 🔒 Safety: Force testnet mode
+        if not use_testnet:
+            raise ValueError("❌ Mainnet is absolutely forbidden for Binance. Only testnet is allowed.")
+
         self.name = "binance"
         self.venue_type = "cex"
         self.use_testnet = use_testnet
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
-        self.base_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
-        self.ws_base = "wss://stream.binancefuture.com" if use_testnet else "wss://fstream.binance.com"
-        self._client: Optional[httpx.Client] = None
+        self.exchange: Optional[object] = None  # Will be ccxt.binanceusdm
+        self._trading_enabled = False
         self._order_handler: Optional[Callable[[dict], None]] = None
         self._position_handler: Optional[Callable[[dict], None]] = None
-        self._listen_key: Optional[str] = None
-        self._ws_thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
 
     def connect(self) -> None:
-        from dotenv import load_dotenv
-        import os
+        """Connect to Binance Testnet and validate sandbox mode."""
+        import ccxt
 
         load_dotenv()
         self.api_key = os.getenv("BINANCE_API_KEY")
         self.api_secret = os.getenv("BINANCE_API_SECRET")
+
+        # 🔒 Safety: Disable trading if credentials missing
         if not self.api_key or not self.api_secret:
-            raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET are required")
+            logger.warning("⚠️ Binance trading DISABLED: BINANCE_API_KEY or BINANCE_API_SECRET not found")
+            self._trading_enabled = False
+            # Still create exchange for price data
+            self.exchange = ccxt.binanceusdm()
+            self.exchange.set_sandbox_mode(True)
+            return
 
-        self._client = httpx.Client(base_url=self.base_url, headers={"X-MBX-APIKEY": self.api_key}, timeout=10)
-        logger.info("Initialized Binance client (testnet=%s)", self.use_testnet)
-        self._start_user_stream()
+        # Create CCXT exchange instance
+        self.exchange = ccxt.binanceusdm({
+            'apiKey': self.api_key,
+            'secret': self.api_secret,
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+            }
+        })
 
-    # REST 辅助方法
-    def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> httpx.Response:
-        if not self._client or not self.api_secret:
-            raise RuntimeError("Client not connected")
-        params = params or {}
-        params["timestamp"] = int(time.time() * 1000)
-        query = urlencode(params, doseq=True)
-        signature = hmac.new(self.api_secret.encode(), query.encode(), sha256).hexdigest()
-        signed_query = f"{query}&signature={signature}"
-        url = f"{path}?{signed_query}"
-        logger.debug("Binance %s %s", method, url)
-        response = self._client.request(method, url)
-        response.raise_for_status()
-        return response
+        # 🔒 Safety: Force sandbox mode
+        self.exchange.set_sandbox_mode(True)
 
-    def _start_user_stream(self) -> None:
-        if not self._client:
-            raise RuntimeError("Client not connected")
-        resp = self._client.post("/fapi/v1/listenKey")
-        resp.raise_for_status()
-        self._listen_key = resp.json().get("listenKey")
-        logger.info("Obtained Binance listenKey for user stream")
-        if self._listen_key:
-            self._ws_thread = threading.Thread(target=self._run_user_stream, daemon=True)
-            self._ws_thread.start()
+        # 🔒 Safety: Verify we're actually on testnet
+        testnet_url = "https://testnet.binancefuture.com"
+        actual_url = self.exchange.urls.get('api', {}).get('public', '')
+        if testnet_url not in actual_url:
+            raise RuntimeError(f"❌ SAFETY ABORT: Expected testnet URL {testnet_url}, got {actual_url}")
 
-    def _run_user_stream(self) -> None:
-        async def _consume() -> None:
-            if not self._listen_key:
-                return
-            url = f"{self.ws_base}/ws/{self._listen_key}"
-            while not self._stop_event.is_set():
-                try:
-                    async with websockets.connect(url, ping_interval=15) as ws:
-                        async for msg in ws:
-                            data = json.loads(msg)
-                            event_type = data.get("e") or data.get("eventType")
-                            if event_type == "ACCOUNT_UPDATE" and self._position_handler:
-                                self._position_handler(data)
-                            elif self._order_handler:
-                                self._order_handler(data)
-                except Exception as exc:  # pragma: no cover - network dependent
-                    logger.exception("Binance user stream error: %s", exc)
-                    await asyncio.sleep(5)
-
-        asyncio.run(_consume())
+        self._trading_enabled = True
+        logger.info("✅ Binance USDT-M Testnet connected (sandbox=True, trading=%s)", self._trading_enabled)
+        logger.info("🧪 API URL: %s", actual_url)
 
     def _normalize_symbol(self, symbol: str) -> str:
-        return symbol.replace("/", "").upper()
+        """Convert BTC/USDT to BTC/USDT:USDT (CCXT format)."""
+        if "/" not in symbol:
+            return symbol
+        if ":USDT" in symbol:
+            return symbol
+        # BTC/USDT -> BTC/USDT:USDT (linear futures)
+        base, quote = symbol.split("/")
+        return f"{base}/{quote}:{quote}"
 
     def get_current_price(self, symbol: str) -> PriceQuote:
-        if not self._client:
+        """Fetch current bid/ask price from Binance Testnet."""
+        if not self.exchange:
             raise RuntimeError("Client not connected")
-        sym = self._normalize_symbol(symbol)
-        resp = self._client.get("/fapi/v1/ticker/bookTicker", params={"symbol": sym})
-        resp.raise_for_status()
-        data = resp.json()
-        quote = PriceQuote(
+
+        ccxt_symbol = self._normalize_symbol(symbol)
+        ticker = self.exchange.fetch_ticker(ccxt_symbol)
+
+        return PriceQuote(
             exchange=self.name,
             symbol=symbol,
-            bid=float(data["bidPrice"]),
-            ask=float(data["askPrice"]),
+            bid=float(ticker['bid'] or 0),
+            ask=float(ticker['ask'] or 0),
             venue_type="cex",
         )
-        return quote
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
-        if not self._client:
+        """Fetch order book depth from Binance Testnet."""
+        if not self.exchange:
             raise RuntimeError("Client not connected")
-        sym = self._normalize_symbol(symbol)
-        resp = self._client.get("/fapi/v1/depth", params={"symbol": sym, "limit": depth})
-        resp.raise_for_status()
-        data = resp.json()
+
+        ccxt_symbol = self._normalize_symbol(symbol)
+        book = self.exchange.fetch_order_book(ccxt_symbol, limit=depth)
+
         return OrderBookDepth(
-            bids=[(float(p), float(q)) for p, q in data.get("bids", [])],
-            asks=[(float(p), float(q)) for p, q in data.get("asks", [])],
+            bids=[(float(p), float(q)) for p, q in book.get('bids', [])],
+            asks=[(float(p), float(q)) for p, q in book.get('asks', [])],
         )
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Place a MARKET order to open a position (Testnet only).
+
+        ✅ Only supports MARKET orders.
+        ❌ Limit orders are forbidden.
+
+        Returns:
+            Order object if successful, Order with id="rejected*" if disabled.
+        """
+        # 🔒 Safety: Check if trading is enabled
+        if not self._trading_enabled:
+            logger.warning("❌ Order REJECTED: Trading disabled (missing credentials)")
+            return Order(
+                id="rejected",
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                size=request.size,
+                price=0.0,
+            )
+
+        # 🔒 Safety: Only allow MARKET orders
+        if request.limit_price is not None:
+            logger.error("❌ Order REJECTED: Limit orders are forbidden (use MARKET only)")
+            return Order(
+                id="rejected-limit",
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                size=request.size,
+                price=0.0,
+            )
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            ccxt_symbol = self._normalize_symbol(request.symbol)
+
+            # Place MARKET order
+            order = self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type='market',
+                side=request.side,
+                amount=request.size,
+                params={}
+            )
+
+            logger.info("✅ Binance MARKET %s %.4f %s - OrderID: %s",
+                       request.side.upper(), request.size, request.symbol, order['id'])
+
+            return Order(
+                id=str(order['id']),
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                size=float(order['amount']),
+                price=float(order.get('average') or order.get('price', 0)),
+            )
+
+        except Exception as e:
+            logger.exception("❌ Binance order failed: %s", e)
+            return Order(
+                id=f"error-{int(os.urandom(4).hex(), 16)}",
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                size=request.size,
+                price=0.0,
+            )
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Place a MARKET order to close a position with reduceOnly=True (Testnet only).
 
-    def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        ✅ Only supports MARKET orders with reduceOnly.
+        ❌ Limit orders are forbidden.
 
-    def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        Returns:
+            Order object if successful, Order with id="rejected*" if disabled.
+        """
+        # 🔒 Safety: Check if trading is enabled
+        if not self._trading_enabled:
+            logger.warning("❌ Close order REJECTED: Trading disabled (missing credentials)")
+            return Order(
+                id="rejected-close",
+                exchange=self.name,
+                symbol=position.order.symbol,
+                side="sell" if position.order.side == "buy" else "buy",
+                size=position.order.size,
+                price=0.0,
+            )
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            ccxt_symbol = self._normalize_symbol(position.order.symbol)
+            closing_side = "sell" if position.order.side == "buy" else "buy"
+
+            # Place MARKET order with reduceOnly=True
+            order = self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type='market',
+                side=closing_side,
+                amount=position.order.size,
+                params={'reduceOnly': True}
+            )
+
+            logger.info("✅ Binance CLOSE %s %.4f %s (reduceOnly) - OrderID: %s",
+                       closing_side.upper(), position.order.size, position.order.symbol, order['id'])
+
+            return Order(
+                id=str(order['id']),
+                exchange=self.name,
+                symbol=position.order.symbol,
+                side=closing_side,
+                size=float(order['amount']),
+                price=float(order.get('average') or order.get('price', current_price)),
+            )
+
+        except Exception as e:
+            logger.exception("❌ Binance close order failed: %s", e)
+            return Order(
+                id=f"error-close-{int(os.urandom(4).hex(), 16)}",
+                exchange=self.name,
+                symbol=position.order.symbol,
+                side="sell" if position.order.side == "buy" else "buy",
+                size=position.order.size,
+                price=0.0,
+            )
 
     def get_account_positions(self) -> List[Position]:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Fetch real positions from Binance Testnet.
+
+        Returns:
+            List of Position objects with real Testnet data.
+        """
+        if not self._trading_enabled:
+            logger.warning("⚠️ Positions query skipped: Trading disabled")
+            return []
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            # Fetch all positions
+            positions_data = self.exchange.fetch_positions()
+
+            positions: List[Position] = []
+            for pos in positions_data:
+                contracts = float(pos.get('contracts', 0))
+                if contracts == 0:
+                    continue
+
+                # Determine side from contracts (positive = long, negative = short)
+                side = "buy" if contracts > 0 else "sell"
+                size = abs(contracts)
+
+                symbol = pos['symbol']
+                # Convert BTC/USDT:USDT back to BTC/USDT
+                if ":USDT" in symbol:
+                    symbol = symbol.replace(":USDT", "")
+
+                entry_price = float(pos.get('entryPrice', 0))
+
+                # Create Order object for Position
+                order = Order(
+                    id=f"pos-{symbol.replace('/', '')}",
+                    exchange=self.name,
+                    symbol=symbol,
+                    side=side,
+                    size=size,
+                    price=entry_price,
+                )
+
+                position = Position(
+                    id=order.id,
+                    order=order,
+                    target_profit_pct=0.0,
+                )
+
+                positions.append(position)
+
+            if positions:
+                logger.info("📊 Binance positions: %d open", len(positions))
+
+            return positions
+
+        except Exception as e:
+            logger.exception("❌ Failed to fetch Binance positions: %s", e)
+            return []
+
+    def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
+        """Cancel an order (not implemented for this phase)."""
+        raise NotImplementedError("Order cancellation not required for MARKET-only phase")
+
+    def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get active orders (not implemented for this phase)."""
+        raise NotImplementedError("Active orders query not required for MARKET-only phase")
 
     def get_account_balances(self) -> List[Balance]:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Get account balances (not implemented for this phase)."""
+        raise NotImplementedError("Balance query not required for this phase")
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Setup order update handler (not implemented for this phase)."""
+        self._order_handler = handler
+        logger.info("Registered Binance order update handler (WebSocket not active)")
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        raise NotImplementedError("Binance trading is disabled; CEX is reference-only")
+        """Setup position update handler (not implemented for this phase)."""
+        self._position_handler = handler
+        logger.info("Registered Binance position update handler (WebSocket not active)")
