@@ -89,10 +89,9 @@ class OKXClient(ExchangeClient):
     def get_current_price(self, symbol: str) -> PriceQuote:
         """Fetch current bid/ask price from OKX Demo Trading.
 
-        三层兜底机制：
-        1. fetch_ticker 的 bid/ask
-        2. fetch_ticker 的 last
-        3. fetch_order_book 的盘口价
+        二层兜底机制：
+        1. Demo Trading fetch_ticker 的 bid/ask
+        2. 主网 REST API 直接获取 (https://www.okx.com/api/v5/market/ticker)
 
         严禁返回 bid=0 或 ask=0
         """
@@ -101,7 +100,7 @@ class OKXClient(ExchangeClient):
 
         ccxt_symbol = self._normalize_symbol(symbol)
 
-        # 第一层：尝试 fetch_ticker
+        # 第一层：尝试 Demo Trading fetch_ticker
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
 
         bid = ticker.get('bid')
@@ -121,48 +120,51 @@ class OKXClient(ExchangeClient):
                 venue_type="cex",
             )
 
-        # 第二层：尝试使用 last 兜底
-        last = ticker.get('last')
-        if last is not None and last > 0:
-            logger.warning("⚠️ OKX %s: bid/ask invalid, using last=%.2f as fallback", symbol, last)
-            return PriceQuote(
-                exchange=self.name,
-                symbol=symbol,
-                bid=float(last),
-                ask=float(last),
-                venue_type="cex",
-            )
+        # 第二层：直接请求主网 REST API
+        logger.warning("⚠️ OKX Demo Trading %s: bid/ask invalid, fetching mainnet REST API", symbol)
 
-        # 第三层：尝试使用 order book 兜底
-        logger.warning("⚠️ OKX %s: ticker invalid, fetching order book", symbol)
+        # 转换 symbol: BTC/USDT -> BTC-USDT-SWAP
+        rest_symbol = symbol.replace("/", "-").upper() + "-SWAP"
+
         try:
-            book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
+            import httpx
 
-            bids = book.get('bids', [])
-            asks = book.get('asks', [])
+            url = "https://www.okx.com/api/v5/market/ticker"
+            response = httpx.get(url, params={"instId": rest_symbol}, timeout=5)
+            response.raise_for_status()
 
-            if bids and asks and len(bids) > 0 and len(asks) > 0:
-                book_bid = bids[0][0]
-                book_ask = asks[0][0]
+            data = response.json()
 
-                if book_bid > 0 and book_ask > 0:
-                    logger.info("✅ OKX %s: using order book bid=%.2f ask=%.2f",
-                               symbol, book_bid, book_ask)
+            # OKX API 返回格式: {"code": "0", "data": [{"bidPx": "...", "askPx": "..."}]}
+            if data.get('code') == '0' and data.get('data'):
+                ticker_data = data['data'][0]
+
+                bid = float(ticker_data.get('bidPx'))
+                ask = float(ticker_data.get('askPx'))
+
+                # 严格验证
+                if bid > 0 and ask > 0:
+                    logger.info("✅ OKX %s: using mainnet REST API bid=%.2f ask=%.2f",
+                               symbol, bid, ask)
                     return PriceQuote(
                         exchange=self.name,
                         symbol=symbol,
-                        bid=float(book_bid),
-                        ask=float(book_ask),
+                        bid=bid,
+                        ask=ask,
                         venue_type="cex",
                     )
-        except Exception as e:
-            logger.error("❌ OKX %s: order book fetch failed: %s", symbol, e)
+                else:
+                    logger.error("❌ OKX %s: mainnet REST API returned invalid prices bid=%.2f ask=%.2f",
+                               symbol, bid, ask)
+            else:
+                logger.error("❌ OKX %s: mainnet REST API returned error code: %s",
+                           symbol, data.get('code'))
 
-        # 三层兜底全部失败
-        raise RuntimeError(
-            f"INVALID PRICE from OKX Demo Trading for {symbol}: "
-            f"ticker bid={bid}, ask={ask}, last={last}, order_book failed"
-        )
+        except Exception as e:
+            logger.error("❌ OKX %s: mainnet REST API failed: %s", symbol, e)
+
+        # 所有兜底全部失败
+        raise RuntimeError(f"🚨 OKX PRICE REST API FAILED for {symbol}")
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         """Fetch order book depth from OKX."""
