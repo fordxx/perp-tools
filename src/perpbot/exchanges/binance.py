@@ -164,15 +164,6 @@ class BinanceClient(ExchangeClient):
             f"ticker bid={bid}, ask={ask}, last={last}, order_book failed"
         )
 
-    return PriceQuote(
-        exchange=self.name,
-        symbol=symbol,
-        bid=float(bid),
-        ask=float(ask),
-        venue_type="cex",
-    )
-
-
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         """Fetch order book depth from Binance Testnet."""
         if not self.exchange:
