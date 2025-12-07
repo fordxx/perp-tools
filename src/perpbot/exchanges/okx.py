@@ -87,19 +87,81 @@ class OKXClient(ExchangeClient):
         return f"{base}/{quote}:{quote}"
 
     def get_current_price(self, symbol: str) -> PriceQuote:
-        """Fetch current bid/ask price from OKX."""
+        """Fetch current bid/ask price from OKX Demo Trading.
+
+        三层兜底机制：
+        1. fetch_ticker 的 bid/ask
+        2. fetch_ticker 的 last
+        3. fetch_order_book 的盘口价
+
+        严禁返回 bid=0 或 ask=0
+        """
         if not self.exchange:
             raise RuntimeError("Client not connected")
 
         ccxt_symbol = self._normalize_symbol(symbol)
+
+        # 第一层：尝试 fetch_ticker
         ticker = self.exchange.fetch_ticker(ccxt_symbol)
 
-        return PriceQuote(
-            exchange=self.name,
-            symbol=symbol,
-            bid=float(ticker['bid'] or 0),
-            ask=float(ticker['ask'] or 0),
-            venue_type="cex",
+        bid = ticker.get('bid')
+        ask = ticker.get('ask')
+
+        # 检查 bid/ask 是否有效
+        bid_valid = bid is not None and bid > 0
+        ask_valid = ask is not None and ask > 0
+
+        if bid_valid and ask_valid:
+            # 第一层成功
+            return PriceQuote(
+                exchange=self.name,
+                symbol=symbol,
+                bid=float(bid),
+                ask=float(ask),
+                venue_type="cex",
+            )
+
+        # 第二层：尝试使用 last 兜底
+        last = ticker.get('last')
+        if last is not None and last > 0:
+            logger.warning("⚠️ OKX %s: bid/ask invalid, using last=%.2f as fallback", symbol, last)
+            return PriceQuote(
+                exchange=self.name,
+                symbol=symbol,
+                bid=float(last),
+                ask=float(last),
+                venue_type="cex",
+            )
+
+        # 第三层：尝试使用 order book 兜底
+        logger.warning("⚠️ OKX %s: ticker invalid, fetching order book", symbol)
+        try:
+            book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
+
+            bids = book.get('bids', [])
+            asks = book.get('asks', [])
+
+            if bids and asks and len(bids) > 0 and len(asks) > 0:
+                book_bid = bids[0][0]
+                book_ask = asks[0][0]
+
+                if book_bid > 0 and book_ask > 0:
+                    logger.info("✅ OKX %s: using order book bid=%.2f ask=%.2f",
+                               symbol, book_bid, book_ask)
+                    return PriceQuote(
+                        exchange=self.name,
+                        symbol=symbol,
+                        bid=float(book_bid),
+                        ask=float(book_ask),
+                        venue_type="cex",
+                    )
+        except Exception as e:
+            logger.error("❌ OKX %s: order book fetch failed: %s", symbol, e)
+
+        # 三层兜底全部失败
+        raise RuntimeError(
+            f"INVALID PRICE from OKX Demo Trading for {symbol}: "
+            f"ticker bid={bid}, ask={ask}, last={last}, order_book failed"
         )
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:

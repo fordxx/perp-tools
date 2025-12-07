@@ -86,41 +86,82 @@ class BinanceClient(ExchangeClient):
         base, quote = symbol.split("/")
         return f"{base}/{quote}:{quote}"
 
-def get_current_price(self, symbol: str) -> PriceQuote:
-    """Fetch current bid/ask price from Binance Testnet with robust fallback."""
-    if not self.exchange:
-        raise RuntimeError("Client not connected")
+    def get_current_price(self, symbol: str) -> PriceQuote:
+        """Fetch current bid/ask price from Binance Testnet.
 
-    ccxt_symbol = self._normalize_symbol(symbol)
+        三层兜底机制：
+        1. fetch_ticker 的 bid/ask
+        2. fetch_ticker 的 last
+        3. fetch_order_book 的盘口价
 
-    # 1️⃣ 首选 fetch_ticker
-    ticker = self.exchange.fetch_ticker(ccxt_symbol)
+        严禁返回 bid=0 或 ask=0
+        """
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
 
-    bid = ticker.get("bid")
-    ask = ticker.get("ask")
-    last = ticker.get("last") or ticker.get("close")
+        ccxt_symbol = self._normalize_symbol(symbol)
 
-    # 2️⃣ 如果 bid/ask 为空，用 last 兜底
-    if (bid is None or bid <= 0) and last and last > 0:
-        bid = last
-    if (ask is None or ask <= 0) and last and last > 0:
-        ask = last
+        # 第一层：尝试 fetch_ticker
+        ticker = self.exchange.fetch_ticker(ccxt_symbol)
 
-    # 3️⃣ 如果仍然无效，强制走 orderbook 兜底
-    if (not bid or bid <= 0) or (not ask or ask <= 0):
-        book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
+        bid = ticker.get('bid')
+        ask = ticker.get('ask')
 
-        if bids and not bid:
-            bid = bids[0][0]
-        if asks and not ask:
-            ask = asks[0][0]
+        # 检查 bid/ask 是否有效
+        bid_valid = bid is not None and bid > 0
+        ask_valid = ask is not None and ask > 0
 
-    # 4️⃣ 最终安全校验（这是防爆仓护栏）
-    if not bid or not ask or bid <= 0 or ask <= 0:
+        if bid_valid and ask_valid:
+            # 第一层成功
+            return PriceQuote(
+                exchange=self.name,
+                symbol=symbol,
+                bid=float(bid),
+                ask=float(ask),
+                venue_type="cex",
+            )
+
+        # 第二层：尝试使用 last 兜底
+        last = ticker.get('last')
+        if last is not None and last > 0:
+            logger.warning("⚠️ Binance %s: bid/ask invalid, using last=%.2f as fallback", symbol, last)
+            return PriceQuote(
+                exchange=self.name,
+                symbol=symbol,
+                bid=float(last),
+                ask=float(last),
+                venue_type="cex",
+            )
+
+        # 第三层：尝试使用 order book 兜底
+        logger.warning("⚠️ Binance %s: ticker invalid, fetching order book", symbol)
+        try:
+            book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
+
+            bids = book.get('bids', [])
+            asks = book.get('asks', [])
+
+            if bids and asks and len(bids) > 0 and len(asks) > 0:
+                book_bid = bids[0][0]
+                book_ask = asks[0][0]
+
+                if book_bid > 0 and book_ask > 0:
+                    logger.info("✅ Binance %s: using order book bid=%.2f ask=%.2f",
+                               symbol, book_bid, book_ask)
+                    return PriceQuote(
+                        exchange=self.name,
+                        symbol=symbol,
+                        bid=float(book_bid),
+                        ask=float(book_ask),
+                        venue_type="cex",
+                    )
+        except Exception as e:
+            logger.error("❌ Binance %s: order book fetch failed: %s", symbol, e)
+
+        # 三层兜底全部失败
         raise RuntimeError(
-            f"❌ INVALID PRICE from Binance Testnet: bid={bid}, ask={ask}, ticker={ticker}"
+            f"INVALID PRICE from Binance Testnet for {symbol}: "
+            f"ticker bid={bid}, ask={ask}, last={last}, order_book failed"
         )
 
     return PriceQuote(
