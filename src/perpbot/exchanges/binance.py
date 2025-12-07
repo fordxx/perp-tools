@@ -89,10 +89,9 @@ class BinanceClient(ExchangeClient):
     def get_current_price(self, symbol: str) -> PriceQuote:
         """Fetch current bid/ask price from Binance Testnet.
 
-        三层兜底机制：
+        二层兜底机制：
         1. Testnet fetch_ticker 的 bid/ask
-        2. 主网 fetch_ticker 兜底（仅用于行情）
-        3. 主网 fetch_order_book 兜底
+        2. 主网 REST API 直接获取 (https://api.binance.com/api/v3/ticker/bookTicker)
 
         严禁返回 bid=0 或 ask=0
         """
@@ -121,66 +120,44 @@ class BinanceClient(ExchangeClient):
                 venue_type="cex",
             )
 
-        # 第二层：切换到主网 public 行情兜底
-        logger.warning("⚠️ Binance Testnet %s: bid/ask invalid, switching to mainnet public ticker", symbol)
+        # 第二层：直接请求主网 REST API
+        logger.warning("⚠️ Binance Testnet %s: bid/ask invalid, fetching mainnet REST API", symbol)
 
-        import ccxt
-        mainnet_exchange = ccxt.binance()  # 主网仅用于行情
+        # 转换 symbol: BTC/USDT -> BTCUSDT
+        rest_symbol = symbol.replace("/", "").upper()
 
         try:
-            mainnet_ticker = mainnet_exchange.fetch_ticker(ccxt_symbol)
+            import httpx
 
-            bid = mainnet_ticker.get('bid')
-            ask = mainnet_ticker.get('ask')
-            last = mainnet_ticker.get('last') or mainnet_ticker.get('close')
+            url = "https://api.binance.com/api/v3/ticker/bookTicker"
+            response = httpx.get(url, params={"symbol": rest_symbol}, timeout=5)
+            response.raise_for_status()
 
-            # 检查主网 ticker bid/ask 是否有效
-            bid_valid = bid is not None and bid > 0
-            ask_valid = ask is not None and ask > 0
+            data = response.json()
 
-            if bid_valid and ask_valid:
-                logger.info("✅ Binance %s: using mainnet ticker bid=%.2f ask=%.2f",
+            bid = float(data.get('bidPrice'))
+            ask = float(data.get('askPrice'))
+
+            # 严格验证
+            if bid > 0 and ask > 0:
+                logger.info("✅ Binance %s: using mainnet REST API bid=%.2f ask=%.2f",
                            symbol, bid, ask)
                 return PriceQuote(
                     exchange=self.name,
                     symbol=symbol,
-                    bid=float(bid),
-                    ask=float(ask),
+                    bid=bid,
+                    ask=ask,
                     venue_type="cex",
                 )
-
-            # 第三层：主网 ticker 依然无效，尝试主网 order book
-            logger.warning("⚠️ Binance %s: mainnet ticker invalid, fetching mainnet order book", symbol)
-
-            book = mainnet_exchange.fetch_order_book(ccxt_symbol, limit=5)
-
-            bids = book.get('bids', [])
-            asks = book.get('asks', [])
-
-            if bids and asks and len(bids) > 0 and len(asks) > 0:
-                book_bid = bids[0][0]
-                book_ask = asks[0][0]
-
-                if book_bid > 0 and book_ask > 0:
-                    logger.info("✅ Binance %s: using mainnet order book bid=%.2f ask=%.2f",
-                               symbol, book_bid, book_ask)
-                    return PriceQuote(
-                        exchange=self.name,
-                        symbol=symbol,
-                        bid=float(book_bid),
-                        ask=float(book_ask),
-                        venue_type="cex",
-                    )
+            else:
+                logger.error("❌ Binance %s: mainnet REST API returned invalid prices bid=%.2f ask=%.2f",
+                           symbol, bid, ask)
 
         except Exception as e:
-            logger.error("❌ Binance %s: mainnet fallback failed: %s", symbol, e)
+            logger.error("❌ Binance %s: mainnet REST API failed: %s", symbol, e)
 
         # 所有兜底全部失败
-        raise RuntimeError(
-            f"🚨 INVALID BINANCE PRICE AFTER MAINNET FALLBACK for {symbol}: "
-            f"testnet bid={ticker.get('bid')}, ask={ticker.get('ask')}, "
-            f"mainnet fallback failed"
-        )
+        raise RuntimeError(f"🚨 BINANCE PRICE REST API FAILED for {symbol}")
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         """Fetch order book depth from Binance Testnet."""
