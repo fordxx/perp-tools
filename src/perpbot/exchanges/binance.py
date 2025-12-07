@@ -86,21 +86,51 @@ class BinanceClient(ExchangeClient):
         base, quote = symbol.split("/")
         return f"{base}/{quote}:{quote}"
 
-    def get_current_price(self, symbol: str) -> PriceQuote:
-        """Fetch current bid/ask price from Binance Testnet."""
-        if not self.exchange:
-            raise RuntimeError("Client not connected")
+def get_current_price(self, symbol: str) -> PriceQuote:
+    """Fetch current bid/ask price from Binance Testnet with robust fallback."""
+    if not self.exchange:
+        raise RuntimeError("Client not connected")
 
-        ccxt_symbol = self._normalize_symbol(symbol)
-        ticker = self.exchange.fetch_ticker(ccxt_symbol)
+    ccxt_symbol = self._normalize_symbol(symbol)
 
-        return PriceQuote(
-            exchange=self.name,
-            symbol=symbol,
-            bid=float(ticker['bid'] or 0),
-            ask=float(ticker['ask'] or 0),
-            venue_type="cex",
+    # 1️⃣ 首选 fetch_ticker
+    ticker = self.exchange.fetch_ticker(ccxt_symbol)
+
+    bid = ticker.get("bid")
+    ask = ticker.get("ask")
+    last = ticker.get("last") or ticker.get("close")
+
+    # 2️⃣ 如果 bid/ask 为空，用 last 兜底
+    if (bid is None or bid <= 0) and last and last > 0:
+        bid = last
+    if (ask is None or ask <= 0) and last and last > 0:
+        ask = last
+
+    # 3️⃣ 如果仍然无效，强制走 orderbook 兜底
+    if (not bid or bid <= 0) or (not ask or ask <= 0):
+        book = self.exchange.fetch_order_book(ccxt_symbol, limit=5)
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        if bids and not bid:
+            bid = bids[0][0]
+        if asks and not ask:
+            ask = asks[0][0]
+
+    # 4️⃣ 最终安全校验（这是防爆仓护栏）
+    if not bid or not ask or bid <= 0 or ask <= 0:
+        raise RuntimeError(
+            f"❌ INVALID PRICE from Binance Testnet: bid={bid}, ask={ask}, ticker={ticker}"
         )
+
+    return PriceQuote(
+        exchange=self.name,
+        symbol=symbol,
+        bid=float(bid),
+        ask=float(ask),
+        venue_type="cex",
+    )
+
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
         """Fetch order book depth from Binance Testnet."""
