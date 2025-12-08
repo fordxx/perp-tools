@@ -57,18 +57,18 @@ class ParadexClient(ExchangeClient):
             return
 
         try:
-            # Import Paradex SDK
-            from paradex_py import Paradex
-            from paradex_py.environment import TESTNET, PROD
+            # Import Paradex SDK (使用 ParadexSubkey 类 - 仅需 L2 凭证)
+            from paradex_py import ParadexSubkey
+            from paradex_py.environment import Environment
 
             # Select environment
-            env = TESTNET if self.use_testnet else PROD
+            env = Environment.TESTNET if self.use_testnet else Environment.PROD
 
-            # Initialize SDK with L2 private key
-            self.client = Paradex(
+            # Initialize SDK with L2 private key (使用 ParadexSubkey)
+            self.client = ParadexSubkey(
                 env=env,
                 l2_private_key=self.l2_private_key,
-                ethereum_address=self.account_address,
+                l2_address=self.account_address,
             )
 
             self._trading_enabled = True
