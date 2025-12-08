@@ -59,10 +59,9 @@ class ParadexClient(ExchangeClient):
         try:
             # Import Paradex SDK (使用 ParadexSubkey 类 - 仅需 L2 凭证)
             from paradex_py import ParadexSubkey
-            from paradex_py.environment import Environment
 
-            # Select environment
-            env = Environment.TESTNET if self.use_testnet else Environment.PROD
+            # Select environment (使用字符串，不是枚举)
+            env = 'testnet' if self.use_testnet else 'prod'
 
             # Initialize SDK with L2 private key (使用 ParadexSubkey)
             self.client = ParadexSubkey(
