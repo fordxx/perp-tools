@@ -100,9 +100,9 @@ class ParadexClient(ExchangeClient):
             # Use SDK to get BBO (Best Bid/Offer)
             bbo = self.client.api_client.fetch_bbo(market)
 
-            # Paradex SDK returns: {'best_bid': '...', 'best_ask': '...', ...}
-            bid = float(bbo.get("best_bid", 0))
-            ask = float(bbo.get("best_ask", 0))
+            # Paradex SDK returns: {'bid': '...', 'ask': '...', ...}
+            bid = float(bbo.get("bid", 0))
+            ask = float(bbo.get("ask", 0))
 
             if bid == 0 or ask == 0:
                 logger.warning("⚠️ Paradex %s: Invalid bid/ask (bid=%.2f, ask=%.2f)",
@@ -402,9 +402,9 @@ class ParadexClient(ExchangeClient):
 
             balances: List[Balance] = []
 
-            # Paradex typically returns USDC balance
-            total_equity = float(summary.get("equity", 0))
-            available = float(summary.get("available_balance", 0))
+            # Paradex AccountSummary object attributes
+            total_equity = float(summary.account_value)
+            available = float(summary.free_collateral)
             locked = total_equity - available
 
             if total_equity > 0:
