@@ -36,7 +36,6 @@ EXCHANGE_NAMES = [
     "grvt",
     "extended",
     "okx",
-    "binance",
 ]
 
 logger = logging.getLogger(__name__)
@@ -379,7 +378,6 @@ def provision_exchanges() -> List[ExchangeClient]:
     load_dotenv()
     exchanges: List[ExchangeClient] = []
 
-    from perpbot.exchanges.binance import BinanceClient
     from perpbot.exchanges.okx import OKXClient
     from perpbot.exchanges.edgex import EdgeXClient
     from perpbot.exchanges.backpack import BackpackClient
@@ -389,12 +387,6 @@ def provision_exchanges() -> List[ExchangeClient]:
     from perpbot.exchanges.extended import ExtendedClient
 
     exchange_builders = [
-        (
-            "binance",
-            "cex",
-            lambda: BinanceClient(use_testnet=os.getenv("BINANCE_ENV", "testnet").lower() == "testnet"),
-            ["BINANCE_API_KEY", "BINANCE_API_SECRET"],
-        ),
         (
             "okx",
             "cex",
