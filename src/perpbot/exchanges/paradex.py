@@ -97,12 +97,12 @@ class ParadexClient(ExchangeClient):
         market = self._normalize_symbol(symbol)
 
         try:
-            # Use SDK to get market ticker
-            ticker = self.client.markets.get_ticker(market)
+            # Use SDK to get BBO (Best Bid/Offer)
+            bbo = self.client.api_client.fetch_bbo(market)
 
             # Paradex SDK returns: {'best_bid': '...', 'best_ask': '...', ...}
-            bid = float(ticker.get("best_bid", 0))
-            ask = float(ticker.get("best_ask", 0))
+            bid = float(bbo.get("best_bid", 0))
+            ask = float(bbo.get("best_ask", 0))
 
             if bid == 0 or ask == 0:
                 logger.warning("⚠️ Paradex %s: Invalid bid/ask (bid=%.2f, ask=%.2f)",
@@ -129,7 +129,7 @@ class ParadexClient(ExchangeClient):
 
         try:
             # Use SDK to get orderbook
-            orderbook = self.client.markets.get_orderbook(market, depth=depth)
+            orderbook = self.client.api_client.fetch_orderbook(market)
 
             # Paradex SDK format: {"bids": [[price, size], ...], "asks": [[price, size], ...]}
             bids = [(float(p), float(s)) for p, s in orderbook.get("bids", [])]
@@ -186,7 +186,7 @@ class ParadexClient(ExchangeClient):
                 order_params["price"] = str(request.limit_price)
 
             # Place order using SDK (SDK handles L2 signing automatically)
-            order_response = self.client.orders.create_order(**order_params)
+            order_response = self.client.api_client.submit_order(**order_params)
 
             # Extract order info
             order_id = order_response.get("id", "unknown")
@@ -266,7 +266,7 @@ class ParadexClient(ExchangeClient):
 
         try:
             # Use SDK to cancel order
-            self.client.orders.cancel_order(order_id)
+            self.client.api_client.cancel_order(order_id)
             logger.info("✅ Paradex order cancelled: %s", order_id)
 
         except Exception as e:
@@ -295,7 +295,7 @@ class ParadexClient(ExchangeClient):
             if symbol:
                 filters["market"] = self._normalize_symbol(symbol)
 
-            orders_response = self.client.orders.list_orders(**filters)
+            orders_response = self.client.api_client.fetch_orders(**filters)
 
             orders: List[Order] = []
             for order_data in orders_response.get("results", []):
@@ -340,7 +340,7 @@ class ParadexClient(ExchangeClient):
 
         try:
             # Use SDK to get positions
-            positions_response = self.client.account.get_positions()
+            positions_response = self.client.api_client.fetch_positions()
 
             positions: List[Position] = []
             for pos_data in positions_response.get("results", []):
@@ -398,7 +398,7 @@ class ParadexClient(ExchangeClient):
 
         try:
             # Use SDK to get account summary
-            summary = self.client.account.get_summary()
+            summary = self.client.api_client.fetch_account_summary()
 
             balances: List[Balance] = []
 
