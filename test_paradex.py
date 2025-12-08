@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Paradex 交易功能测试脚本
+Paradex 交易功能测试脚本（SDK + L2 私钥版本）
 
-这个脚本帮助你测试 Paradex DEX 的所有交易功能：
-- 连接和认证
+✅ 使用 Paradex SDK (paradex-py)
+✅ L2 私钥签名（Starknet）
+✅ 支持主网和测试网
+
+测试功能：
+- 连接和认证（SDK 初始化）
 - 查询价格
 - 查询余额
 - 查询持仓
@@ -12,8 +16,12 @@ Paradex 交易功能测试脚本
 - 查询活跃订单
 
 使用方法：
-1. 配置 .env 文件（参考 PARADEX_SETUP_GUIDE.md）
-2. 运行：python test_paradex.py
+1. 安装依赖：pip install paradex-py
+2. 配置 .env 文件：
+   PARADEX_L2_PRIVATE_KEY=0x...
+   PARADEX_ACCOUNT_ADDRESS=0x...
+   PARADEX_ENV=testnet
+3. 运行：python test_paradex.py
 """
 
 import logging
@@ -43,15 +51,23 @@ def print_separator(title: str):
 
 
 def test_connection(client: ParadexClient):
-    """测试 1: 连接和认证"""
-    print_separator("测试 1: 连接 Paradex")
+    """测试 1: 连接和认证（SDK 初始化）"""
+    print_separator("测试 1: 连接 Paradex SDK")
 
     try:
         client.connect()
-        print("✅ Paradex 连接成功！")
-        print(f"   - 交易模式: {'Testnet' if client.use_testnet else 'Mainnet'}")
-        print(f"   - 交易启用: {client._trading_enabled}")
-        return True
+
+        if client._trading_enabled:
+            print("✅ Paradex SDK 连接成功！")
+            print(f"   - 交易模式: {'Testnet' if client.use_testnet else 'Mainnet'}")
+            print(f"   - 交易启用: {client._trading_enabled}")
+            print(f"   - 账户地址: {client.account_address[:10]}...{client.account_address[-6:]}")
+            return True
+        else:
+            print("⚠️ Paradex SDK 初始化失败（可能缺少凭证）")
+            print("   请检查 .env 文件中的 PARADEX_L2_PRIVATE_KEY 和 PARADEX_ACCOUNT_ADDRESS")
+            return False
+
     except Exception as e:
         print(f"❌ 连接失败: {e}")
         return False
@@ -280,12 +296,18 @@ def test_cancel_order(client: ParadexClient, order_id: str):
 
 def main():
     """主测试流程"""
-    print("\n🚀 Paradex 交易功能测试")
+    print("\n🚀 Paradex 交易功能测试（SDK + L2 私钥版本）")
     print("=" * 60)
 
     # 选择环境
     env = input("\n选择环境 (1=Mainnet, 2=Testnet): ").strip()
     use_testnet = (env == "2")
+
+    if not use_testnet:
+        confirm = input("\n⚠️ 警告：你选择了主网！这会使用真实资金。确认继续？(yes/no): ").strip().lower()
+        if confirm != 'yes':
+            print("已取消，建议先在测试网测试")
+            return
 
     # 创建客户端
     client = ParadexClient(use_testnet=use_testnet)
@@ -293,6 +315,10 @@ def main():
     # 测试 1: 连接
     if not test_connection(client):
         print("\n❌ 连接失败，无法继续测试")
+        print("\n💡 故障排查：")
+        print("1. 检查 .env 文件是否存在")
+        print("2. 确认 PARADEX_L2_PRIVATE_KEY 和 PARADEX_ACCOUNT_ADDRESS 已配置")
+        print("3. 确认已安装 paradex-py: pip install paradex-py")
         return
 
     # 测试 2: 查询价格
@@ -323,7 +349,7 @@ def main():
     # 测试 7: 下限价单
     if price:
         # 设置一个远离市场价的限价单（不会立即成交）
-        test_limit_price = price.bid * 0.95 if "buy" else price.ask * 1.05
+        test_limit_price = price.bid * 0.95 if side == "buy" else price.ask * 1.05
 
         print(f"\n提示: 当前市场价 ${price.mid:,.2f}")
         print(f"建议限价单价格: ${test_limit_price:,.2f} (不会立即成交)")
