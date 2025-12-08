@@ -189,8 +189,8 @@ def test_active_orders(client: ParadexClient):
         return []
 
 
-def test_place_limit_order(client: ParadexClient, symbol: str = "BTC/USDT",
-                          side: str = "buy", size: float = 0.001, price: float = None):
+def test_place_limit_order(client: ParadexClient, symbol: str = "ETH/USDT",
+                          side: str = "buy", size: float = 0.003, price: float = None):
     """测试 7: 下限价单（LIMIT）"""
     print_separator("测试 7: 下限价单（LIMIT ORDER）")
 
@@ -233,8 +233,8 @@ def test_place_limit_order(client: ParadexClient, symbol: str = "BTC/USDT",
         return None
 
 
-def test_place_market_order(client: ParadexClient, symbol: str = "BTC/USDT",
-                           side: str = "buy", size: float = 0.001):
+def test_place_market_order(client: ParadexClient, symbol: str = "ETH/USDT",
+                           side: str = "buy", size: float = 0.003):
     """测试 8: 下市价单（MARKET）"""
     print_separator("测试 8: 下市价单（MARKET ORDER）")
 
@@ -322,10 +322,10 @@ def main():
         return
 
     # 测试 2: 查询价格
-    price = test_price(client, "BTC/USDT")
+    price = test_price(client, "ETH/USDT")
 
     # 测试 3: 查询订单簿
-    test_orderbook(client, "BTC/USDT")
+    test_orderbook(client, "ETH/USDT")
 
     # 测试 4: 查询余额
     test_balance(client)
@@ -349,7 +349,8 @@ def main():
     # 测试 7: 下限价单
     if price:
         # 设置一个远离市场价的限价单（不会立即成交）
-        test_limit_price = price.bid * 0.95 if side == "buy" else price.ask * 1.05
+        side = "buy"  # 默认买单
+        test_limit_price = price.bid * 0.95  # 买单价格设置低于市价5%
 
         print(f"\n提示: 当前市场价 ${price.mid:,.2f}")
         print(f"建议限价单价格: ${test_limit_price:,.2f} (不会立即成交)")
@@ -357,7 +358,7 @@ def main():
         use_suggested = input("使用建议价格？(yes/no): ").strip().lower()
         if use_suggested == 'yes':
             limit_order = test_place_limit_order(
-                client, "BTC/USDT", "buy", 0.001, test_limit_price
+                client, "ETH/USDT", "buy", 0.003, test_limit_price
             )
 
             # 如果下单成功，等待3秒后撤单
@@ -369,7 +370,7 @@ def main():
     # 测试 8: 下市价单（可选）
     test_market = input("\n⚠️  是否测试市价单？(市价单会立即成交，yes/no): ").strip().lower()
     if test_market == 'yes':
-        test_place_market_order(client, "BTC/USDT", "buy", 0.001)
+        test_place_market_order(client, "ETH/USDT", "buy", 0.003)
 
     print("\n" + "=" * 60)
     print("  ✅ 所有测试完成！")
