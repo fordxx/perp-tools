@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
 import logging
 import os
-import time
 from typing import Callable, List, Optional
 
-import httpx
 from dotenv import load_dotenv
 
 from perpbot.exchanges.base import ExchangeClient
@@ -18,115 +13,74 @@ logger = logging.getLogger(__name__)
 
 
 class ParadexClient(ExchangeClient):
-    """Paradex DEX client with full trading support.
+    """Paradex DEX client using official SDK + L2 private key.
 
-    Paradex is a Starknet-based derivatives DEX.
+    ✅ 使用 Paradex SDK (paradex-py)
+    ✅ L2 私钥签名（Starknet）
+    ✅ LIMIT 和 MARKET 订单
+    ✅ 主网和测试网支持
 
-    Features:
-    - LIMIT and MARKET orders
-    - Order cancellation
-    - Position queries
-    - Balance queries
-    - STARK key signing
-
-    Requirements:
-    - PARADEX_API_KEY
-    - PARADEX_API_SECRET
-    - PARADEX_STARK_PRIVATE_KEY (optional, for signing)
+    环境变量：
+    - PARADEX_L2_PRIVATE_KEY: L2 私钥（必需）
+    - PARADEX_ACCOUNT_ADDRESS: Starknet 账户地址（必需）
+    - PARADEX_ENV: mainnet 或 testnet（可选，默认 testnet）
     """
 
-    def __init__(self, use_testnet: bool = False) -> None:
+    def __init__(self, use_testnet: bool = True) -> None:
         self.name = "paradex"
         self.venue_type = "dex"
         self.use_testnet = use_testnet
 
-        # API URLs
-        if use_testnet:
-            self.base_url = "https://api.testnet.paradex.trade/v1"
-        else:
-            self.base_url = "https://api.prod.paradex.trade/v1"
-
-        # Credentials
-        self.api_key: Optional[str] = None
-        self.api_secret: Optional[str] = None
-        self.stark_private_key: Optional[str] = None
+        # L2 credentials
+        self.l2_private_key: Optional[str] = None
         self.account_address: Optional[str] = None
 
-        # HTTP client
-        self._client: Optional[httpx.Client] = None
-        self._jwt_token: Optional[str] = None
+        # SDK client
+        self.client = None  # Will be ParadexClient from SDK
         self._trading_enabled = False
 
-        # Handlers (placeholder for future WebSocket)
+        # Handlers (WebSocket 后置)
         self._order_handler: Optional[Callable[[dict], None]] = None
         self._position_handler: Optional[Callable[[dict], None]] = None
 
     def connect(self) -> None:
-        """Connect to Paradex and authenticate."""
+        """Connect to Paradex using SDK + L2 private key."""
         load_dotenv()
 
-        self.api_key = os.getenv("PARADEX_API_KEY")
-        self.api_secret = os.getenv("PARADEX_API_SECRET")
-        self.stark_private_key = os.getenv("PARADEX_STARK_PRIVATE_KEY")
+        self.l2_private_key = os.getenv("PARADEX_L2_PRIVATE_KEY")
         self.account_address = os.getenv("PARADEX_ACCOUNT_ADDRESS")
 
-        if not self.api_key or not self.api_secret:
-            logger.warning("⚠️ Paradex trading DISABLED: PARADEX_API_KEY or PARADEX_API_SECRET missing")
+        # 🔒 Safety: Check credentials
+        if not self.l2_private_key or not self.account_address:
+            logger.warning("⚠️ Paradex trading DISABLED: PARADEX_L2_PRIVATE_KEY or PARADEX_ACCOUNT_ADDRESS missing")
             self._trading_enabled = False
-            # Create client for read-only access
-            self._client = httpx.Client(base_url=self.base_url, timeout=10)
             return
 
-        # Create authenticated client
-        self._client = httpx.Client(base_url=self.base_url, timeout=10)
-
-        # Get JWT token
         try:
-            self._authenticate()
+            # Import Paradex SDK
+            from paradex_py import Paradex
+            from paradex_py.environment import TESTNET, PROD
+
+            # Select environment
+            env = TESTNET if self.use_testnet else PROD
+
+            # Initialize SDK with L2 private key
+            self.client = Paradex(
+                env=env,
+                l2_private_key=self.l2_private_key,
+                ethereum_address=self.account_address,
+            )
+
             self._trading_enabled = True
-            logger.info("✅ Paradex connected (testnet=%s, trading=%s)",
-                       self.use_testnet, self._trading_enabled)
-        except Exception as e:
-            logger.error("❌ Paradex authentication failed: %s", e)
+            logger.info("✅ Paradex SDK connected (testnet=%s, trading=%s, account=%s)",
+                       self.use_testnet, self._trading_enabled, self.account_address[:10] + "...")
+
+        except ImportError:
+            logger.error("❌ Paradex SDK not installed. Run: pip install paradex-py")
             self._trading_enabled = False
-
-    def _authenticate(self) -> None:
-        """Authenticate and get JWT token."""
-        # Paradex uses HMAC-based authentication
-        timestamp = str(int(time.time() * 1000))
-
-        # Create signature
-        message = f"{timestamp}"
-        signature = hmac.new(
-            self.api_secret.encode(),
-            message.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        # Request JWT token
-        headers = {
-            "PARADEX-API-KEY": self.api_key,
-            "PARADEX-SIGNATURE": signature,
-            "PARADEX-TIMESTAMP": timestamp,
-        }
-
-        response = self._client.post("/auth", headers=headers)
-        response.raise_for_status()
-
-        data = response.json()
-        self._jwt_token = data.get("jwt_token")
-
-        if not self._jwt_token:
-            raise RuntimeError("Failed to get JWT token from Paradex")
-
-        logger.info("✅ Paradex JWT token obtained")
-
-    def _get_headers(self) -> dict:
-        """Get request headers with JWT token."""
-        headers = {}
-        if self._jwt_token:
-            headers["Authorization"] = f"Bearer {self._jwt_token}"
-        return headers
+        except Exception as e:
+            logger.error("❌ Paradex SDK initialization failed: %s", e)
+            self._trading_enabled = False
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Convert BTC/USDT to BTC-USD-PERP (Paradex format)."""
@@ -137,21 +91,19 @@ class ParadexClient(ExchangeClient):
         return f"{base}-USD-PERP"
 
     def get_current_price(self, symbol: str) -> PriceQuote:
-        """Fetch current bid/ask price from Paradex."""
-        if not self._client:
+        """Fetch current bid/ask price from Paradex using SDK."""
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         market = self._normalize_symbol(symbol)
 
         try:
-            # Get ticker data
-            response = self._client.get(f"/markets/{market}/ticker")
-            response.raise_for_status()
-            data = response.json()
+            # Use SDK to get market ticker
+            ticker = self.client.markets.get_ticker(market)
 
-            # Paradex API returns: {"best_bid": "...", "best_ask": "...", ...}
-            bid = float(data.get("best_bid", 0))
-            ask = float(data.get("best_ask", 0))
+            # Paradex SDK returns: {'best_bid': '...', 'best_ask': '...', ...}
+            bid = float(ticker.get("best_bid", 0))
+            ask = float(ticker.get("best_ask", 0))
 
             if bid == 0 or ask == 0:
                 logger.warning("⚠️ Paradex %s: Invalid bid/ask (bid=%.2f, ask=%.2f)",
@@ -170,21 +122,19 @@ class ParadexClient(ExchangeClient):
             raise RuntimeError(f"Paradex price fetch failed for {symbol}: {e}")
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
-        """Fetch order book from Paradex."""
-        if not self._client:
+        """Fetch order book from Paradex using SDK."""
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         market = self._normalize_symbol(symbol)
 
         try:
-            response = self._client.get(f"/markets/{market}/orderbook",
-                                       params={"depth": depth})
-            response.raise_for_status()
-            data = response.json()
+            # Use SDK to get orderbook
+            orderbook = self.client.markets.get_orderbook(market, depth=depth)
 
-            # Paradex format: {"bids": [[price, size], ...], "asks": [[price, size], ...]}
-            bids = [(float(p), float(s)) for p, s in data.get("bids", [])]
-            asks = [(float(p), float(s)) for p, s in data.get("asks", [])]
+            # Paradex SDK format: {"bids": [[price, size], ...], "asks": [[price, size], ...]}
+            bids = [(float(p), float(s)) for p, s in orderbook.get("bids", [])]
+            asks = [(float(p), float(s)) for p, s in orderbook.get("asks", [])]
 
             return OrderBookDepth(bids=bids, asks=asks)
 
@@ -193,7 +143,10 @@ class ParadexClient(ExchangeClient):
             raise RuntimeError(f"Paradex orderbook fetch failed: {e}")
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        """Place an order on Paradex (LIMIT or MARKET).
+        """Place an order on Paradex using SDK (LIMIT or MARKET).
+
+        ✅ 支持 LIMIT 和 MARKET 订单
+        ✅ 自动 L2 签名
 
         Args:
             request: OrderRequest with symbol, side, size, limit_price (optional)
@@ -213,7 +166,7 @@ class ParadexClient(ExchangeClient):
                 price=0.0,
             )
 
-        if not self._client:
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         try:
@@ -222,32 +175,23 @@ class ParadexClient(ExchangeClient):
             # Determine order type
             order_type = "LIMIT" if request.limit_price is not None else "MARKET"
 
-            # Build order payload
-            payload = {
+            # Build order params
+            order_params = {
                 "market": market,
                 "side": request.side.upper(),  # BUY or SELL
-                "type": order_type,
+                "order_type": order_type,
                 "size": str(request.size),
             }
 
             if order_type == "LIMIT":
-                payload["price"] = str(request.limit_price)
+                order_params["price"] = str(request.limit_price)
 
-            # Optional: Add signature if STARK key is available
-            if self.stark_private_key:
-                payload["signature"] = self._sign_order(payload)
-
-            # Send order
-            response = self._client.post("/orders",
-                                        json=payload,
-                                        headers=self._get_headers())
-            response.raise_for_status()
-
-            order_data = response.json()
+            # Place order using SDK (SDK handles L2 signing automatically)
+            order_response = self.client.orders.create_order(**order_params)
 
             # Extract order info
-            order_id = order_data.get("id", "unknown")
-            filled_price = float(order_data.get("price", request.limit_price or 0))
+            order_id = order_response.get("id", "unknown")
+            filled_price = float(order_response.get("price", request.limit_price or 0))
 
             logger.info("✅ Paradex %s order placed: %s %.4f %s @ %.2f - ID: %s",
                        order_type, request.side.upper(), request.size,
@@ -265,7 +209,7 @@ class ParadexClient(ExchangeClient):
         except Exception as e:
             logger.exception("❌ Paradex order failed: %s", e)
             return Order(
-                id=f"error-{int(time.time())}",
+                id=f"error-{int(os.urandom(4).hex(), 16)}",
                 exchange=self.name,
                 symbol=request.symbol,
                 side=request.side,
@@ -274,7 +218,7 @@ class ParadexClient(ExchangeClient):
             )
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
-        """Close a position with a MARKET order.
+        """Close a position with a MARKET order using SDK.
 
         Args:
             position: Position to close
@@ -295,7 +239,7 @@ class ParadexClient(ExchangeClient):
                 price=0.0,
             )
 
-        # Create reverse order
+        # Create reverse MARKET order
         closing_side = "sell" if position.order.side == "buy" else "buy"
 
         close_request = OrderRequest(
@@ -308,24 +252,22 @@ class ParadexClient(ExchangeClient):
         return self.place_open_order(close_request)
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        """Cancel an order on Paradex.
+        """Cancel an order on Paradex using SDK.
 
         Args:
             order_id: Order ID to cancel
-            symbol: Optional symbol (not used by Paradex)
+            symbol: Optional symbol (not used by Paradex SDK)
         """
         if not self._trading_enabled:
             logger.warning("❌ Cancel REJECTED: Trading disabled")
             return
 
-        if not self._client:
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         try:
-            response = self._client.delete(f"/orders/{order_id}",
-                                          headers=self._get_headers())
-            response.raise_for_status()
-
+            # Use SDK to cancel order
+            self.client.orders.cancel_order(order_id)
             logger.info("✅ Paradex order cancelled: %s", order_id)
 
         except Exception as e:
@@ -333,7 +275,7 @@ class ParadexClient(ExchangeClient):
             raise RuntimeError(f"Cancel failed: {e}")
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        """Get all active orders on Paradex.
+        """Get all active orders on Paradex using SDK.
 
         Args:
             symbol: Optional symbol filter
@@ -345,23 +287,19 @@ class ParadexClient(ExchangeClient):
             logger.warning("⚠️ Active orders query skipped: Trading disabled")
             return []
 
-        if not self._client:
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         try:
-            params = {}
+            # Use SDK to get orders
+            filters = {}
             if symbol:
-                params["market"] = self._normalize_symbol(symbol)
+                filters["market"] = self._normalize_symbol(symbol)
 
-            response = self._client.get("/orders",
-                                       params=params,
-                                       headers=self._get_headers())
-            response.raise_for_status()
+            orders_response = self.client.orders.list_orders(**filters)
 
-            orders_data = response.json()
             orders: List[Order] = []
-
-            for order_data in orders_data.get("results", []):
+            for order_data in orders_response.get("results", []):
                 # Only include open orders
                 if order_data.get("status") != "OPEN":
                     continue
@@ -389,7 +327,7 @@ class ParadexClient(ExchangeClient):
             return []
 
     def get_account_positions(self) -> List[Position]:
-        """Get all positions on Paradex.
+        """Get all positions on Paradex using SDK.
 
         Returns:
             List of Position objects
@@ -398,18 +336,15 @@ class ParadexClient(ExchangeClient):
             logger.warning("⚠️ Positions query skipped: Trading disabled")
             return []
 
-        if not self._client:
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         try:
-            response = self._client.get("/account/positions",
-                                       headers=self._get_headers())
-            response.raise_for_status()
+            # Use SDK to get positions
+            positions_response = self.client.account.get_positions()
 
-            positions_data = response.json()
             positions: List[Position] = []
-
-            for pos_data in positions_data.get("results", []):
+            for pos_data in positions_response.get("results", []):
                 size = float(pos_data.get("size", 0))
                 if size == 0:
                     continue
@@ -450,7 +385,7 @@ class ParadexClient(ExchangeClient):
             return []
 
     def get_account_balances(self) -> List[Balance]:
-        """Get account balances on Paradex.
+        """Get account balances on Paradex using SDK.
 
         Returns:
             List of Balance objects
@@ -459,20 +394,18 @@ class ParadexClient(ExchangeClient):
             logger.warning("⚠️ Balances query skipped: Trading disabled")
             return []
 
-        if not self._client:
+        if not self.client:
             raise RuntimeError("Client not connected")
 
         try:
-            response = self._client.get("/account/summary",
-                                       headers=self._get_headers())
-            response.raise_for_status()
+            # Use SDK to get account summary
+            summary = self.client.account.get_summary()
 
-            data = response.json()
             balances: List[Balance] = []
 
             # Paradex typically returns USDC balance
-            total_equity = float(data.get("equity", 0))
-            available = float(data.get("available_balance", 0))
+            total_equity = float(summary.get("equity", 0))
+            available = float(summary.get("available_balance", 0))
             locked = total_equity - available
 
             if total_equity > 0:
@@ -494,25 +427,11 @@ class ParadexClient(ExchangeClient):
             return []
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        """Setup order update handler (WebSocket not implemented yet)."""
+        """Setup order update handler (WebSocket 后置)."""
         self._order_handler = handler
         logger.info("Registered Paradex order update handler (WebSocket not active)")
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        """Setup position update handler (WebSocket not implemented yet)."""
+        """Setup position update handler (WebSocket 后置)."""
         self._position_handler = handler
         logger.info("Registered Paradex position update handler (WebSocket not active)")
-
-    def _sign_order(self, payload: dict) -> str:
-        """Sign order with STARK private key (placeholder).
-
-        Note: Actual STARK signing requires starknet.py library.
-        This is a placeholder implementation.
-        """
-        if not self.stark_private_key:
-            return ""
-
-        # TODO: Implement actual STARK signing when starknet.py is available
-        # For now, return empty signature (Paradex may accept unsigned orders in some cases)
-        logger.warning("⚠️ STARK signing not implemented, order may fail if signing is required")
-        return ""
