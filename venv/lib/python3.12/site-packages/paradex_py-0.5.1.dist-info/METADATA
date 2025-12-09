@@ -1,0 +1,164 @@
+Metadata-Version: 2.4
+Name: paradex_py
+Version: 0.5.1
+Summary: Paradex Python SDK
+Project-URL: Homepage, https://github.com/tradeparadex/paradex-py
+Project-URL: Repository, https://github.com/tradeparadex/paradex-py
+Project-URL: Documentation, https://tradeparadex.github.io/paradex-py/
+Author-email: Paradex <finfo@paradex.trade>
+License: MIT License
+        
+        Copyright (c) 2023, Paradex
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+License-File: LICENSE
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: <3.13,>=3.10
+Requires-Dist: eth-account<0.12.0,>=0.11.0
+Requires-Dist: httpx<0.28.0,>=0.27.0
+Requires-Dist: ledgereth<0.10.0,>=0.9.1
+Requires-Dist: marshmallow-dataclass<9.0.0,>=8.6.1
+Requires-Dist: poseidon-py<0.2.0,>=0.1.0
+Requires-Dist: pydantic<3.0.0,>=2.0.0
+Requires-Dist: starknet-crypto-py<0.3.0,>=0.2.0
+Requires-Dist: starknet-py<0.29.0,>=0.28.0
+Requires-Dist: web3<7.0.0,>=6.19.0
+Requires-Dist: websockets<16.0,>=15.0
+Description-Content-Type: text/markdown
+
+# Paradex Python SDK
+
+[![Release](https://img.shields.io/github/v/release/tradeparadex/paradex-py)](https://img.shields.io/github/v/release/tradeparadex/paradex-py)
+[![Build status](https://img.shields.io/github/actions/workflow/status/tradeparadex/paradex-py/main.yml?branch=main)](https://github.com/tradeparadex/paradex-py/actions/workflows/main.yml?query=branch%3Amain)
+[![codecov](https://codecov.io/gh/tradeparadex/paradex-py/branch/main/graph/badge.svg)](https://codecov.io/gh/tradeparadex/paradex-py)
+[![Commit activity](https://img.shields.io/github/commit-activity/m/tradeparadex/paradex-py)](https://img.shields.io/github/commit-activity/m/tradeparadex/paradex-py)
+[![License](https://img.shields.io/github/license/tradeparadex/paradex-py)](https://img.shields.io/github/license/tradeparadex/paradex-py)
+
+Paradex Python SDK provides a simple interface to interact with the Paradex REST and WS API.
+
+## Examples
+
+### L1 + L2 Authentication (Traditional)
+
+```python
+from paradex_py import Paradex
+from paradex_py.environment import Environment
+
+paradex = Paradex(env=Environment.TESTNET, l1_address="0x...", l1_private_key="0x...")
+print(hex(paradex.account.l2_address)) # 0x...
+print(hex(paradex.account.l2_public_key)) # 0x...
+print(hex(paradex.account.l2_private_key)) # 0x...
+```
+
+### L2-Only Authentication (Subkey)
+
+```python
+from paradex_py import ParadexSubkey
+from paradex_py.environment import Environment
+
+# Use ParadexSubkey for L2-only authentication
+paradex = ParadexSubkey(
+    env=Environment.TESTNET,
+    l2_private_key="0x...",
+    l2_address="0x..."
+)
+print(hex(paradex.account.l2_address)) # 0x...
+print(hex(paradex.account.l2_public_key)) # 0x...
+print(hex(paradex.account.l2_private_key)) # 0x...
+```
+
+### WebSocket Usage
+
+```python
+async def on_message(ws_channel, message):
+    print(ws_channel, message)
+
+await paradex.ws_client.connect()
+await paradex.ws_client.subscribe(ParadexWebsocketChannel.MARKETS_SUMMARY, callback=on_message)
+```
+
+📖 For complete documentation refer to [tradeparadex.github.io/paradex-py](https://tradeparadex.github.io/paradex-py/)
+
+💻 For comprehensive examples refer to following files:
+
+- API (L1+L2): [examples/call_rest_api.py](examples/call_rest_api.py)
+- API (L2-only): [examples/subkey_rest_api.py](examples/subkey_rest_api.py)
+- WS (L1+L2): [examples/connect_ws_api.py](examples/connect_ws_api.py)
+- WS (L2-only): [examples/subkey_ws_api.py](examples/subkey_ws_api.py)
+- Transfer: [examples/transfer_l2_usdc.py](examples/transfer_l2_usdc.py)
+
+## Development
+
+```bash
+make install
+make check
+make test
+make build
+make clean-build
+make publish
+make build-and-publish
+make docs-test
+make docs
+make help
+```
+
+### Using uv
+
+This project uses `uv` for managing dependencies and building. Below are instructions for installing `uv` and the basic workflow for development outside of using `make` commands.
+
+### Installing uv
+
+`uv` is a fast and modern Python package manager. You can install it using the standalone installer for macOS and Linux:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+For other installation methods, refer to the [uv installation documentation](https://docs.astral.sh/uv/getting-started/installation/).
+
+### Basic Workflow with uv
+
+If you prefer not to use `make` commands, you can directly use `uv` for development tasks:
+
+- **Install dependencies**: Sync your environment with the project's dependencies.
+  ```bash
+  uv sync
+  ```
+- **Run tests**: Execute the test suite using `pytest` within the `uv` environment.
+  ```bash
+  uv run pytest
+  ```
+- **Build the project**: Create a distribution package for the SDK.
+  ```bash
+  uv build
+  ```
+
+For more detailed information on using `uv`, refer to the [uv documentation](https://docs.astral.sh/uv/).
+
+The CI/CD pipeline will be triggered when a new pull request is opened, code is merged to main, or when new release is created.
+
+## Notes
+
+> [!WARNING]
+> Experimental SDK, library API is subject to change

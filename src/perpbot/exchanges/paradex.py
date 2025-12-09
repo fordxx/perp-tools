@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import threading
 from decimal import Decimal
 from typing import Callable, List, Optional
 
@@ -37,10 +39,15 @@ class ParadexClient(ExchangeClient):
         self.account_address: Optional[str] = None
 
         # SDK client
-        self.client = None  # Will be ParadexClient from SDK
+        self.client = None  # Will be ParadexSubkey from SDK
         self._trading_enabled = False
 
-        # Handlers (WebSocket 后置)
+        # WebSocket 管理
+        self._ws_thread: Optional[threading.Thread] = None
+        self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_connected = False
+
+        # Handlers (WebSocket callbacks)
         self._order_handler: Optional[Callable[[dict], None]] = None
         self._position_handler: Optional[Callable[[dict], None]] = None
 
@@ -60,9 +67,10 @@ class ParadexClient(ExchangeClient):
         try:
             # Import Paradex SDK (使用 ParadexSubkey 类 - 仅需 L2 凭证)
             from paradex_py import ParadexSubkey
+            from paradex_py.environment import TESTNET, PROD
 
-            # Select environment (使用字符串，不是枚举)
-            env = 'testnet' if self.use_testnet else 'prod'
+            # Select environment (使用官方环境常量)
+            env = TESTNET if self.use_testnet else PROD
 
             # Initialize SDK with L2 private key (使用 ParadexSubkey)
             self.client = ParadexSubkey(
@@ -75,12 +83,113 @@ class ParadexClient(ExchangeClient):
             logger.info("✅ Paradex SDK connected (testnet=%s, trading=%s, account=%s)",
                        self.use_testnet, self._trading_enabled, self.account_address[:10] + "...")
 
+            # 启动 WebSocket 连接（后台线程）
+            self._start_websocket_thread()
+
         except ImportError:
             logger.error("❌ Paradex SDK not installed. Run: pip install paradex-py")
             self._trading_enabled = False
         except Exception as e:
             logger.error("❌ Paradex SDK initialization failed: %s", e)
             self._trading_enabled = False
+
+    def _start_websocket_thread(self) -> None:
+        """在后台线程启动 WebSocket 连接"""
+        if not self.client:
+            logger.warning("⚠️ Cannot start WebSocket: client not initialized")
+            return
+
+        def run_async_loop():
+            """后台线程的 asyncio 事件循环"""
+            self._ws_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._ws_loop)
+            try:
+                self._ws_loop.run_until_complete(self._connect_websocket())
+                self._ws_loop.run_forever()
+            except Exception as e:
+                logger.error("❌ WebSocket event loop error: %s", e)
+            finally:
+                self._ws_loop.close()
+
+        self._ws_thread = threading.Thread(target=run_async_loop, daemon=True, name="ParadexWS")
+        self._ws_thread.start()
+        logger.info("🚀 Started WebSocket background thread")
+
+    async def _connect_websocket(self) -> None:
+        """异步连接 WebSocket 并订阅频道"""
+        try:
+            logger.info("🔌 Connecting to Paradex WebSocket...")
+            await self.client.ws_client.connect()
+            self._ws_connected = True
+            logger.info("✅ Paradex WebSocket connected")
+
+            # 订阅频道
+            await self._subscribe_channels()
+
+        except Exception as e:
+            logger.error("❌ WebSocket connection failed: %s", e)
+            self._ws_connected = False
+
+    async def _subscribe_channels(self) -> None:
+        """订阅 WebSocket 频道（ORDERS 和 POSITIONS）"""
+        from paradex_py.api.ws_client import ParadexWebsocketChannel
+
+        try:
+            # 订阅订单更新
+            if self._order_handler:
+                await self.client.ws_client.subscribe(
+                    ParadexWebsocketChannel.ORDERS,
+                    callback=self._on_order_update,
+                    params={"market": "ALL"}
+                )
+                logger.info("📡 Subscribed to ORDERS channel")
+
+            # 订阅持仓更新
+            if self._position_handler:
+                await self.client.ws_client.subscribe(
+                    ParadexWebsocketChannel.POSITIONS,
+                    callback=self._on_position_update,
+                )
+                logger.info("📡 Subscribed to POSITIONS channel")
+
+        except Exception as e:
+            logger.error("❌ Channel subscription failed: %s", e)
+
+    async def _on_order_update(self, channel, message: dict) -> None:
+        """处理订单更新消息"""
+        try:
+            if self._order_handler:
+                # 调用用户注册的 handler
+                self._order_handler(message)
+        except Exception as e:
+            logger.error("❌ Order handler error: %s", e)
+
+    async def _on_position_update(self, channel, message: dict) -> None:
+        """处理持仓更新消息"""
+        try:
+            if self._position_handler:
+                # 调用用户注册的 handler
+                self._position_handler(message)
+        except Exception as e:
+            logger.error("❌ Position handler error: %s", e)
+
+    def disconnect(self) -> None:
+        """断开 WebSocket 连接并清理资源"""
+        if self._ws_connected and self._ws_loop:
+            try:
+                # 在事件循环中关闭 WebSocket
+                future = asyncio.run_coroutine_threadsafe(
+                    self.client.ws_client.close(),
+                    self._ws_loop
+                )
+                future.result(timeout=5.0)  # 等待最多 5 秒
+                
+                self._ws_loop.stop()
+                self._ws_connected = False
+                logger.info("🔌 Paradex WebSocket disconnected")
+            except Exception as e:
+                logger.error("❌ WebSocket disconnect error: %s", e)
+
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Convert BTC/USDT to BTC-USD-PERP (Paradex format)."""
@@ -437,11 +546,40 @@ class ParadexClient(ExchangeClient):
             return []
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:
-        """Setup order update handler (WebSocket 后置)."""
+        """设置订单更新回调并订阅 ORDERS 频道"""
         self._order_handler = handler
-        logger.info("Registered Paradex order update handler (WebSocket not active)")
+        logger.info("✅ Registered Paradex order update handler")
+
+        # 如果 WebSocket 已连接，立即订阅
+        if self._ws_connected and self._ws_loop:
+            import asyncio
+            from paradex_py.api.ws_client import ParadexWebsocketChannel
+            
+            asyncio.run_coroutine_threadsafe(
+                self.client.ws_client.subscribe(
+                    ParadexWebsocketChannel.ORDERS,
+                    callback=self._on_order_update,
+                    params={"market": "ALL"}
+                ),
+                self._ws_loop
+            )
+            logger.info("📡 Dynamically subscribed to ORDERS channel")
 
     def setup_position_update_handler(self, handler: Callable[[dict], None]) -> None:
-        """Setup position update handler (WebSocket 后置)."""
+        """设置持仓更新回调并订阅 POSITIONS 频道"""
         self._position_handler = handler
-        logger.info("Registered Paradex position update handler (WebSocket not active)")
+        logger.info("✅ Registered Paradex position update handler")
+
+        # 如果 WebSocket 已连接，立即订阅
+        if self._ws_connected and self._ws_loop:
+            import asyncio
+            from paradex_py.api.ws_client import ParadexWebsocketChannel
+            
+            asyncio.run_coroutine_threadsafe(
+                self.client.ws_client.subscribe(
+                    ParadexWebsocketChannel.POSITIONS,
+                    callback=self._on_position_update,
+                ),
+                self._ws_loop
+            )
+            logger.info("📡 Dynamically subscribed to POSITIONS channel")
