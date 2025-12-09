@@ -83,7 +83,6 @@ def test_price(client: ParadexClient, symbol: str = "BTC/USDT"):
         print(f"   - 买价 (Bid): ${price.bid:,.2f}")
         print(f"   - 卖价 (Ask): ${price.ask:,.2f}")
         print(f"   - 中间价: ${price.mid:,.2f}")
-        print(f"   - 价差: ${price.spread:,.2f} ({price.spread_pct:.2f}%)")
         return price
     except Exception as e:
         print(f"❌ 价格查询失败: {e}")
