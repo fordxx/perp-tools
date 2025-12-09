@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from decimal import Decimal
 from typing import Callable, List, Optional
 
 from dotenv import load_dotenv
@@ -169,31 +170,34 @@ class ParadexClient(ExchangeClient):
             raise RuntimeError("Client not connected")
 
         try:
+            # Import Paradex SDK Order classes
+            from paradex_py.common.order import Order as ParadexOrder, OrderType, OrderSide
+
             market = self._normalize_symbol(request.symbol)
 
-            # Determine order type
-            order_type = "LIMIT" if request.limit_price is not None else "MARKET"
+            # Determine order type and side (using SDK enums)
+            is_limit = request.limit_price is not None
+            order_type = OrderType.Limit if is_limit else OrderType.Market
+            order_side = OrderSide.Buy if request.side.lower() == "buy" else OrderSide.Sell
 
-            # Build order params
-            order_params = {
-                "market": market,
-                "side": request.side.upper(),  # BUY or SELL
-                "order_type": order_type,
-                "size": str(request.size),
-            }
-
-            if order_type == "LIMIT":
-                order_params["price"] = str(request.limit_price)
+            # Create Paradex Order object
+            paradex_order = ParadexOrder(
+                market=market,
+                order_type=order_type,
+                order_side=order_side,
+                size=Decimal(str(request.size)),
+                limit_price=Decimal(str(request.limit_price)) if is_limit else Decimal("0"),
+            )
 
             # Place order using SDK (SDK handles L2 signing automatically)
-            order_response = self.client.api_client.submit_order(**order_params)
+            order_response = self.client.api_client.submit_order(paradex_order)
 
             # Extract order info
             order_id = order_response.get("id", "unknown")
             filled_price = float(order_response.get("price", request.limit_price or 0))
 
             logger.info("✅ Paradex %s order placed: %s %.4f %s @ %.2f - ID: %s",
-                       order_type, request.side.upper(), request.size,
+                       order_type.value, request.side.upper(), request.size,
                        request.symbol, filled_price, order_id)
 
             return Order(
