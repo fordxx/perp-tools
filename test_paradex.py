@@ -190,7 +190,7 @@ def test_active_orders(client: ParadexClient):
 
 
 def test_place_limit_order(client: ParadexClient, symbol: str = "ETH/USDT",
-                          side: str = "buy", size: float = 0.003, price: float = None):
+                          side: str = "buy", size: float = 0.004, price: float = None):
     """测试 7: 下限价单（LIMIT）"""
     print_separator("测试 7: 下限价单（LIMIT ORDER）")
 
@@ -234,7 +234,7 @@ def test_place_limit_order(client: ParadexClient, symbol: str = "ETH/USDT",
 
 
 def test_place_market_order(client: ParadexClient, symbol: str = "ETH/USDT",
-                           side: str = "buy", size: float = 0.003):
+                           side: str = "buy", size: float = 0.004):
     """测试 8: 下市价单（MARKET）"""
     print_separator("测试 8: 下市价单（MARKET ORDER）")
 
@@ -358,7 +358,7 @@ def main():
         use_suggested = input("使用建议价格？(yes/no): ").strip().lower()
         if use_suggested == 'yes':
             limit_order = test_place_limit_order(
-                client, "ETH/USDT", "buy", 0.003, test_limit_price
+                client, "ETH/USDT", "buy", 0.004, test_limit_price
             )
 
             # 如果下单成功，等待3秒后撤单
@@ -370,7 +370,7 @@ def main():
     # 测试 8: 下市价单（可选）
     test_market = input("\n⚠️  是否测试市价单？(市价单会立即成交，yes/no): ").strip().lower()
     if test_market == 'yes':
-        test_place_market_order(client, "ETH/USDT", "buy", 0.003)
+        test_place_market_order(client, "ETH/USDT", "buy", 0.004)
 
     print("\n" + "=" * 60)
     print("  ✅ 所有测试完成！")
