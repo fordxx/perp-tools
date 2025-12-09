@@ -180,13 +180,20 @@ class ParadexClient(ExchangeClient):
             order_type = OrderType.Limit if is_limit else OrderType.Market
             order_side = OrderSide.Buy if request.side.lower() == "buy" else OrderSide.Sell
 
+            # Round price to tick_size (0.01 for Paradex)
+            if is_limit:
+                # Round to 2 decimal places (tick_size = 0.01)
+                price_decimal = Decimal(str(request.limit_price)).quantize(Decimal("0.01"))
+            else:
+                price_decimal = Decimal("0")
+
             # Create Paradex Order object
             paradex_order = ParadexOrder(
                 market=market,
                 order_type=order_type,
                 order_side=order_side,
                 size=Decimal(str(request.size)),
-                limit_price=Decimal(str(request.limit_price)) if is_limit else Decimal("0"),
+                limit_price=price_decimal,
             )
 
             # Place order using SDK (SDK handles L2 signing automatically)
