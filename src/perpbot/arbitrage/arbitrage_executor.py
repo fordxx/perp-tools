@@ -9,10 +9,14 @@ from perpbot.arbitrage.profit import ProfitContext, calculate_real_profit, chunk
 from perpbot.arbitrage.scanner import ArbitrageOpportunity, DEX_ONLY_PAIRS
 from perpbot.capital_orchestrator import CapitalOrchestrator, CapitalReservation
 from perpbot.exchanges.base import ExchangeClient
-from perpbot.models import ExchangeCost, OrderRequest, Position
+from perpbot.execution.execution_engine import ExecutionEngine, ExecutionPlan
+from perpbot.execution.execution_mode import ExecutionConfig
+from perpbot.models import ExchangeCost, Order, OrderRequest, Position, PriceQuote
 from perpbot.persistence import TradeRecorder
 from perpbot.position_guard import PositionGuard
 from perpbot.risk_manager import RiskManager
+from perpbot.scoring.fee_model import FeeModel
+from perpbot.scoring.slippage_model import SlippageModel
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,8 @@ class ArbitrageExecutor:
         exchange_costs: Optional[Dict[str, ExchangeCost]] = None,
         recorder: Optional[TradeRecorder] = None,
         capital_orchestrator: Optional[CapitalOrchestrator] = None,
+        execution_engine: Optional[ExecutionEngine] = None,
+        execution_config: Optional[ExecutionConfig] = None,
     ):
         self.exchanges: Dict[str, ExchangeClient] = {ex.name: ex for ex in exchanges}
         self.guard = guard
@@ -44,6 +50,11 @@ class ArbitrageExecutor:
         self.exchange_costs = exchange_costs or {}
         self.recorder = recorder
         self.capital_orchestrator = capital_orchestrator
+        self.execution_engine = execution_engine or ExecutionEngine(
+            fee_model=FeeModel(),
+            slippage_model=SlippageModel(),
+            config=execution_config or ExecutionConfig(),
+        )
 
     def execute(
         self,
@@ -83,6 +94,8 @@ class ArbitrageExecutor:
             logger.warning("%s: notional %.4f exceeds %s%% of equity", msg, notional, self.guard.max_risk_pct * 100)
             return ExecutionResult(opportunity, status="blocked", error=msg)
 
+        quotes_list = list(quotes) if quotes is not None else []
+        quote_map = {(q.exchange, q.symbol): q for q in quotes_list}
         reservation: Optional[CapitalReservation] = None
 
         if self.risk_manager:
@@ -93,7 +106,7 @@ class ArbitrageExecutor:
                 size=opportunity.size,
                 price=opportunity.buy_price,
                 positions=positions,
-                quotes=quotes,
+                quotes=quotes_list,
             )
             if not allowed:
                 msg = reason or "被风控拦截"
@@ -123,6 +136,19 @@ class ArbitrageExecutor:
             msg = "套利不再有正收益"
             logger.warning(msg)
             return ExecutionResult(opportunity, status="blocked", error=msg)
+
+        plan = self._plan_execution(opportunity, expected_profit, quote_map)
+        if not plan.valid:
+            msg = plan.reason or "执行计划未通过约束"
+            logger.warning(msg)
+            return ExecutionResult(opportunity, status="blocked", error=msg)
+        buy_is_taker = plan.decision.open_order_type == "taker"
+        sell_is_taker = plan.decision.close_order_type == "taker"
+        if not prefer_limit:
+            buy_is_taker = True
+            sell_is_taker = True
+        had_fallback = False
+
         try:
             if self.capital_orchestrator:
                 reservation = self.capital_orchestrator.reserve_for_strategy(
@@ -142,24 +168,28 @@ class ArbitrageExecutor:
             )
 
             for chunk in chunks:
+                buy_limit = None if buy_is_taker else opportunity.buy_price
+                sell_limit = None if sell_is_taker else opportunity.sell_price
                 buy_req = OrderRequest(
                     symbol=opportunity.symbol,
                     side="buy",
                     size=chunk,
-                    limit_price=opportunity.buy_price if prefer_limit else None,
+                    limit_price=buy_limit,
                 )
                 sell_req = OrderRequest(
                     symbol=opportunity.symbol,
                     side="sell",
                     size=chunk,
-                    limit_price=opportunity.sell_price if prefer_limit else None,
+                    limit_price=sell_limit,
                 )
 
                 latest_buy = buy_ex.get_current_price(opportunity.symbol)
                 latest_sell = sell_ex.get_current_price(opportunity.symbol)
                 if self.risk_manager:
-                    ok_buy, reason_buy = self.risk_manager.check_slippage(opportunity.buy_price, latest_buy.ask)
-                    ok_sell, reason_sell = self.risk_manager.check_slippage(opportunity.sell_price, latest_sell.bid)
+                    buy_reference = buy_limit or latest_buy.ask
+                    sell_reference = sell_limit or latest_sell.bid
+                    ok_buy, reason_buy = self.risk_manager.check_slippage(buy_reference, latest_buy.ask)
+                    ok_sell, reason_sell = self.risk_manager.check_slippage(sell_reference, latest_sell.bid)
                     if not (ok_buy and ok_sell):
                         msg = reason_buy or reason_sell or "滑点校验未通过"
                         logger.warning(msg)
@@ -168,23 +198,46 @@ class ArbitrageExecutor:
                 buy_order = buy_ex.place_open_order(buy_req)
                 sell_order = sell_ex.place_open_order(sell_req)
 
-                filled = self._wait_for_fill(buy_ex, buy_order, opportunity.symbol)
-                filled &= self._wait_for_fill(sell_ex, sell_order, opportunity.symbol)
-                if not filled:
+                buy_filled = self._wait_for_fill(buy_ex, buy_order, opportunity.symbol)
+                sell_filled = self._wait_for_fill(sell_ex, sell_order, opportunity.symbol)
+                fallback_triggered = False
+                if plan.decision.may_fallback:
+                    if not buy_filled and not buy_is_taker:
+                        fallback_triggered = True
+                        buy_filled, buy_order = self._fallback_to_taker(
+                            buy_ex, opportunity.symbol, "buy", chunk, buy_order
+                        )
+                    if not sell_filled and not sell_is_taker:
+                        fallback_triggered = True
+                        sell_filled, sell_order = self._fallback_to_taker(
+                            sell_ex, opportunity.symbol, "sell", chunk, sell_order
+                        )
+                had_fallback |= fallback_triggered
+                if not buy_filled or not sell_filled:
                     logger.warning("出现部分成交，启动对冲保护")
-                    self._hedge_incomplete_legs(opportunity, buy_ex, sell_ex, buy_order, sell_order)
+                    self._hedge_incomplete_legs(
+                        opportunity,
+                        buy_ex,
+                        sell_ex,
+                        buy_order if buy_filled else None,
+                        sell_order if sell_filled else None,
+                    )
                     raise RuntimeError("Partial fill hedge executed")
 
             if self.risk_manager:
                 self.risk_manager.record_success()
             self.guard.mark_success()
+            if plan.decision.may_fallback and (not buy_is_taker or not sell_is_taker):
+                self.execution_engine.record_execution_outcome(
+                    buy_ex.name, sell_ex.name, plan.decision, success=True, had_fallback=had_fallback
+                )
             if self.recorder:
                 self.recorder.record_trade(opportunity, success=True, actual_profit=expected_profit.net_profit_abs)
             return ExecutionResult(
                 opportunity,
                 status="filled",
                 buy_order_id=buy_order.id,
-                sell_order_id=sell_order.id,
+                sell_order_id=sell_order.id if sell_order else None,
             )
         except Exception as exc:  # pragma: no cover - runtime protection
             logger.exception("套利腿执行失败: %s", exc)
@@ -194,12 +247,71 @@ class ArbitrageExecutor:
                 self.risk_manager.record_failure()
                 self.risk_manager.record_exchange_failure(buy_ex.name)
                 self.risk_manager.record_exchange_failure(sell_ex.name)
+            if plan.decision.may_fallback and (not buy_is_taker or not sell_is_taker):
+                self.execution_engine.record_execution_outcome(
+                    buy_ex.name, sell_ex.name, plan.decision, success=False, had_fallback=had_fallback
+                )
             if self.recorder:
                 self.recorder.record_trade(opportunity, success=False, actual_profit=0.0, error_message=str(exc))
             return ExecutionResult(opportunity, status="failed", error=str(exc))
         finally:
             if reservation:
                 self.capital_orchestrator.release(reservation)
+
+    def _plan_execution(
+        self,
+        opportunity: ArbitrageOpportunity,
+        expected_profit,
+        quote_map: Dict[tuple[str, str], PriceQuote],
+    ) -> ExecutionPlan:
+        base_liq = (opportunity.liquidity_score / 100) if opportunity.liquidity_score else 0.5
+        default_liq = max(0.05, min(0.95, base_liq))
+        buy_quote = quote_map.get((opportunity.buy_exchange, opportunity.symbol))
+        sell_quote = quote_map.get((opportunity.sell_exchange, opportunity.symbol))
+        buy_liq = self._liquidity_score(buy_quote, "buy", opportunity.size, default_liq)
+        sell_liq = self._liquidity_score(sell_quote, "sell", opportunity.size, default_liq)
+        return self.execution_engine.plan_execution(
+            buy_exchange=opportunity.buy_exchange,
+            sell_exchange=opportunity.sell_exchange,
+            symbol=opportunity.symbol,
+            notional=opportunity.buy_price * opportunity.size,
+            buy_liquidity_score=buy_liq,
+            sell_liquidity_score=sell_liq,
+            expected_pnl=expected_profit.net_profit_abs,
+        )
+
+    def _liquidity_score(
+        self,
+        quote: Optional[PriceQuote],
+        side: str,
+        size: float,
+        fallback: float,
+    ) -> float:
+        if quote and quote.order_book:
+            try:
+                ratio = quote.order_book.fill_ratio(side, size)
+                return max(0.05, min(0.95, ratio))
+            except Exception:
+                logger.debug("计算盘口流动性失败: %s %s", quote.exchange, quote.symbol)
+        return fallback
+
+    def _fallback_to_taker(
+        self,
+        ex: ExchangeClient,
+        symbol: str,
+        side: str,
+        size: float,
+        order: Order,
+    ) -> tuple[bool, Order]:
+        try:
+            ex.cancel_order(order.id, symbol)
+        except Exception:
+            logger.debug("取消未成交订单失败: %s", order.id)
+        logger.info("Maker 订单 fallback 到 taker: %s %s %s", ex.name, symbol, side)
+        fallback_req = OrderRequest(symbol=symbol, side=side, size=size, limit_price=None)
+        fallback_order = ex.place_open_order(fallback_req)
+        filled = self._wait_for_fill(ex, fallback_order, symbol)
+        return filled, fallback_order
 
     def _hedge_incomplete_legs(
         self,

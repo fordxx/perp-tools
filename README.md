@@ -56,28 +56,24 @@ PerpBot 是一个**高度模块化**的自动交易框架，专注于多交易�
 
 | 功能模块 | 说明 | 状态 |
 |---------|------|------|
-| 🏦 模块化交易所层 | 统一接口支持多家交易所 | ✅ 完成 |
+| 🏦 8个交易所客户端 | Paradex/Extended/Lighter/EdgeX/Backpack/GRVT/Aster/OKX | ✅ 完成 |
 | 💰 三层资金管理 | 刷量/套利/储备三层资金调度 | ✅ 完成 |
-| 📊 自动止盈策略 | 基于收益阈值自动平仓 | ✅ 完成 |
-| 🔄 套利扫描引擎 | 跨所价差发现与评分 | ✅ 完成 |
-| ⚡ 并发行情获取 | WebSocket + REST 双通道 | ✅ 完成 |
+| 📊 高级策略模块 | 追踪止损/网格交易/动态仓位 | ✅ 完成 |
+| 🔄 套利扫描引擎 | 42种DEX配对+优先级评分 | ✅ 完成 |
+| ⚡ WebSocket管理器 | 自动重连+状态监控 | ✅ 完成 |
 | 🛡️ 多层风控系统 | 账户级 + 仓位级风控 | ✅ 完成 |
-| 🔔 智能提醒系统 | 多条件触发 + 自动下单 | ✅ 完成 |
+| 🔔 增强通知系统 | Telegram/Discord/微信/飞书/邮件 | ✅ 完成 |
 | 🖥️ Web 控制台 | 实时监控 + 在线调参 | ✅ 完成 |
-| 🔐 安全审计 | API 调用日志 + 密钥加密 | ✅ 完成 |
+| ⚙️ 配置增强 | 验证+热重载+环境变量覆盖 | ✅ 完成 |
+| 🧪 通用测试框架 | 一键测试所有交易所 | ✅ 完成 |
 
-### 🚧 开发中功能
+### 🚧 待测试功能
 
 | 功能模块 | 说明 | 进度 |
 |---------|------|------|
-| 🔵 Paradex DEX | 真实下单与持仓管理 | 🚧 80% |
-| 🔵 Extended DEX | 真实下单与持仓管理 | 🚧 80% |
-| 📈 高级套利策略 | 多腿套利 + 对冲优化 | 🚧 50% |
-
-### ⏸️ 待启用功能
-
-- EdgeX、Backpack、Aster、GRVT 等 DEX（代码已保留）
-- 更多 CEX 集成（代码框架已完成）
+| 🔵 Paradex 真实交易 | 真实下单与持仓管理 | 🚧 待测试 |
+| 🔵 Lighter 真实交易 | 真实下单与持仓管理 | 🚧 待测试 |
+| 📈 跨DEX套利 | 42种配对实盘套利 | 🚧 待测试 |
 
 ---
 
@@ -356,66 +352,42 @@ snapshot = orchestrator.current_snapshot()
 
 ## 交易所集成状态
 
-### 🟢 主力 DEX（开发中）
+### 🟢 已完成集成 (8个交易所)
 
-#### Paradex
-- **类型**: Layer 2 DEX (Starknet)
-- **官网**: https://paradex.trade
-- **API 文档**: https://docs.paradex.trade/api/
-- **状态**: 🚧 集成中
-  - ✅ 行情获取 (REST + WebSocket)
-  - 🚧 下单接口（80% 完成）
-  - ⏸️ 提现接口（禁用）
-- **认证方式**: JWT + STARK 签名
-- **支持合约**: BTC-USD-PERP, ETH-USD-PERP 等永续合约
-- **最小下单**: 10 USDT
-- **费率**: Maker 0% / Taker 0.025%
-- **限速**: 100 req/min (账户级)
-- **特点**:
-  - 零 Maker 费
-  - 自托管（非托管）
-  - 链上结算
+| 交易所 | 类型 | 代码行数 | 签名方式 | 状态 |
+|--------|------|----------|----------|------|
+| **Paradex** | DEX (Starknet) | 586行 | STARK签名 | ✅ 完成 |
+| **Extended** | DEX (Starknet) | 362行 | STARK签名+REST | ✅ 完成 |
+| **Lighter** | DEX (Ethereum L2) | 380行 | lighter-v1-python SDK | ✅ 完成 |
+| **EdgeX** | DEX | 280行 | HMAC-SHA256 | ✅ 完成 |
+| **Backpack** | DEX | 285行 | ED25519 | ✅ 完成 |
+| **GRVT** | DEX (ZK-rollup) | 340行 | grvt-pysdk SDK | ✅ 完成 |
+| **Aster** | DEX (BNB Chain) | 275行 | HMAC-SHA256 | ✅ 完成 |
+| **OKX** | CEX (参考价格) | 已存在 | HMAC | ✅ 完成 |
 
-#### Extended Exchange
-- **类型**: Layer 2 DEX (Starknet)
-- **官网**: https://extended.exchange
-- **API 文档**: https://api.docs.extended.exchange/
-- **状态**: 🚧 集成中
-  - ✅ 行情获取 (REST + WebSocket)
-  - 🚧 下单接口（80% 完成）
-  - ⏸️ 提现接口（禁用）
-- **认证方式**: API Key + STARK 签名
-- **支持合约**: 加密货币 + TradFi 资产永续合约
-- **最小下单**: 10 USDT
-- **费率**: Maker 0% / Taker 0.025%
-- **限速**: 自适应
-- **特点**:
-  - 统一保证金
-  - TradFi 资产（股票、商品）
-  - 最高 100x 杠杆
+### 每个客户端实现的功能
 
-### 🟡 参考价格源（仅行情）
+- ✅ `connect()` - 连接并初始化
+- ✅ `get_current_price()` - 获取实时价格
+- ✅ `get_orderbook()` - 获取订单簿深度
+- ✅ `place_open_order()` - 下单 (LIMIT/MARKET)
+- ✅ `place_close_order()` - 平仓
+- ✅ `cancel_order()` - 撤单
+- ✅ `get_active_orders()` - 查询活跃订单
+- ✅ `get_account_positions()` - 查询持仓
+- ✅ `get_account_balances()` - 查询余额
 
-#### OKX
-- **用途**: 提供参考价格，过滤异常波动
-- **状态**: ✅ 已集成（仅行情）
-- **不参与**: 套利下单（纯CEX，不在本项目DEX套利范围）
-- **接口**: `exchanges/okx_client.py`
+### 套利配对支持
 
-#### Binance
-- **用途**: 提供参考价格，过滤异常波动
-- **状态**: ✅ 已集成（仅行情）
-- **不参与**: 套利下单
-- **接口**: `exchanges/binance_client.py`
+- **总计 42 种 DEX 配对**（7个DEX两两组合）
+- **优先级配对**: Paradex↔Extended, Lighter↔GRVT, Backpack↔Aster
 
-### ⏸️ 待启用 DEX
+### 参考价格源
 
-| 交易所 | 类型 | 状态 | 计划 |
-|--------|------|------|------|
-| EdgeX | DEX | ⏸️ 代码保留 | Paradex/Extended 测试完成后启用 |
-| Backpack | DEX | ⏸️ 代码保留 | 同上 |
-| Aster | DEX | ⏸️ 代码保留 | 同上 |
-| GRVT | DEX | ⏸️ 代码保留 | 同上 |
+| 交易所 | 用途 | 状态 |
+|--------|------|------|
+| OKX | 参考价格，过滤异常波动 | ✅ 已集成 |
+| Binance | 参考价格 | ✅ 已集成 |
 
 ---
 
@@ -447,15 +419,28 @@ perp-tools/
 │   │   └── arbitrage_executor.py     # 套利执行器（双边下单+对冲）
 │   │
 │   ├── capital_orchestrator.py       # 💰 资金总控（3层资金管理）
+│   ├── config_enhanced.py            # ⚙️ 配置增强（验证+热重载）
 │   ├── risk_manager.py               # 🛡️ 风险管理器（账户级风控）
 │   ├── position_guard.py             # 🔒 仓位守卫（单笔风险限制）
 │   ├── hedge_volume_engine.py        # ⚡ 刷量引擎（对冲刷量）
 │   │
+│   ├── strategy/                     # 📈 策略模块
+│   │   ├── take_profit.py            # 基础止盈策略
+│   │   └── advanced_strategies.py    # 追踪止损/网格交易/动态仓位
+│   │
+│   ├── connections/                  # 🔌 连接管理
+│   │   └── ws_manager.py             # WebSocket统一管理器
+│   │
 │   └── monitoring/                   # 📊 监控模块
 │       ├── alerts.py                 # 提醒系统（多条件+多渠道）
+│       ├── notifications.py          # 增强通知（Telegram/Discord/微信/飞书/邮件）
 │       ├── web_console.py            # Web 控制台（FastAPI）
 │       └── static/
 │           └── index.html            # Web 前端界面
+│
+├── test_all_exchanges.py             # 🧪 通用交易所测试框架
+├── test_close_position.py            # 测试平仓功能
+├── test_tp_sl_complete.py            # 测试止盈止损
 │
 ├── docs/                             # 📚 文档目录
 │   ├── ARCHITECTURE.md               # 架构设计文档
@@ -467,12 +452,13 @@ perp-tools/
 │
 ├── config.example.yaml               # ⚙️ 配置模板
 ├── requirements.txt                  # 📦 Python 依赖
-├── .env.example                      # 🔐 环境变量模板
+├── .env.example                      # 🔐 环境变量模板（含8个交易所配置）
 ├── README.md                         # 📖 本文档
 ├── BRANCH_ANALYSIS.md                # 分支分析文档
 ├── DELIVERY_SUMMARY.md               # 交付总结
 └── perpbot-important-architecture.md # 重要架构说明
 ```
+
 
 ---
 
@@ -582,8 +568,19 @@ if reservation.approved:
         # 释放资金
         orchestrator.release(reservation)
 else:
-    logger.warning(f"资金申请被拒: {reservation.reason}")
+logger.warning(f"资金申请被拒: {reservation.reason}")
 ```
+
+### 执行引擎 (`execution/execution_engine.py`)
+
+ExecutionEngine 负责将套利信号转成可执行计划，并在 maker/taker、降级和 fallback 之间找平衡。
+
+- `plan_execution(...)`：根据双方流动性评分、费率、降级状态生成 `ExecutionPlan`，提前确定对冲腿与返佣腿的下单类型。
+- `validate_execution_constraints(...)`：对 DOUBLE_MAKER、刷量模式、未对冲额度等做硬性校验，避免在风控之外出现高风险下单。
+- `record_execution_outcome(...)`：套利执行完毕后回写实际表现，MakerTracker 会按填单率/回退率自动降级或恢复。
+- 内置 `MakerFillEstimator` 和 `MakerTracker`，可在 `execution_config` 中调节未对冲额度、maker 超时等容忍参数。
+
+当前版本的 `ArbitrageExecutor` 会在每笔机会执行前调用 `plan_execution`，并在 maker 未成交时自动 fallback 到 taker，再由执行引擎记录结果，确保套利腿和对冲腿的闭环。
 
 ### 3. 交易所基类 (`exchanges/base.py`)
 
@@ -1046,6 +1043,8 @@ arbitrage:
     profit_weight: 0.5              # 利润权重 50%
     liquidity_weight: 0.3           # 流动性权重 30%
     reliability_weight: 0.2         # 可靠性权重 20%
+
+> 说明：实际运行时会依据 `config.example.yaml` 中的 `arbitrage_trade_size` 与 `arbitrage_min_profit_pct`，结合最新中间价计算绝对利润门槛，既能按比例控制期望收益，也避免在行情低价时出现“不切实际的绝对值”过滤。
 
 # ========================================
 # 风控配置
@@ -1629,6 +1628,12 @@ PYTHONPATH=src python -m perpbot.cli emergency_close_all
 ---
 
 ## 更新日志
+
+### 2025-01-XX: 套利执行链路升级
+- ✅ ArbitrageExecutor 现已调用 ExecutionEngine 生成执行计划，自动区分对冲腿/maker 返佣腿并反馈到 MakerTracker。
+- ✅ 支持 maker 未成交自动 fallback 到 taker，同时记录降级指标，减少裸露风险。
+- ✅ 套利绝对利润门槛改为 `arbitrage_trade_size × 最新中间价 × arbitrage_min_profit_pct`，避免错误过滤有效信号。
+- ✅ README 配置说明与模块详解同步更新。
 
 ### 2024-12-XX: 三层资金管理重构
 - ✅ 将原 5 层简化为 3 层（刷量/套利/储备）
