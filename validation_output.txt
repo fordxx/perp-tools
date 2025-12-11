@@ -1,0 +1,65 @@
+======================================================================
+PERPBOT V2 SYSTEM VALIDATION
+======================================================================
+
+[PHASE 1] Directory Structure Validation
+----------------------------------------------------------------------
+✓ Directory: execution - Found at /home/fordxx/perp-tools/src/perpbot/execution
+✓ Directory: capital - Found at /home/fordxx/perp-tools/src/perpbot/capital
+✓ Directory: exposure - Found at /home/fordxx/perp-tools/src/perpbot/exposure
+✓ Directory: scanner - Found at /home/fordxx/perp-tools/src/perpbot/scanner
+✓ Directory: events - Found at /home/fordxx/perp-tools/src/perpbot/events
+✓ Directory: health - Found at /home/fordxx/perp-tools/src/perpbot/health
+✓ Directory: console - Found at /home/fordxx/perp-tools/src/perpbot/console
+✓ Directory: positions - Found at /home/fordxx/perp-tools/src/perpbot/positions
+✓ Directory: risk_manager.py - Found at /home/fordxx/perp-tools/src/perpbot/risk_manager.py
+
+[PHASE 2] Import Validation
+----------------------------------------------------------------------
+✗ Import: CapitalSnapshot - Unexpected error
+  Error: non-default argument 'used_margin' follows default argument
+✓ Import: UnifiedPosition - from models.position_snapshot import UnifiedPosition
+✓ Import: Order - from models.order import Order
+✓ Import: RiskManager - from perpbot.risk_manager import RiskManager
+✓ Import: ExecutionEngine - from perpbot.execution.execution_engine import ExecutionEngine
+✓ Import: ExecutionMode - from perpbot.execution.execution_mode import ExecutionMode
+✓ Import: SimpleCapitalOrchestrator - from perpbot.capital import SimpleCapitalOrchestrator
+✗ Import: CapitalSnapshotProvider - Unexpected error
+  Error: non-default argument 'used_margin' follows default argument
+✓ Import: ExposureAggregator - from perpbot.exposure.exposure_aggregator import ExposureAggregator
+✓ Import: PositionAggregator - from perpbot.positions.position_aggregator import PositionAggregator
+✓ Import: EventBus - from perpbot.events import EventBus
+✓ Import: EventKind - from perpbot.events import EventKind
+✓ Import: MarketScannerV3 - from perpbot.scanner.market_scanner_v3 import MarketScannerV3
+✓ Import: HealthMonitor - from perpbot.health.health_monitor import HealthMonitor
+✓ Import: ConsoleState - from perpbot.console.console_state import ConsoleState
+
+⚠ Import validation failed. Skipping instance tests.
+○ SYSTEM: Instance Tests - Imports failed
+○ SYSTEM: Integration Tests - Imports failed
+
+
+======================================================================
+PERPBOT V2 SYSTEM VALIDATION SUMMARY
+======================================================================
+✓ Directory                      9/9 PASS
+✗ Import                         13/15 PASS
+✓ SYSTEM                         0/2 PASS
+----------------------------------------------------------------------
+Total Tests:     26
+Passed:          22 (84.6%)
+Failed:          2
+Warnings:        0
+Skipped:         2
+Elapsed Time:    0.20s
+----------------------------------------------------------------------
+TOTAL SCORE:     86.2/100
+======================================================================
+
+FAILED TESTS:
+  ✗ Import: CapitalSnapshot
+    Unexpected error
+    Error: non-default argument 'used_margin' follows default argument
+  ✗ Import: CapitalSnapshotProvider
+    Unexpected error
+    Error: non-default argument 'used_margin' follows default argument

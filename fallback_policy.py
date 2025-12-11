@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-from ..models.order_request import OrderRequest
+from models.order_request import OrderRequest
 
 
 @dataclass
@@ -62,6 +62,7 @@ class MakerToTakerFallback(BaseFallbackPolicy):
             side=original_request.side,
             size=remaining_size,
             limit_price=None,  # None indicates a Market order
+            strategy=original_request.strategy,
             is_fallback=True,
         )
 

@@ -2,9 +2,9 @@ import asyncio
 import logging
 from typing import Any, Dict
 
-from ..risk.kill_switch import KillSwitchV2
-from ..risk.risk_engine import RiskEngine
-from ..positions.position_aggregator import PositionAggregator
+from positions.position_aggregator import PositionAggregator
+from risk.kill_switch import KillSwitchV2
+from risk.risk_engine import RiskEngine
 
 logger = logging.getLogger(__name__)
 

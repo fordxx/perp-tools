@@ -3,8 +3,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
 
-from ..models.order import Order
-from ..models.order_request import OrderRequest
+from models.order import Order
+from models.order_request import OrderRequest
 
 logger = logging.getLogger(__name__)
 
