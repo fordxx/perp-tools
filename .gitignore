@@ -1,0 +1,142 @@
+# ============================
+# PerpBot Professional .gitignore
+# ============================
+
+##############
+# Python
+##############
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.pickle
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.out
+*.tmp
+
+##############
+# Virtual Environments (your project uses many venv_* directories)
+##############
+venv/
+venv_*/
+.venv/
+.env/
+.env*/        # 匹配 .env.test / .env.local 等
+*.env.bak
+.envrc
+.env.backup
+
+##############
+# API Keys / Secrets / Credentials
+##############
+*.key
+*.pem
+*.crt
+*.der
+*.p12
+*.pfx
+secrets/
+secret/
+credentials/
+*.secret
+*.token
+*.jwt
+
+# 禁止密钥意外被提交
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.mainnet
+.env.testnet
+
+##############
+# Logs / Cache / Temp
+##############
+logs/
+log/
+*.log
+*.stderr
+*.stdout
+cache/
+.cache/
+tmp/
+temp/
+data/
+run/
+workspace/
+output/
+outputs/
+results/
+profiles/
+
+##############
+# Build / Dist
+##############
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+##############
+# VSCode / Editor / JetBrains
+##############
+.vscode/
+.history/
+.idea/
+.ipynb_checkpoints/
+*.code-workspace
+
+##############
+# OS Files
+##############
+.DS_Store
+Thumbs.db
+desktop.ini
+
+##############
+# Node / Frontend
+##############
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.pnpm-debug.log
+
+##############
+# Web Console / Frontend builds
+##############
+web/dist/
+web/.vite/
+web/node_modules/
+
+##############
+# PerpBot Specific
+##############
+# Compiled StarkNet artifacts
+perpbot/**/compiled/
+perpbot/**/build/
+perpbot/**/cache/
+
+# AI 自动生成的临时文件
+*.bak
+*.backup
+*_backup
+*backup*
+*.swp
+
+# Jupyter / Research notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+##############
+# Docker
+##############
+docker-data/
+docker-compose.override.yml

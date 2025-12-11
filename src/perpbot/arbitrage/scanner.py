@@ -7,14 +7,26 @@ from perpbot.arbitrage.profit import ProfitContext, calculate_real_profit, resol
 from perpbot.arbitrage.volatility import SpreadVolatilityTracker
 from perpbot.models import ArbitrageOpportunity, ExchangeCost, PriceQuote
 
-DEX_ONLY_PAIRS = {
-    ("edgex", "paradex"),
-    ("paradex", "edgex"),
-    ("backpack", "aster"),
+# 所有支持的 DEX 交易所
+ALL_DEX_EXCHANGES = ["paradex", "extended", "lighter", "edgex", "backpack", "grvt", "aster"]
+
+# 生成所有 DEX 配对组合（双向）
+DEX_ONLY_PAIRS = set()
+for i, ex1 in enumerate(ALL_DEX_EXCHANGES):
+    for ex2 in ALL_DEX_EXCHANGES[i + 1:]:
+        DEX_ONLY_PAIRS.add((ex1, ex2))
+        DEX_ONLY_PAIRS.add((ex2, ex1))
+
+# 优先级配对（延迟较低、流动性较好的交易所组合）
+PRIORITY_PAIRS = {
+    ("paradex", "extended"),  # 同为 Starknet
+    ("extended", "paradex"),
+    ("lighter", "grvt"),      # 同为 ZK-rollup
+    ("grvt", "lighter"),
+    ("backpack", "aster"),    # 相似 API 风格
     ("aster", "backpack"),
-    ("grvt", "extended"),
-    ("extended", "grvt"),
 }
+
 
 
 def _effective_price(quote: PriceQuote, side: str, size: float, slippage_bps: float) -> float | None:

@@ -25,9 +25,7 @@ from typing import Optional, Literal
 from dotenv import load_dotenv
 
 from paradex_py import Paradex
-from paradex_py.environment import Environment
-from paradex_py.signer import PrivateKeySigner
-from paradex_py.api.models.order import Order, OrderType, OrderSide, TimeInForce
+from paradex_py.common.order import Order, OrderType, OrderSide
 from paradex_py.api.ws_client import ParadexWebsocketChannel
 
 # -------------------- 基础配置 --------------------
@@ -41,21 +39,17 @@ logger = logging.getLogger("paradex_ws_demo")
 load_dotenv()  # 读取 .env
 
 
-def get_env() -> Environment:
-    env_str = os.getenv("PARADEX_ENV", "PROD").upper()
-    if env_str == "TESTNET":
-        return Environment.TESTNET
-    return Environment.PROD
-
-
 def build_paradex() -> Paradex:
-    env = get_env()
+    env_str = os.getenv("PARADEX_ENV", "prod").lower()  # 'prod' or 'testnet'
     l2_key = os.environ["PARADEX_L2_PRIVATE_KEY"]
     account_addr = os.environ["PARADEX_ACCOUNT_ADDRESS"]
 
-    signer = PrivateKeySigner(l2_key)
-    client = Paradex(env=env, signer=signer, account_address=account_addr)
-    logger.info("Paradex SDK 初始化完成，环境=%s", env.value)
+    client = Paradex(
+        env=env_str,
+        l2_private_key=l2_key,
+        l1_address=account_addr,  # 使用 l1_address 参数
+    )
+    logger.info("Paradex SDK 初始化完成，环境=%s", env_str)
     return client
 
 
@@ -141,13 +135,10 @@ async def place_market_order(
 
     order = Order(
         market=MARKET,
-        price=None,  # 市价单 price=None
+        order_type=OrderType.Market,  # 使用 order_type 而不是 type
+        order_side=side_enum,          # 使用 order_side 而不是 side
         size=size,
-        side=side_enum,
-        type=OrderType.MARKET,
-        time_in_force=TimeInForce.FILL_OR_KILL,
-        reduce_only=False,
-        client_order_id=None,
+        limit_price=None,              # 市价单 limit_price=None
     )
 
     res = client.submit_order(order)

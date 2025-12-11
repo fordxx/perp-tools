@@ -35,6 +35,7 @@ EXCHANGE_NAMES = [
     "aster",
     "grvt",
     "extended",
+    "lighter",
     "okx",
 ]
 
@@ -385,6 +386,7 @@ def provision_exchanges() -> List[ExchangeClient]:
     from perpbot.exchanges.aster import AsterClient
     from perpbot.exchanges.grvt import GRVTClient
     from perpbot.exchanges.extended import ExtendedClient
+    from perpbot.exchanges.lighter import LighterClient
 
     exchange_builders = [
         (
@@ -393,12 +395,13 @@ def provision_exchanges() -> List[ExchangeClient]:
             lambda: OKXClient(use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"),
             ["OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"],
         ),
-        ("edgex", "dex", lambda: EdgeXClient(), ["EDGEX_API_KEY", "EDGEX_API_SECRET"]),
+        ("edgex", "dex", lambda: EdgeXClient(), ["EDGEX_API_KEY"]),
         ("backpack", "dex", lambda: BackpackClient(), ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"]),
-        ("paradex", "dex", lambda: ParadexClient(), ["PARADEX_API_KEY", "PARADEX_API_SECRET"]),
-        ("aster", "dex", lambda: AsterClient(), ["ASTER_API_KEY", "ASTER_API_SECRET"]),
-        ("grvt", "dex", lambda: GRVTClient(), ["GRVT_API_KEY", "GRVT_API_SECRET"]),
-        ("extended", "dex", lambda: ExtendedClient(), ["EXTENDED_API_KEY", "EXTENDED_API_SECRET"]),
+        ("paradex", "dex", lambda: ParadexClient(), ["PARADEX_L2_PRIVATE_KEY", "PARADEX_ACCOUNT_ADDRESS"]),
+        ("aster", "dex", lambda: AsterClient(), ["ASTER_API_KEY"]),
+        ("grvt", "dex", lambda: GRVTClient(), ["GRVT_API_KEY"]),
+        ("extended", "dex", lambda: ExtendedClient(), ["EXTENDED_API_KEY"]),
+        ("lighter", "dex", lambda: LighterClient(), ["LIGHTER_API_KEY"]),
     ]
 
     for name, venue_type, builder, required_keys in exchange_builders:

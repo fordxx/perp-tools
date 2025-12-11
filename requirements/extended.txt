@@ -1,0 +1,6 @@
+x10-python-trading-starknet==0.0.17
+websockets>=13.0,<14.0
+eth-account>=0.13
+aiohttp>=3.8
+httpx>=0.24
+fast-stark-crypto
