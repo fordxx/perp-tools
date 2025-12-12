@@ -97,6 +97,10 @@ exchange_costs:
     maker_fee_bps: 1.6
     taker_fee_bps: 2.6
     funding_rate: 0.0
+  hyperliquid:
+    maker_fee_bps: 2.0
+    taker_fee_bps: 2.5
+    funding_rate: 0.0
 alerts:
   - symbol: BTC/USDT
     condition: price_above

@@ -16,6 +16,8 @@ import httpx
 import websockets
 from dotenv import load_dotenv
 
+# Due to models/ being a package, we import from the parent perpbot.models which is models.py
+# Python will prefer models.py over models/ package when we do:
 from perpbot.models import (
     AlertCondition,
     Order,
@@ -37,6 +39,7 @@ EXCHANGE_NAMES = [
     "extended",
     "lighter",
     "okx",
+    "hyperliquid",
 ]
 
 logger = logging.getLogger(__name__)
