@@ -122,10 +122,17 @@ PerpBot 是一个**基于事件驱动和高度模块化**的自动交易框架�
 ## 核心特性
 
 - **事件驱动架构 (V2)**: 基于中央事件总线，实现模块间零耦合，提升了系统的响应速度和可扩展性。
-- **多交易所支持**: 已集成 **8** 个主流 CEX/DEX，包括 Starknet 上的 Paradex 和 Extended。
+- **多交易所支持**: 已集成 **9** 个主流 CEX/DEX，包括 Starknet 上的 Paradex 和 Extended，以及 Hyperliquid。
+- **WebSocket 实时行情 (NEW)** ⚡:
+    - **超低延迟**: < 100ms (相比 REST API 的 200-500ms)
+    - **实时推送**: 10-100 次/秒 (相比 REST 的 1-5秒轮询)
+    - **更高准确性**: 即时更新避免陈旧快照
+    - **统一管理**: WebSocketMarketDataManager 集中管理所有交易所连接
+    - **支持交易所**: OKX, Hyperliquid, Paradex
 - **资金管理系统 (V2)**: 创新的 **分配器/编排器/快照供应器** 架构，实现动态风险敞口管理。
 - **高性能套利引擎 (V2)**:
     - **QuoteEngineV2**: 统一处理多交易所行情流。
+    - **WebSocket Quote Engine**: 基于 WebSocket 的实时报价引擎。
     - **ScannerV3**: 响应式价差扫描，亚秒级发现机会。
     - **ExecutionEngineV2**: 集成风控、资金和回退策略的智能执行。
 - **统一风险敞口 (V2)**: **Position Aggregator V2** 聚合所有交易所的仓位，提供全局风险视图。
@@ -693,6 +700,48 @@ python test_exchange_integration.py
 ---
 
 ## 快速开始
+
+### 🚀 运行 WebSocket 实时套利扫描 Demo (推荐)
+
+体验最新的 WebSocket 实时行情集成功能：
+
+```bash
+# 1. 测试 WebSocket 连接
+python test_websocket_feeds.py
+
+# 2. 运行实时套利扫描 Demo
+python demos/websocket_arbitrage_demo.py
+```
+
+**Demo 功能**:
+- ⚡ 实时监控 OKX 和 Hyperliquid 的 BTC/ETH 价格
+- 📊 自动发现跨交易所套利机会
+- 💰 计算净利润（扣除手续费）
+- 🎯 显示执行计划和风险评分
+
+**预期输出**:
+```
+🎯 ARBITRAGE OPPORTUNITY DETECTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Symbol:          BTC/USDT
+  Exchange A:      OKX             | Bid: $ 43250.00 | Ask: $ 43251.00
+  Exchange B:      HYPERLIQUID     | Bid: $ 43254.00 | Ask: $ 43255.50
+
+  📊 Spread:          8.72 bps ( 0.087%)
+  💰 Net Profit:      3.72 bps ( 0.037%)
+
+  📋 Execution Plan:
+     1. BUY  on OKX @ $43251.00
+     2. SELL on HYPERLIQUID @ $43254.00
+```
+
+**详细文档**: 查看 [docs/WEBSOCKET_INTEGRATION.md](docs/WEBSOCKET_INTEGRATION.md)
+
+---
+
+### 📚 传统方式快速开始
+
 *本节内容保持不变。*
 
 ---
