@@ -3,13 +3,17 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-V2__Event--Driven-blueviolet)](ARCHITECTURE.md)
-[![Validation](https://img.shields.io/badge/System_Validation-99.0%2F100-success)](VALIDATION_FINAL_REPORT.md)
+[![Exchanges](https://img.shields.io/badge/Exchanges-13+-success)](FRAMEWORK_README.md)
+[![Test Framework](https://img.shields.io/badge/Test_Framework-Unified-brightgreen)](FRAMEWORK_README.md)
+[![Credentials](https://img.shields.io/badge/Credentials-Interactive-blue)](CREDENTIALS_QUICK_START.md)
 [![Production Ready](https://img.shields.io/badge/Production-Ready-brightgreen)]
 
-> 🚀 **当前架构**: `V2 - Event-Driven`
-> 🎯 **开发重点**: V2 架构稳定性与真实交易性能优化
+> 🚀 **当前架构**: `V2 - Event-Driven` + **统一交易所测试框架 v2.1**
+> 🎯 **开发重点**: V2 架构稳定性与真实交易性能优化 + 交易所集成
 > 💰 **测试规模**: 本金 1000 USDT，单笔约 10 USDT
 > ✅ **系统验证**: [99.0/100 - 生产就绪](VALIDATION_FINAL_REPORT.md)
+> 🔄 **交易所支持**: 13 个 (4 CEX + 9 DEX)
+> 🔐 **凭证管理**: 交互式配置工具
 
 ## 🎉 系统验证完成 - 99.0/100 分
 
@@ -55,6 +59,53 @@ python3 validate_perpbot_v2.py
 
 ---
 
+## � 统一交易所测试框架 v2.1
+
+**新增功能**: 支持 13 个交易所的统一测试框架 + 交互式凭证管理
+
+### ⚡ 快速开始 (30 秒)
+
+```bash
+# 1. 查看支持的交易所
+python test_exchanges.py --list
+
+# 2. 配置凭证（交互式）
+bash setup_credentials.sh
+
+# 3. 运行测试
+python test_exchanges.py okx binance hyperliquid
+```
+
+### 📋 支持的交易所 (13 个)
+
+| CEX (中心化) | DEX (去中心化) |
+|:---|:---|
+| OKX | Hyperliquid ✅ |
+| Binance | Paradex ✅ |
+| Bitget | Extended ✅ |
+| Bybit | Lighter |
+| | EdgeX |
+| | Backpack |
+| | GRVT |
+| | Aster |
+| | Sunx |
+
+✅ = 已配置的交易所
+
+### 📚 详细文档
+
+| 文档 | 用途 |
+|:---|:---|
+| [FRAMEWORK_README.md](FRAMEWORK_README.md) | 框架总览 |
+| [QUICK_TEST_GUIDE.md](QUICK_TEST_GUIDE.md) | 5 分钟快速开始 |
+| [CREDENTIALS_QUICK_START.md](CREDENTIALS_QUICK_START.md) | 凭证配置快速开始 |
+| [COMMAND_CHEATSHEET.md](COMMAND_CHEATSHEET.md) | 命令速查表 |
+| [EXCHANGE_TEST_GUIDE.md](EXCHANGE_TEST_GUIDE.md) | 完整使用指南 |
+
+**已归档旧文件:** [archive/README.md](archive/README.md) - 23 个旧测试 + 12 个旧文档已归档
+
+---
+
 ## 📌 AI Developer Notice
 
 > 本仓库允许多 AI 协作开发（ChatGPT / Claude / Cursor / Codeium）。  
@@ -76,6 +127,7 @@ python3 validate_perpbot_v2.py
 
 - [项目概述](#项目概述)
 - [核心特性](#核心特性)
+- [🚀 统一交易所测试框架 v2.1](#-统一交易所测试框架-v21)
 - [📊 系统 SLO (服务级别目标)](#-系统-slo-服务级别目标)
 - [V2 系统架构](#v2-系统架构)
 - [目录结构](#目录结构)
@@ -92,7 +144,6 @@ python3 validate_perpbot_v2.py
 - [常见问题](#常见问题)
 - [术语表](#术语表)
 - [更新日志](#更新日志)
-
 
 ---
 
