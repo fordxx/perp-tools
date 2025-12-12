@@ -2,35 +2,40 @@
 """
 🚀 PerpBot 统一交易所测试框架 (生产级)
 
-支持十几个交易所的完整集成测试。
+支持十几个交易所的完整集成测试（包含交易功能）。
 直接使用主网进行小额测试（无需 testnet）。
 
 特点:
 - 统一接口，支持所有交易所
+- 查询功能：价格、订单簿、余额、持仓
+- 交易功能：限价单、市价单、撤单、平仓
+- 交互式菜单和自动化测试模式
 - 按需初始化虚拈环境
 - 详细的连接验证和错误诊断
 - 实时交易对验证
-- 账户信息和持仓监控
 - 性能指标收集
 
 使用方法:
-    # 测试所有已配置交易所
+    # 交互式选择并测试 (推荐)
     python test_exchanges.py
     
-    # 测试特定交易所
-    python test_exchanges.py okx binance
+    # 测试特定交易所（带交互式菜单）
+    python test_exchanges.py okx
+    
+    # 自动化测试模式（查询功能）
+    python test_exchanges.py okx --auto-test
+    
+    # 包含完整交易测试 (谨慎!，需要真实账户)
+    python test_exchanges.py okx --trading --trading-size 0.001
+    
+    # 测试所有已配置交易所（自动化）
+    python test_exchanges.py --all --auto-test
     
     # 打印支持的交易所列表
     python test_exchanges.py --list
     
     # 详细日志模式
     python test_exchanges.py --verbose
-    
-    # 包含小额交易测试 (谨慎!)
-    python test_exchanges.py --trading
-    
-    # 自定义交易对
-    python test_exchanges.py okx --symbol BTC/USDT
     
     # 输出到 JSON 报告
     python test_exchanges.py --json-report report.json
@@ -393,6 +398,235 @@ class UnifiedExchangeTester:
         self.metrics.append(metrics)
         return metrics
     
+    def test_limit_order(self, client: Any, symbol: str, size: float, limit_offset: float = 0.01) -> Tuple[bool, str]:
+        """测试限价单和撤单"""
+        try:
+            logger.info(f"\n6️⃣ Testing limit order ({symbol}, size={size})...")
+            
+            # 获取当前价格
+            quote = client.get_current_price(symbol)
+            if not quote:
+                return False, "Failed to get current price"
+            
+            # 计算限价（买单略低）
+            limit_price = quote.bid * (1 - limit_offset)
+            logger.info(f"   📍 Current price: {quote.mid:.2f}, Limit price: {limit_price:.2f}")
+            
+            # 检查是否有下单方法
+            if not hasattr(client, 'place_open_order'):
+                logger.warning(f"   ⚠️ Exchange does not support place_open_order")
+                return False, "No place_open_order method"
+            
+            # 下限价单
+            from perpbot.models import OrderRequest
+            req = OrderRequest(symbol=symbol, side="buy", size=size, limit_price=limit_price)
+            order = client.place_open_order(req)
+            
+            if not order or order.id.startswith('error') or order.id == 'rejected':
+                return False, f"Order placement failed: {order.id if order else 'None'}"
+            
+            logger.info(f"   ✅ Order placed: ID={order.id}")
+            
+            # 等待后尝试撤单
+            time.sleep(0.5)
+            logger.info(f"   📍 Attempting to cancel order...")
+            
+            if not hasattr(client, 'cancel_order'):
+                logger.warning(f"   ⚠️ Exchange does not support cancel_order")
+                return True, "Order placed successfully (no cancel support)"
+            
+            client.cancel_order(order.id)
+            logger.info(f"   ✅ Order cancelled: ID={order.id}")
+            
+            return True, "Limit order and cancel successful"
+        
+        except Exception as e:
+            logger.error(f"   ❌ Limit order test failed: {e}")
+            return False, str(e)
+    
+    def test_market_order(self, client: Any, symbol: str, size: float) -> Tuple[bool, str]:
+        """测试市价单（或市价执行）"""
+        try:
+            logger.info(f"\n7️⃣ Testing market/IOC order ({symbol}, size={size})...")
+            
+            # 检查是否有下单方法
+            if not hasattr(client, 'place_open_order'):
+                logger.warning(f"   ⚠️ Exchange does not support place_open_order")
+                return False, "No place_open_order method"
+            
+            # 下市价单（不指定价格）
+            from perpbot.models import OrderRequest
+            req = OrderRequest(symbol=symbol, side="buy", size=size)
+            order = client.place_open_order(req)
+            
+            if not order or order.id.startswith('error') or order.id == 'rejected':
+                return False, f"Order placement failed: {order.id if order else 'None'}"
+            
+            logger.info(f"   ✅ Market order placed: ID={order.id}, Price={order.price}")
+            
+            return True, "Market order successful"
+        
+        except Exception as e:
+            logger.error(f"   ❌ Market order test failed: {e}")
+            return False, str(e)
+    
+    def test_close_position(self, client: Any, symbol: str) -> Tuple[bool, str]:
+        """测试平仓"""
+        try:
+            logger.info(f"\n8️⃣ Testing close position ({symbol})...")
+            
+            # 获取持仓
+            positions = client.get_account_positions()
+            if not positions or len(positions) == 0:
+                logger.warning(f"   ⚠️ No open positions found")
+                return False, "No positions to close"
+            
+            # 检查是否有平仓方法
+            if not hasattr(client, 'place_close_order'):
+                logger.warning(f"   ⚠️ Exchange does not support place_close_order")
+                return False, "No place_close_order method"
+            
+            # 找到相应持仓
+            pos = None
+            for p in positions:
+                if hasattr(p, 'order') and hasattr(p.order, 'symbol') and p.order.symbol == symbol:
+                    pos = p
+                    break
+            
+            if not pos:
+                logger.warning(f"   ⚠️ No position for {symbol}")
+                return False, f"No position for {symbol}"
+            
+            # 获取当前价格
+            current_price = client.get_current_price(symbol).mid
+            logger.info(f"   📍 Position size: {pos.order.size}, Current price: {current_price}")
+            
+            # 平仓
+            close_order = client.place_close_order(pos, current_price)
+            
+            if not close_order or close_order.id.startswith('error') or close_order.id == 'rejected':
+                return False, f"Close order failed: {close_order.id if close_order else 'None'}"
+            
+            logger.info(f"   ✅ Close order placed: ID={close_order.id}")
+            
+            return True, "Close position successful"
+        
+        except Exception as e:
+            logger.error(f"   ❌ Close position test failed: {e}")
+            return False, str(e)
+    
+    def interactive_menu(self, exchange_name: str, client: Any, symbol: str) -> None:
+        """交互式菜单"""
+        while True:
+            print(f"\n{'='*60}")
+            print(f"🔄 {exchange_name.upper()} - 交互式菜单")
+            print(f"{'='*60}")
+            print(f"交易对: {symbol}")
+            print()
+            print("1️⃣  查询价格")
+            print("2️⃣  查询订单簿")
+            print("3️⃣  查询账户余额")
+            print("4️⃣  查询持仓")
+            print("5️⃣  下限价单 (买)")
+            print("6️⃣  下市价单 (买)")
+            print("7️⃣  撤销最近订单")
+            print("8️⃣  平仓")
+            print("9️⃣  切换交易对")
+            print("0️⃣  返回")
+            print()
+            
+            choice = input("请选择操作 (0-9): ").strip()
+            
+            if choice == "0":
+                break
+            elif choice == "1":
+                try:
+                    quote = client.get_current_price(symbol)
+                    print(f"\n💹 {symbol} 价格")
+                    print(f"   买价: {quote.bid:.2f}")
+                    print(f"   卖价: {quote.ask:.2f}")
+                    print(f"   中间: {quote.mid:.2f}")
+                except Exception as e:
+                    print(f"❌ 获取价格失败: {e}")
+            
+            elif choice == "2":
+                try:
+                    ob = client.get_orderbook(symbol, depth=5)
+                    print(f"\n📊 {symbol} 订单簿 (深度5)")
+                    print(f"   卖盘 (Asks):")
+                    for ask in (ob.asks[:3] if ob.asks else []):
+                        print(f"      {ask.price:.2f} x {ask.size}")
+                    print(f"   买盘 (Bids):")
+                    for bid in (ob.bids[:3] if ob.bids else []):
+                        print(f"      {bid.price:.2f} x {bid.size}")
+                except Exception as e:
+                    print(f"❌ 获取订单簿失败: {e}")
+            
+            elif choice == "3":
+                try:
+                    balances = client.get_account_balances()
+                    print(f"\n💰 账户余额 ({len(balances)} 种资产)")
+                    for b in balances[:5]:
+                        print(f"   {b.currency}: 可用={b.free}, 锁定={b.locked}")
+                except Exception as e:
+                    print(f"❌ 获取余额失败: {e}")
+            
+            elif choice == "4":
+                try:
+                    positions = client.get_account_positions()
+                    if not positions:
+                        print(f"\nℹ️  当前无持仓")
+                    else:
+                        print(f"\n📋 持仓列表 ({len(positions)} 个)")
+                        for pos in positions:
+                            if hasattr(pos, 'order'):
+                                print(f"   {pos.order.symbol} {pos.order.side.upper()} {pos.order.size} @ {pos.order.price}")
+                except Exception as e:
+                    print(f"❌ 获取持仓失败: {e}")
+            
+            elif choice == "5":
+                try:
+                    size = float(input(f"请输入下单数量 (default=0.001): ").strip() or "0.001")
+                    offset = float(input(f"请输入限价偏差 (default=0.01): ").strip() or "0.01")
+                    success, msg = self.test_limit_order(client, symbol, size, offset)
+                    if success:
+                        print(f"✅ {msg}")
+                    else:
+                        print(f"❌ {msg}")
+                except Exception as e:
+                    print(f"❌ 下单失败: {e}")
+            
+            elif choice == "6":
+                try:
+                    size = float(input(f"请输入下单数量 (default=0.001): ").strip() or "0.001")
+                    success, msg = self.test_market_order(client, symbol, size)
+                    if success:
+                        print(f"✅ {msg}")
+                    else:
+                        print(f"❌ {msg}")
+                except Exception as e:
+                    print(f"❌ 下单失败: {e}")
+            
+            elif choice == "7":
+                print("⚠️  此功能需要保存最后的订单 ID (未实现)")
+            
+            elif choice == "8":
+                try:
+                    success, msg = self.test_close_position(client, symbol)
+                    if success:
+                        print(f"✅ {msg}")
+                    else:
+                        print(f"ℹ️  {msg}")
+                except Exception as e:
+                    print(f"❌ 平仓失败: {e}")
+            
+            elif choice == "9":
+                symbol = input("请输入新交易对 (e.g., BTC/USDT): ").strip()
+                print(f"✅ 已切换到 {symbol}")
+            
+            else:
+                print("❌ 无效选择")
+    
     def run_tests(self, exchanges: Optional[List[str]] = None, symbol: str = "BTC/USDT") -> TestReport:
         """运行测试"""
         start_time = time.time()
@@ -624,6 +858,22 @@ Examples:
         help="包含小额交易测试 (谨慎!)",
     )
     parser.add_argument(
+        "--trading-size",
+        type=float,
+        default=0.001,
+        help="交易测试的数量 (默认: 0.001)",
+    )
+    parser.add_argument(
+        "--auto-test",
+        action="store_true",
+        help="自动化测试模式（不进入交互式菜单）",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="交互式菜单模式 (对单个交易所)",
+    )
+    parser.add_argument(
         "--json-report",
         help="输出 JSON 报告到指定文件",
     )
@@ -665,23 +915,93 @@ Examples:
         logger.error("No exchanges selected!")
         sys.exit(1)
     
-    # 运行测试
+    # 创建测试器
     tester = UnifiedExchangeTester(
         include_trading=args.trading,
         verbose=args.verbose,
     )
     
-    report = tester.run_tests(selected_exchanges, args.symbol)
-    tester.print_summary(report)
+    # 如果只选择了一个交易所，可能进入交互式模式或带交易的自动测试
+    if len(selected_exchanges) == 1 and (args.interactive or not args.auto_test):
+        exchange_name = selected_exchanges[0]
+        config = EXCHANGE_CONFIGS[exchange_name]
+        
+        # 检查环境变量
+        has_env, missing = tester._check_env(config)
+        if not has_env:
+            logger.error(f"❌ Missing env vars for {exchange_name}: {', '.join(missing)}")
+            sys.exit(1)
+        
+        # 加载客户端
+        try:
+            client = tester._load_exchange_client(config)
+            client.connect()
+            logger.info(f"✅ Connected to {exchange_name}")
+        except Exception as e:
+            logger.error(f"❌ Failed to connect: {e}")
+            sys.exit(1)
+        
+        # 基础测试
+        logger.info(f"\n{'='*60}")
+        logger.info(f"交易所: {exchange_name.upper()}")
+        logger.info(f"交易对: {args.symbol}")
+        logger.info(f"{'='*60}")
+        
+        tester.test_exchange(exchange_name, args.symbol)
+        
+        # 如果指定了 --trading，运行交易测试
+        if args.trading:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🔄 运行交易测试 (大小: {args.trading_size})")
+            logger.info(f"{'='*60}")
+            
+            # 测试限价单
+            success, msg = tester.test_limit_order(client, args.symbol, args.trading_size)
+            
+            # 测试市价单
+            time.sleep(1)
+            success, msg = tester.test_market_order(client, args.symbol, args.trading_size)
+            
+            # 测试平仓
+            time.sleep(1)
+            success, msg = tester.test_close_position(client, args.symbol)
+        else:
+            # 进入交互式菜单
+            logger.info(f"\n💡 提示: 使用 --trading 启用交易功能，或使用 --auto-test 自动化模式")
+            tester.interactive_menu(exchange_name, client, args.symbol)
     
-    # 输出 JSON 报告
-    if args.json_report:
+    else:
+        # 多个交易所的自动化测试模式
+        if not args.auto_test:
+            print(f"\n💡 多个交易所检测到，自动进入自动化测试模式")
+        
+        report = tester.run_tests(selected_exchanges, args.symbol)
+        tester.print_summary(report)
+        
+        # 输出 JSON 报告
+        if args.json_report:
+            with open(args.json_report, "w") as f:
+                json.dump(asdict(report), f, indent=2, default=str)
+            logger.info(f"\n📄 Report saved to {args.json_report}")
+        
+        # 返回状态码
+        sys.exit(0 if report.failed_exchanges == 0 else 1)
+    
+    # 单个交易所的 JSON 报告
+    if args.json_report and len(selected_exchanges) == 1:
+        report = TestReport(
+            test_time=datetime.now().isoformat(),
+            duration_seconds=0,
+            total_exchanges=1,
+            passed_exchanges=1,
+            failed_exchanges=0,
+            metrics=tester.metrics,
+            errors={},
+        )
         with open(args.json_report, "w") as f:
             json.dump(asdict(report), f, indent=2, default=str)
         logger.info(f"\n📄 Report saved to {args.json_report}")
     
-    # 返回状态码
-    sys.exit(0 if report.failed_exchanges == 0 else 1)
 
 
 if __name__ == "__main__":

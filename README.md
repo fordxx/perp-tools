@@ -8,7 +8,7 @@
 [![Credentials](https://img.shields.io/badge/Credentials-Interactive-blue)](CREDENTIALS_QUICK_START.md)
 [![Production Ready](https://img.shields.io/badge/Production-Ready-brightgreen)]
 
-> 🚀 **当前架构**: `V2 - Event-Driven` + **统一交易所测试框架 v2.1**
+> 🚀 **当前架构**: `V2 - Event-Driven` + **统一交易所测试框架 v2.2** (含交易功能)
 > 🎯 **开发重点**: V2 架构稳定性与真实交易性能优化 + 交易所集成
 > 💰 **测试规模**: 本金 1000 USDT，单笔约 10 USDT
 > ✅ **系统验证**: [99.0/100 - 生产就绪](VALIDATION_FINAL_REPORT.md)
@@ -59,9 +59,9 @@ python3 validate_perpbot_v2.py
 
 ---
 
-## � 统一交易所测试框架 v2.1
+## 🚀 统一交易所测试框架 v2.2 (全新交易功能)
 
-**新增功能**: 支持 13 个交易所的统一测试框架 + 交互式凭证管理
+**新版本特性**: 支持 13 个交易所 + 完整交易功能（下单、撤单、平仓、交互式菜单）
 
 ### ⚡ 快速开始 (30 秒)
 
@@ -72,37 +72,35 @@ python test_exchanges.py --list
 # 2. 配置凭证（交互式）
 bash setup_credentials.sh
 
-# 3. 运行测试
-python test_exchanges.py okx binance hyperliquid
+# 3. 选择模式运行:
+
+# 模式 A: 交互式菜单（推荐）
+python test_exchanges.py okx
+
+# 模式 B: 自动化测试
+python test_exchanges.py extended --auto-test
+
+# 模式 C: 完整交易测试（下单+撤单+平仓）
+python test_exchanges.py hyperliquid --auto-test --trading --trading-size 0.001
 ```
 
-### 📋 支持的交易所 (13 个)
+### ✨ 新增功能 (v2.2)
 
-| CEX (中心化) | DEX (去中心化) |
+- 🎯 **下单**: 限价单、市价单
+- ❌ **撤单**: 取消挂单
+- 📍 **平仓**: 自动平仓
+- 💬 **交互式菜单**: 9 个操作选项
+- 🤖 **自动化交易**: 完整的测试流程
+
+### 📚 推荐阅读
+
+| 文档 | 说明 |
 |:---|:---|
-| OKX | Hyperliquid ✅ |
-| Binance | Paradex ✅ |
-| Bitget | Extended ✅ |
-| Bybit | Lighter |
-| | EdgeX |
-| | Backpack |
-| | GRVT |
-| | Aster |
-| | Sunx |
-
-✅ = 已配置的交易所
-
-### 📚 详细文档
-
-| 文档 | 用途 |
-|:---|:---|
-| [FRAMEWORK_README.md](FRAMEWORK_README.md) | 框架总览 |
-| [QUICK_TEST_GUIDE.md](QUICK_TEST_GUIDE.md) | 5 分钟快速开始 |
-| [CREDENTIALS_QUICK_START.md](CREDENTIALS_QUICK_START.md) | 凭证配置快速开始 |
+| **[ENHANCED_TEST_GUIDE.md](ENHANCED_TEST_GUIDE.md)** | **v2.2 新功能详解** |
+| [QUICK_TEST_GUIDE.md](QUICK_TEST_GUIDE.md) | 快速开始（5 min）|
+| [EXCHANGE_TEST_GUIDE.md](EXCHANGE_TEST_GUIDE.md) | 完整指南（30 min）|
+| [CREDENTIALS_SETUP_GUIDE.md](CREDENTIALS_SETUP_GUIDE.md) | 凭证配置指南 |
 | [COMMAND_CHEATSHEET.md](COMMAND_CHEATSHEET.md) | 命令速查表 |
-| [EXCHANGE_TEST_GUIDE.md](EXCHANGE_TEST_GUIDE.md) | 完整使用指南 |
-
-**已归档旧文件:** [archive/README.md](archive/README.md) - 23 个旧测试 + 12 个旧文档已归档
 
 ---
 
