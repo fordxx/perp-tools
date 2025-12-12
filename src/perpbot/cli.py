@@ -126,6 +126,10 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
     )
     strategy = TakeProfitStrategy(profit_target_pct=cfg.profit_target_pct)
     quotes = market_bus.collect_quotes(exchanges, cfg.symbols)
+    reference_quote = next(iter(quotes), None)
+    reference_price = reference_quote.mid if reference_quote else 0.0
+    trade_notional = cfg.arbitrage_trade_size * reference_price
+    min_profit_abs = trade_notional * cfg.arbitrage_min_profit_pct
     for quote in quotes:
         state.quotes[f"{quote.exchange}:{quote.symbol}"] = quote
         history = state.price_history.setdefault(quote.symbol, [])
@@ -165,9 +169,7 @@ def single_cycle(cfg: BotConfig, state: TradingState) -> None:
         default_slippage_bps=cfg.default_slippage_bps,
         failure_probability=cfg.failure_probability,
         exchange_costs=cfg.exchange_costs,
-        min_profit_abs=cfg.arbitrage_trade_size * next(iter(state.quotes.values())).mid
-        if state.quotes
-        else 0.0,
+        min_profit_abs=min_profit_abs,
         volatility_tracker=volatility_tracker,
         high_vol_min_profit_pct=cfg.high_vol_min_profit_pct,
         low_vol_min_profit_pct=cfg.low_vol_min_profit_pct,

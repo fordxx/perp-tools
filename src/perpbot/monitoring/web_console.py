@@ -203,6 +203,10 @@ class TradingService:
             self.state.last_cycle_at = datetime.utcnow()
             self.state.status = "running" if self.state.trading_enabled else "paused"
             self._refresh_monitoring(quotes)
+            reference_quote = next(iter(quotes), None)
+            reference_price = reference_quote.mid if reference_quote else 0.0
+            trade_notional = self.cfg.arbitrage_trade_size * reference_price
+            min_profit_abs = trade_notional * self.state.min_profit_pct
 
             # 即便暂停交易也向前端展示套利机会
             opportunities = find_arbitrage_opportunities(
@@ -214,9 +218,7 @@ class TradingService:
                 default_slippage_bps=self.cfg.default_slippage_bps,
                 failure_probability=self.cfg.failure_probability,
                 exchange_costs=self.cfg.exchange_costs,
-                min_profit_abs=self.cfg.arbitrage_trade_size * next(iter(self.state.quotes.values())).mid
-                if self.state.quotes
-                else 0.0,
+                min_profit_abs=min_profit_abs,
                 volatility_tracker=self.volatility_tracker,
                 high_vol_min_profit_pct=self.cfg.high_vol_min_profit_pct,
                 low_vol_min_profit_pct=self.cfg.low_vol_min_profit_pct,

@@ -119,6 +119,16 @@ class HedgeExecutionResult:
     note: str = ""
 
 
+@dataclass
+class ExecutionPlan:
+    """执行前的计划结果"""
+
+    mode: ExecutionMode
+    decision: OrderTypeDecision
+    valid: bool = True
+    reason: Optional[str] = None
+
+
 class ExecutionEngine:
     """
     执行引擎
@@ -155,6 +165,76 @@ class ExecutionEngine:
             f"初始化执行引擎: mode={config.mode.value}, "
             f"max_unhedged={config.max_unhedged_notional_usd} USDT, "
             f"max_time={config.max_unhedged_time_ms}ms"
+        )
+
+    def plan_execution(
+        self,
+        buy_exchange: str,
+        sell_exchange: str,
+        symbol: str,
+        notional: float,
+        buy_liquidity_score: float,
+        sell_liquidity_score: float,
+        expected_pnl: Optional[float] = None,
+    ) -> ExecutionPlan:
+        """在真实下单前生成执行计划，供上层参考。"""
+
+        execution_mode = self.config.mode
+        if self.maker_tracker.is_degraded(buy_exchange, sell_exchange):
+            logger.warning(
+                "交易所对 %s<->%s 在降级冷却期，强制使用 SAFE_TAKER_ONLY",
+                buy_exchange,
+                sell_exchange,
+            )
+            execution_mode = ExecutionMode.SAFE_TAKER_ONLY
+
+        buy_maker_fee = self.fee_model.get_fee(buy_exchange, symbol, "buy", "maker")
+        sell_maker_fee = self.fee_model.get_fee(sell_exchange, symbol, "sell", "maker")
+        buy_taker_fee = self.fee_model.get_fee(buy_exchange, symbol, "buy", "taker")
+        sell_taker_fee = self.fee_model.get_fee(sell_exchange, symbol, "sell", "taker")
+
+        decision = decide_order_types(
+            execution_mode=execution_mode,
+            buy_exchange=buy_exchange,
+            sell_exchange=sell_exchange,
+            buy_liquidity_score=buy_liquidity_score,
+            sell_liquidity_score=sell_liquidity_score,
+            buy_maker_fee=buy_maker_fee,
+            sell_maker_fee=sell_maker_fee,
+            buy_taker_fee=buy_taker_fee,
+            sell_taker_fee=sell_taker_fee,
+            notional=notional,
+        )
+
+        valid, reason = validate_execution_constraints(
+            execution_mode=execution_mode,
+            notional=notional,
+            expected_pnl=expected_pnl or 0.0,
+            is_wash_mode=self.config.is_wash_mode,
+            config=self.config,
+        )
+        if not valid:
+            return ExecutionPlan(mode=execution_mode, decision=decision, valid=False, reason=reason)
+        return ExecutionPlan(mode=execution_mode, decision=decision)
+
+    def record_execution_outcome(
+        self,
+        buy_exchange: str,
+        sell_exchange: str,
+        decision: OrderTypeDecision,
+        success: bool,
+        had_fallback: bool = False,
+    ) -> None:
+        """将实际执行结果反馈给 maker tracker。"""
+
+        if not decision.may_fallback:
+            return
+        self.maker_tracker.record_maker_attempt(
+            buy_exchange,
+            sell_exchange,
+            is_filled=success,
+            is_timeout=not success,
+            is_fallback=had_fallback,
         )
 
     async def execute_hedge(

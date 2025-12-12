@@ -1,132 +1,142 @@
-# Byte-compiled / optimized / DLL files
+# ============================
+# PerpBot Professional .gitignore
+# ============================
+
+##############
+# Python
+##############
 __pycache__/
-*.py[cod]
-*$py.class
-
-# C extensions
-*.so
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-.python-version
-
-# pipenv
-Pipfile.lock
-
-# PEP 582
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# Trading bot specific
-data/
-*.csv
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.pickle
 *.db
 *.sqlite
-config.yaml
+*.sqlite3
+*.log
+*.out
+*.tmp
+
+##############
+# Virtual Environments (your project uses many venv_* directories)
+##############
+venv/
+venv_*/
+.venv/
+.env/
+.env*/        # 匹配 .env.test / .env.local 等
+*.env.bak
+.envrc
+.env.backup
+
+##############
+# API Keys / Secrets / Credentials
+##############
+*.key
+*.pem
+*.crt
+*.der
+*.p12
+*.pfx
+secrets/
+secret/
+credentials/
+*.secret
+*.token
+*.jwt
+
+# 禁止密钥意外被提交
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.mainnet
+.env.testnet
+
+##############
+# Logs / Cache / Temp
+##############
+logs/
+log/
+*.log
+*.stderr
+*.stdout
+cache/
+.cache/
+tmp/
+temp/
+data/
+run/
+workspace/
+output/
+outputs/
+results/
+profiles/
+
+##############
+# Build / Dist
+##############
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+##############
+# VSCode / Editor / JetBrains
+##############
 .vscode/
+.history/
 .idea/
+.ipynb_checkpoints/
+*.code-workspace
+
+##############
+# OS Files
+##############
+.DS_Store
+Thumbs.db
+desktop.ini
+
+##############
+# Node / Frontend
+##############
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.pnpm-debug.log
+
+##############
+# Web Console / Frontend builds
+##############
+web/dist/
+web/.vite/
+web/node_modules/
+
+##############
+# PerpBot Specific
+##############
+# Compiled StarkNet artifacts
+perpbot/**/compiled/
+perpbot/**/build/
+perpbot/**/cache/
+
+# AI 自动生成的临时文件
+*.bak
+*.backup
+*_backup
+*backup*
+*.swp
+
+# Jupyter / Research notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+##############
+# Docker
+##############
+docker-data/
+docker-compose.override.yml
