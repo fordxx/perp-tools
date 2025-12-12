@@ -481,6 +481,13 @@ class ExtendedClient(ExchangeClient):
         self._last_payload = payload
 
         try:
+            # DEBUG: Log order details before submission
+            TradingLogger.debug(
+                "Extended order details - market=%s, qty=%s (type: %s), price=%s (type: %s), side=%s, tif=%s",
+                market_name, quantity, type(quantity).__name__, price, type(price).__name__,
+                side.value, time_in_force.value
+            )
+            
             response = self._run_async(
                 self._trading_client.place_order(
                     market_name=market_name,

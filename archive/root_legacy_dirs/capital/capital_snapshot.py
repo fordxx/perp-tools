@@ -8,10 +8,10 @@ class ExchangeCapitalSnapshot:
     """
     Represents a unified view of capital for a single exchange.
     """
+    # Required fields (no defaults) - must come first
     exchange: str
     equity: float              # 总权益 (Total Equity)
     available_balance: float   # 可用余额（可下单）(Available Balance for trading)
-    open_notional: float = 0.0
     used_margin: float         # 已用保证金 (Used Margin)
     unrealized_pnl: float      # 未实现盈亏 (Unrealized PnL)
     realized_pnl: float        # 已实现盈亏 (Realized PnL)

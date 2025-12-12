@@ -1,4 +1,8 @@
-# Extended 交易测试计划
+# Extended 交易测试计划 (V2 Event-Driven)
+
+**版本:** V2  
+**最后更新:** 2025-12-12  
+**架构:** EventBus 驱动的异步执行
 
 ## 覆盖范围
 

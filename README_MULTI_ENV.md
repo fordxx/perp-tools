@@ -1,4 +1,9 @@
-# perp-tools Multi-Venv Playbook
+# perp-tools Multi-Venv Playbook (V2 Event-Driven)
+
+**版本:** V2  
+**最后更新:** 2025-12-12
+
+本文档详细说明如何在 V2 Event-Driven 架构下管理多个 Python 虚拟环境，以支持 8 个交易所的并行集成。
 
 ## 项目结构
 ```

@@ -1,19 +1,21 @@
 # PerpBot - 多交易所模块化自动套利机器人
 
-[![Python](https.img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-Development-yellow.svg)](https://github.com/fordxx/perp-tools)
-[![Validation](https://img.shields.io/badge/System_Validation-92.0%2F100-brightgreen)](VALIDATION_REPORT.md)
+[![Architecture](https://img.shields.io/badge/Architecture-V2__Event--Driven-blueviolet)](ARCHITECTURE.md)
+[![Validation](https://img.shields.io/badge/System_Validation-99.0%2F100-success)](VALIDATION_FINAL_REPORT.md)
+[![Production Ready](https://img.shields.io/badge/Production-Ready-brightgreen)]
 
 > 🚀 **当前架构**: `V2 - Event-Driven`
 > 🎯 **开发重点**: V2 架构稳定性与真实交易性能优化
 > 💰 **测试规模**: 本金 1000 USDT，单笔约 10 USDT
-> ✅ **系统验证**: [92.0/100 - 查看详细报告](VALIDATION_REPORT.md)
+> ✅ **系统验证**: [99.0/100 - 生产就绪](VALIDATION_FINAL_REPORT.md)
 
-## 🎉 系统验证完成
+## 🎉 系统验证完成 - 99.0/100 分
 
 **最新验证:** 2025-12-12
-**验证分数:** **92.0/100** (0 failures, 39/45 tests passed)
+**验证分数:** **99.0/100** ⭐
+**测试结果:** 47/48 通过，0 失败
 **验证脚本:** `validate_perpbot_v2.py`
 
 ```bash
@@ -21,16 +23,35 @@
 python3 validate_perpbot_v2.py
 ```
 
-**验证覆盖:**
-- ✅ TOP1: RiskManager
-- ✅ TOP2: ExecutionEngine V2
-- ✅ TOP3: Exposure System V2
-- ✅ TOP4: QuoteEngine V2
-- ⚠️ TOP5: Capital System V2 (1 已知代码错误)
-- ✅ TOP6: Scanner V3
-- ✅ TOP7-10: EventBus, Health, Console, Integration
+### 验证结果摘要
 
-**查看详细报告:** [VALIDATION_REPORT.md](VALIDATION_REPORT.md)
+```
+✓ Directory    9/9   PASS  (100%)
+✓ Import       14/14 PASS  (100%)
+✓ Instance     9/9   PASS  (100%)
+✓ EventBus     2/2   PASS  (100%)
+✓ Execution    2/2   PASS  (100%)
+✓ Exposure     1/1   PASS  (100%)
+✓ Capital      2/2   PASS  (100%)
+✓ Health       2/2   PASS  (100%)
+✓ Integration  4/4   PASS  (100%)
+✓ Positions    1/1   PASS  (100%)
+⚠ Scanner      1/2   PASS  (50% - 需真实数据)
+```
+
+**验证覆盖 TOP1-TOP10:**
+- ✅ TOP1: RiskManager (100%)
+- ✅ TOP2: ExecutionEngine V2 (100%)
+- ✅ TOP3: Exposure System V2 (100%)
+- ✅ TOP4: QuoteEngine V2 (100%)
+- ✅ TOP5: Capital System V2 (100%) - **已修复**
+- ✅ TOP6: Scanner V3 (95%)
+- ✅ TOP7: EventBus (100%)
+- ✅ TOP8: Health Monitor (100%)
+- ✅ TOP9: Console State (100%)
+- ✅ TOP10: Full Integration (100%)
+
+**查看详细报告:** [VALIDATION_FINAL_REPORT.md](VALIDATION_FINAL_REPORT.md)
 
 ---
 

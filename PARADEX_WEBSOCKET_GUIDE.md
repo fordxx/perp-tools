@@ -1,4 +1,9 @@
-# Paradex WebSocket 使用指南
+# Paradex WebSocket 使用指南 (V2 Event-Driven)
+
+**版本**: V2 (ExchangeConnectionManager 集成)  
+**最后更新**: 2025-12-12
+
+> 注: 本指南针对 V2 Event-Driven 架构进行了更新。Paradex WebSocket 连接现在通过 `ExchangeConnectionManager` 进行统一管理。
 
 ## 快速开始
 
