@@ -698,6 +698,93 @@ alerts:
 
 ---
 
+## 交易所集成层
+
+### 支持的 9 个交易所
+
+PerpBot 支持以下交易所，每个交易所实现 `ExchangeClient` 接口：
+
+```python
+class ExchangeClient(ABC):
+    """交易所客户端基类"""
+    
+    # 必须实现的接口
+    def connect(self) -> None:
+        """初始化连接，支持无凭证读写分离模式"""
+        
+    def get_current_price(self, symbol: str) -> PriceQuote:
+        """获取最优买卖价"""
+        
+    def get_orderbook(self, symbol: str, depth: int) -> OrderBookDepth:
+        """获取订单簿快照"""
+        
+    def place_open_order(self, request: OrderRequest) -> Order:
+        """下开仓单"""
+        
+    def place_close_order(self, request: OrderRequest) -> Order:
+        """下平仓单"""
+        
+    def get_active_orders(self, symbol: str) -> List[Order]:
+        """查询活跃订单"""
+        
+    def get_account_positions(self) -> List[Position]:
+        """查询账户持仓"""
+        
+    def get_account_balances(self) -> List[Balance]:
+        """查询账户余额"""
+```
+
+### 交易所实现矩阵
+
+| # | 交易所 | 类型 | 链 | 完成度 | 模式 | 文件 |
+|---|--------|------|-----|--------|------|------|
+| 1 | **Paradex** | DEX | Starknet | 100% | REST API | `exchanges/paradex.py` |
+| 2 | **Extended** | DEX | Starknet | 100% | REST API | `exchanges/extended.py` |
+| 3 | **OKX** | CEX | L1/L2 | 100% | ccxt | `exchanges/okx.py` |
+| 4 | **Lighter** | DEX | Ethereum L2 | 100% | REST + SDK | `exchanges/lighter.py` |
+| 5 | **EdgeX** | DEX | SVM | 100% | REST API | `exchanges/edgex.py` |
+| 6 | **Backpack** | DEX | Solana | 100% | REST + Ed25519 | `exchanges/backpack.py` |
+| 7 | **GRVT** | DEX | ZK-Rollup | 100% | REST + SDK | `exchanges/grvt.py` |
+| 8 | **Aster** | DEX | BNB Chain | 100% | REST API | `exchanges/aster.py` |
+| 9 | **Hyperliquid** | DEX | L1 | 100% | REST API | `exchanges/hyperliquid.py` |
+
+### 读写分离模式 (Mock Mode)
+
+**所有 9 个交易所均支持无凭证运行**，自动进入读写分离模式：
+
+```
+┌──────────────────────────────────┐
+│  交易所客户端初始化            │
+├──────────────────────────────────┤
+│ ✅ 有 API 密钥 (EXCHANGE_API_KEY)│
+│    ↓                             │
+│    初始化认证 HTTP 客户端        │
+│    设置 _trading_enabled = True  │
+│    ↓                             │
+│    完整模式 (读 + 写)            │
+│    • get_current_price()         │
+│    • place_open_order() ✓        │
+├──────────────────────────────────┤
+│ ✅ 无 API 密钥                   │
+│    ↓                             │
+│    初始化基础 HTTP 客户端        │
+│    设置 _trading_enabled = False │
+│    ↓                             │
+│    读写分离模式 (读 ✓ + 写 ✗)   │
+│    • get_current_price() ✓       │
+│    • place_open_order()          │
+│      → Order(id="rejected")      │
+└──────────────────────────────────┘
+```
+
+**特点**:
+- **优雅降级**: 无凭证时自动使用 mock 数据代替 API 调用
+- **交易保护**: 写操作自动拒绝，返回 `rejected` 订单
+- **开发友好**: 无需真实密钥即可测试系统
+- **监控使用**: 适合 24/7 市场监控和只读操作
+
+---
+
 ## 连接管理与恢复机制
 
 ### ExchangeConnectionManager

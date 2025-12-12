@@ -417,40 +417,266 @@ async def execute_plan(self, plan: ExecutionPlan):
 ---
 
 ## 🏦 如何新增一个交易所？
+
 系统具有良好的扩展性，新增一个交易所通常遵循以下步骤：
 
-1.  **实现 BaseExchange 接口**:
-    在 `src/perpbot/exchanges/` 目录下创建一个新的客户端文件，如 `my_exchange_client.py`。让你的客户端类继承 `BaseExchange`。
-    ```python
-    from .base import BaseExchange
+### 步骤 1: 实现 ExchangeClient 接口
 
-    class MyExchangeClient(BaseExchange):
-        # ...
-    ```
+在 `src/perpbot/exchanges/` 目录下创建一个新的客户端文件，如 `my_exchange.py`，继承 `ExchangeClient`：
 
-2.  **补齐核心方法**:
-    你必须实现 `BaseExchange` 中定义的所有抽象方法，主要包括：
-    - `connect()`
-    - `get_current_price()`
-    - `place_order()`
-    - `cancel_order()`
-    - `get_active_orders()`
-    - `get_account_positions()`
-    - `get_account_balances()`
+```python
+from perpbot.exchanges.base import ExchangeClient
+from perpbot.models import Balance, Order, OrderBookDepth, OrderRequest, Position, PriceQuote
 
-3.  **注册进 ConnectionManager**:
-    在 `ExchangeConnectionManager` 中，将你的新客户端加入到 `SUPPORTED_EXCHANGES` 字典中。
+class MyExchangeClient(ExchangeClient):
+    """My Exchange DEX client"""
+    
+    def __init__(self, use_testnet: bool = False) -> None:
+        self.name = "my_exchange"
+        self.venue_type = "dex"
+        self.use_testnet = use_testnet
+        self._client = None
+        self._trading_enabled = False
+    
+    def connect(self) -> None:
+        """初始化连接，支持无凭证模式"""
+        # 加载环境变量
+        self.api_key = os.getenv("MY_EXCHANGE_API_KEY")
+        
+        # 始终初始化基础客户端（支持读写分离）
+        try:
+            import httpx
+            self._client = httpx.Client(
+                base_url=self.base_url,
+                headers={"Content-Type": "application/json"},
+            )
+        except ImportError:
+            logger.error("httpx not available")
+        
+        # 如果有凭证，启用交易
+        if self.api_key:
+            self._trading_enabled = True
+            logger.info("✅ Connected with trading enabled")
+        else:
+            logger.warning("⚠️ Connected in read-only mode (no credentials)")
+```
 
-4.  **提供 Symbol Mapping (如果需要)**:
-    如果新交易所的交易对命名与其他交易所不同，你需要在配置或常量中提供一个映射关系。
+### 步骤 2: 实现必需的核心方法
 
-5.  **运行通用测试框架**:
-    使用 `test_all_exchanges.py` 脚本来验证你的新客户端是否符合所有接口规范。
+```python
+def get_current_price(self, symbol: str) -> PriceQuote:
+    """获取当前价格"""
+    try:
+        data = self._request("GET", f"/api/ticker", params={"symbol": symbol})
+        bid = float(data.get("bid", 0))
+        ask = float(data.get("ask", 0))
+        return PriceQuote(exchange=self.name, symbol=symbol, bid=bid, ask=ask, venue_type="dex")
+    except Exception as e:
+        logger.error(f"Price fetch failed: {e}")
+        # 返回零价格，不要抛出异常
+        return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0, venue_type="dex")
+
+def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
+    """获取订单簿"""
+    try:
+        data = self._request("GET", f"/api/depth", params={"symbol": symbol, "limit": depth})
+        bids = [(float(p), float(q)) for p, q in data.get("bids", [])[:depth]]
+        asks = [(float(p), float(q)) for p, q in data.get("asks", [])[:depth]]
+        return OrderBookDepth(bids=bids, asks=asks)
+    except Exception as e:
+        logger.error(f"Orderbook fetch failed: {e}")
+        # 返回空订单簿，不要抛出异常
+        return OrderBookDepth(bids=[], asks=[])
+
+def place_open_order(self, request: OrderRequest) -> Order:
+    """下开仓单"""
+    if not self._trading_enabled:
+        return Order(id="rejected", exchange=self.name, symbol=request.symbol,
+                    side=request.side, size=request.size, price=0.0)
+    # ... 实现具体下单逻辑
+
+def place_close_order(self, request: OrderRequest) -> Order:
+    """下平仓单"""
+    if not self._trading_enabled:
+        return Order(id="rejected", exchange=self.name, symbol=request.symbol,
+                    side=request.side, size=request.size, price=0.0)
+    # ... 实现具体下单逻辑
+
+# 其他必需方法: get_active_orders, cancel_order, get_account_positions, get_account_balances
+```
+
+### 步骤 3: 注册交易所
+
+#### 3a. 更新 base.py 中的 EXCHANGE_NAMES
+
+```python
+# src/perpbot/exchanges/base.py
+EXCHANGE_NAMES = [
+    "paradex",
+    "extended",
+    "okx",
+    "lighter",
+    "edgex",
+    "backpack",
+    "grvt",
+    "aster",
+    "hyperliquid",
+    "my_exchange",  # <-- 新增
+]
+```
+
+#### 3b. 更新 __init__.py
+
+```python
+# src/perpbot/exchanges/__init__.py
+from .my_exchange import MyExchangeClient
+
+__all__ = [
+    "ParadexClient",
+    "ExtendedClient",
+    "OKXClient",
+    "MyExchangeClient",  # <-- 新增
+    # ...
+]
+```
+
+### 步骤 4: 提供环境变量配置
+
+在 `.env` 或 `config.yaml` 中添加凭证配置：
+
+```yaml
+# config.yaml
+exchanges:
+  my_exchange:
+    api_key: "${MY_EXCHANGE_API_KEY}"
+    api_secret: "${MY_EXCHANGE_API_SECRET}"
+    use_testnet: false
+```
+
+### 步骤 5: 创建测试脚本
+
+参考 `test_aster.py` 或 `test_grvt.py`，创建 `test_my_exchange.py`：
+
+```python
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, "src")
+
+from perpbot.exchanges.my_exchange import MyExchangeClient
+
+client = MyExchangeClient()
+client.connect()
+
+# 测试价格
+price = client.get_current_price("BTC/USDT")
+print(f"Price: {price.bid} / {price.ask}")
+
+# 测试 Orderbook
+ob = client.get_orderbook("BTC/USDT", depth=5)
+print(f"Orderbook: {len(ob.bids)} bids, {len(ob.asks)} asks")
+
+# 测试余额
+balances = client.get_account_balances()
+print(f"Balances: {len(balances)} assets")
+
+print("✅ All tests passed!")
+```
+
+运行测试：
+
+```bash
+# 无凭证（读写分离模式）
+python test_my_exchange.py
+
+# 使用 API 凭证（完整模式）
+export MY_EXCHANGE_API_KEY=xxx
+export MY_EXCHANGE_API_SECRET=yyy
+python test_my_exchange.py
+```
+
+### 步骤 6: 运行完整集成测试
+
+```bash
+# 测试所有交易所
+python test_exchange_integration.py
+
+# 或单独测试新交易所
+python test_all_exchanges.py --exchange my_exchange
+```
+
+### 最佳实践
+
+1. **优雅降级**: 所有 API 调用都应该返回空/零响应而不是抛出异常
+2. **读写分离**: 总是初始化客户端，通过 `_trading_enabled` 标志控制写权限
+3. **Mock 数据**: 在 `_request()` 中提供 mock 数据作为网络失败的降级方案
+4. **错误日志**: 使用 `logger.error()` 记录所有 API 调误，便于排查
+5. **符号规范化**: 实现 `_normalize_symbol()` 方法统一符号格式
+6. **超时控制**: 所有 HTTP 请求都应设置合理的超时时间（推荐 15 秒）
+7. **文档**: 创建 SETUP_GUIDE 文件说明如何获取 API 密钥
 
 ---
 
 ## 交易所集成状态
-*本节内容保持不变，包含 8 个已集成的交易所列表。*
+
+### 📊 9 个交易所全面支持
+
+PerpBot 目前集成了 **9 个主流永续期货交易所**，覆盖 DEX (去中心化) 和 CEX (中心化) 两大类型。
+
+| # | 交易所 | 类型 | 链 | 状态 | 读写模式 | 说明 |
+|---|--------|------|-----|------|---------|------|
+| 1 | **Paradex** | DEX | Starknet | ✅ 完整 | REST API | 主要支持，WebSocket 订单更新 |
+| 2 | **Extended** | DEX | Starknet | ✅ 完整 | REST API | 备选流动性源，价差套利 |
+| 3 | **OKX** | CEX | L1/L2 | ✅ 完整 | ccxt 库 | 主要中心化交易所，testnet 模式 |
+| 4 | **Lighter** | DEX | Ethereum L2 | ✅ 完整 | REST + SDK | 零费永续，官方 SDK 支持 |
+| 5 | **EdgeX** | DEX | SVM | ✅ 完整 | REST API | 高性能订单簿 DEX |
+| 6 | **Backpack** | DEX | Solana | ✅ 完整 | REST + Ed25519 | Solana 生态永续交易 |
+| 7 | **GRVT** | DEX | ZK-Rollup | ✅ 完整 | REST + SDK | ZK 证明的混合交易所 |
+| 8 | **Aster** | DEX | BNB Chain | ✅ 完整 | REST API | BNB 链上永续期货 |
+| 9 | **Hyperliquid** | DEX | L1 | ✅ 完整 | REST API | 高性能 L1 区块链 DEX |
+
+### ✨ 读写模式 (Mock Mode)
+
+**全部 9 个交易所都支持以下运行模式：**
+
+```
+┌─────────────────────────────┐
+│  交易所客户端             │
+├─────────────────────────────┤
+│ ✅ 有 API 密钥             │  → 完整交易模式
+│    (connect() 成功)         │     • 下单/平仓
+│                             │     • 获取持仓/余额
+│                             │     • 实时市场数据
+├─────────────────────────────┤
+│ ✅ 无 API 密钥             │  → 读写分离模式
+│    (connect() 成功)         │     • ✓ 读: 价格/orderbook
+│                             │     • ✗ 写: 自动拒绝下单
+│                             │     • 用途: 监控/开发/测试
+└─────────────────────────────┘
+```
+
+### 💡 快速测试交易所
+
+**测试单个交易所（无需 API 密钥）：**
+
+```bash
+# 测试 Aster (使用真实 API)
+python test_aster.py --symbol BTC/USDT --depth 5
+
+# 测试 GRVT (mock 数据降级)
+python test_grvt.py --symbol BTC/USDT
+
+# 测试 Backpack (无签名密钥)
+python test_backpack.py --symbol BTC/USDT
+
+# 测试全部 9 个交易所
+python test_exchange_integration.py
+```
+
+### 📖 相关文档
+
+- **详细文档**: [EXCHANGE_MOCK_MODE_SUMMARY.md](EXCHANGE_MOCK_MODE_SUMMARY.md) - 读写分离模式深入说明
+- **架构说明**: [ARCHITECTURE.md](ARCHITECTURE.md) - 系统架构与模块设计
+- **如何新增交易所**: [#-如何新增一个交易所](#-如何新增一个交易所) - 集成新交易所的完整步骤
 
 ---
 
