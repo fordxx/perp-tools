@@ -1,0 +1,98 @@
+# Prometheus Alert Rules for PerpBot V2
+
+groups:
+  - name: perpbot_critical
+    interval: 30s
+    rules:
+      - alert: PerpBotDown
+        expr: up{job="perpbot"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PerpBot is down"
+          description: "PerpBot service has been down for more than 1 minute"
+
+      - alert: HighCapitalUtilization
+        expr: perpbot_capital_utilization_percent > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Capital utilization > 90%"
+          description: "Capital utilization is {{ $value }}%, approaching limit"
+
+      - alert: WebSocketDisconnected
+        expr: perpbot_websocket_connected{exchange=~".+"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WebSocket disconnected for {{ $labels.exchange }}"
+          description: "WebSocket connection to {{ $labels.exchange }} has been down for 2 minutes"
+
+      - alert: HighOrderFailureRate
+        expr: rate(perpbot_orders_failed_total[5m]) / rate(perpbot_orders_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High order failure rate"
+          description: "Order failure rate is {{ $value | humanizePercentage }}"
+
+      - alert: LowSystemHealth
+        expr: perpbot_system_health < 0.7
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "System health below 70%"
+          description: "System health score is {{ $value }}"
+
+  - name: perpbot_warning
+    interval: 30s
+    rules:
+      - alert: HighWebSocketLatency
+        expr: perpbot_websocket_latency_ms > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High WebSocket latency for {{ $labels.exchange }}"
+          description: "WebSocket latency is {{ $value }}ms (threshold: 200ms)"
+
+      - alert: CapitalUtilizationWarning
+        expr: perpbot_capital_utilization_percent > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Capital utilization > 80%"
+          description: "Capital utilization is {{ $value }}%"
+
+      - alert: LowArbitrageOpportunities
+        expr: rate(perpbot_arbitrage_opportunities_total[10m]) < 0.01
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low arbitrage opportunity rate"
+          description: "Arbitrage opportunity rate is {{ $value }}/sec (expected > 0.01/sec)"
+
+      - alert: HighExecutionLatency
+        expr: histogram_quantile(0.99, rate(perpbot_order_execution_duration_seconds_bucket[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High order execution latency"
+          description: "P99 execution latency is {{ $value }}s (threshold: 0.5s)"
+
+      - alert: StaleQuoteData
+        expr: time() - perpbot_quote_last_update_timestamp_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale quote data for {{ $labels.exchange }}:{{ $labels.symbol }}"
+          description: "Quote data hasn't been updated in {{ $value }}s"

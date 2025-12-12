@@ -1,0 +1,31 @@
+/app/logs/*.log {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    maxage 90
+    size 100M
+
+    postrotate
+        # Send SIGHUP to supervisor to reopen log files
+        supervisorctl restart perpbot > /dev/null 2>&1 || true
+    endscript
+}
+
+/app/logs/trades/*.log {
+    daily
+    rotate 365
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    maxage 365
+}
