@@ -10,33 +10,46 @@
 
 ### 查看所有支持的交易所
 ```bash
-python test_exchanges.py --list
+./run_exchange_test.sh --list
 ```
 
 ### 测试所有已配置交易所
 ```bash
-python test_exchanges.py
+python3 test_exchanges.py
 ```
 
 ### 测试特定交易所
 ```bash
-python test_exchanges.py okx binance hyperliquid
+./run_exchange_test.sh okx --auto-test
+./run_exchange_test.sh binance --auto-test
 ```
 
 ### 自定义交易对
 ```bash
-python test_exchanges.py okx --symbol BTC/USDT
+./run_exchange_test.sh okx --auto-test --symbol BTC/USDT
 ```
 
 ### 输出 JSON 报告
 ```bash
-python test_exchanges.py --json-report report.json
+./run_exchange_test.sh okx --auto-test --json-report report.json
 ```
 
 ### 详细日志模式
 ```bash
-python test_exchanges.py --verbose
+./run_exchange_test.sh okx --auto-test --verbose
 ```
+
+### Soak 长跑（暴露间歇性问题）
+```bash
+./run_exchange_test.sh paradex --soak 1800 --interval 30 --jitter 0.5 --max-fail-rate 0 --symbol BTC/USDT
+```
+
+### 双交易所并跑（自动 summary）
+```bash
+AUTO_CONFIRM=true USE_SOAK=true ENABLE_GUARDIAN=true RUN_DURATION_SEC=3600 ./START_DUAL_EXCHANGE_TEST.sh
+```
+
+更多：`docs/SOAK_MONITORING.md`
 
 ---
 
@@ -180,6 +193,8 @@ python test_exchanges.py backpack
 ```bash
 # 配置 .env
 GRVT_API_KEY=your_api_key
+GRVT_PRIVATE_KEY=your_private_key
+GRVT_TRADING_ACCOUNT_ID=your_trading_account_id
 
 # 获取链接: https://app.grvt.io
 # 模式: 主网
@@ -191,6 +206,7 @@ python test_exchanges.py grvt
 ```bash
 # 配置 .env
 ASTER_API_KEY=your_api_key
+ASTER_API_SECRET=your_api_secret
 
 # 获取链接: https://app.aster.com
 # 模式: 主网
