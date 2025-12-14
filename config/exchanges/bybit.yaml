@@ -1,0 +1,6 @@
+exchange: bybit
+default_symbol: BTC/USDT
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+

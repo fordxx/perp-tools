@@ -7,10 +7,10 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
+import eth_account
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
 
 from dotenv import load_dotenv
 
@@ -23,14 +23,14 @@ logger = logging.getLogger(__name__)
 class HyperliquidClient(ExchangeClient):
     """Hyperliquid perpetual futures client.
     
-    Uses REST API for orders and account data.
+    Uses hyperliquid-python-sdk for orders and account data.
     Supports real-time price updates and order management.
     
     API Docs: https://hyperliquid.gitbook.io/hyperliquid-docs/api
     """
 
-    BASE_URL = "https://api.hyperliquid.xyz"
-    TESTNET_BASE_URL = "https://testnet.api.hyperliquid.xyz"
+    BASE_URL = constants.MAINNET_API_URL
+    TESTNET_BASE_URL = constants.TESTNET_API_URL
 
     def __init__(self, use_testnet: bool = True) -> None:
         self.name = "hyperliquid"
@@ -43,7 +43,8 @@ class HyperliquidClient(ExchangeClient):
         self.account_address: Optional[str] = None
 
         self._trading_enabled = False
-        self._client: Optional[Any] = None  # httpx.Client
+        self._info_client: Optional[Info] = None
+        self._exchange_client: Optional[Exchange] = None
         self._price_cache: Dict[str, PriceQuote] = {}
         self._cache_time: Dict[str, float] = {}
         self._cache_ttl = 2.0  # 2 second cache for prices
@@ -55,84 +56,43 @@ class HyperliquidClient(ExchangeClient):
         """Load credentials and initialize connection to Hyperliquid."""
         load_dotenv()
 
-        self.account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
-        self.private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
-        self.vault_address = os.getenv("HYPERLIQUID_VAULT_ADDRESS")
+        # Environment variable overrides constructor's use_testnet setting
+        hyperliquid_env_var = os.getenv("HYPERLIQUID_ENV")
+        if hyperliquid_env_var:
+            self.use_testnet = (hyperliquid_env_var.lower() == "testnet")
 
-        # Environment selection
-        env = os.getenv("HYPERLIQUID_ENV", "testnet").lower()
-        self.use_testnet = env == "testnet"
         self.base_url = self.TESTNET_BASE_URL if self.use_testnet else self.BASE_URL
 
-        self._trading_enabled = False
+        # Load credentials
+        self.account_address = os.getenv("HYPERLIQUID_ACCOUNT_ADDRESS")
+        self.private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
+        self.vault_address = os.getenv("HYPERLIQUID_VAULT_ADDRESS") # Unused for now, but kept for completeness
 
-        # Allow read-only mode without keys
-        if not self.account_address:
-            logger.warning("HYPERLIQUID_ACCOUNT_ADDRESS not set - read-only mode")
-        elif not self.private_key:
+        # Initialize SDK clients
+        self._info_client = Info(base_url=self.base_url)
+
+        if self.private_key:
+            try:
+                wallet = eth_account.Account.from_key(self.private_key)
+                self._exchange_client = Exchange(wallet, base_url=self.base_url, account_address=self.account_address)
+                self._trading_enabled = True
+            except Exception as e:
+                logger.error(f"Failed to initialize Hyperliquid Exchange client with private key: {e}")
+                self._trading_enabled = False
+        else:
             logger.warning("HYPERLIQUID_PRIVATE_KEY not set - trading disabled")
-        else:
-            self._trading_enabled = True
+            self._trading_enabled = False
 
-        # Initialize HTTP client if available
-        if httpx:
-            self._client = httpx.Client(
-                base_url=self.base_url,
-                timeout=10.0,
-                follow_redirects=True,
-            )
-        else:
-            logger.warning("httpx not installed - running in mock mode")
-            self._client = None
+        if not self.account_address:
+            logger.warning("HYPERLIQUID_ACCOUNT_ADDRESS not set - some read operations may fail")
 
-        logger.info("✅ Hyperliquid client connected (testnet=%s, trading=%s)", 
+        logger.info("✅ Hyperliquid client connected (testnet=%s, trading=%s)",
                    self.use_testnet, self._trading_enabled)
 
-    def _post(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """POST request to Hyperliquid API."""
-        if not self._client:
-            logger.warning("No HTTP client available - returning mock data")
-            return self._mock_response(endpoint, payload)
 
-        try:
-            response = self._client.post(endpoint, json=payload)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.error(f"HTTP error on {endpoint}: {e}")
-            return {}
-
-    def _mock_response(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Return mock response for testing without httpx."""
-        req_type = payload.get("type", "")
-        
-        if req_type == "recentTrades":
-            return [{
-                "px": "43000.0",
-                "sz": "0.1",
-                "side": "B",
-                "time": int(time.time() * 1000),
-            }]
-        elif req_type == "l2Book":
-            return {
-                "bids": [["42999.0", "1.5"], ["42998.0", "2.0"], ["42997.0", "1.2"]],
-                "asks": [["43001.0", "1.8"], ["43002.0", "2.1"], ["43003.0", "1.5"]],
-            }
-        elif req_type == "openOrders":
-            return []
-        elif req_type == "userState":
-            return {
-                "marginSummary": {
-                    "accountValue": "10000.0",
-                    "totalMarginUsed": "2000.0",
-                    "totalNtlPos": "5000.0",
-                },
-                "assetPositions": [],
-            }
-        return {}
 
     def get_current_price(self, symbol: str) -> PriceQuote:
-        """Fetch current bid/ask price from Hyperliquid."""
+        """Fetch current bid/ask price from Hyperliquid using SDK."""
         # Check cache
         now = time.time()
         if symbol in self._price_cache:
@@ -140,27 +100,28 @@ class HyperliquidClient(ExchangeClient):
             if cache_age < self._cache_ttl:
                 return self._price_cache[symbol]
 
-        # Normalize symbol (remove /)
-        asset = symbol.replace("/", "").upper()
+        if not self._info_client:
+            logger.warning("Hyperliquid info client not initialized for price fetch.")
+            return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0)
 
+        asset = symbol.split("/")[0].upper()
         try:
-            payload = {"type": "recentTrades", "coin": asset}
-            result = self._post("/info", payload)
+            mids = self._info_client.all_mids()
+            if asset not in mids:
+                logger.warning(f"No mid price found for {asset}")
+                return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0)
 
-            if not result or len(result) == 0:
-                logger.warning(f"No price data for {symbol}")
-                quote = PriceQuote(
-                    exchange=self.name,
-                    symbol=symbol,
-                    bid=0.0,
-                    ask=0.0,
-                )
-                return quote
+            mid_price_raw = mids[asset]
+            # Ensure mid_price is a float
+            try:
+                mid_price = float(mid_price_raw)
+            except (ValueError, TypeError):
+                logger.error(f"Received non-numeric mid_price for {asset}: {mid_price_raw}. Skipping price derivation.")
+                return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0)
 
-            latest_trade = result[0]
-            price = float(latest_trade.get("px", 0))
-            bid = price * 0.9999
-            ask = price * 1.0001
+            # Hyperliquid SDK provides mid price directly, derive bid/ask for consistency
+            bid = mid_price * 0.9999
+            ask = mid_price * 1.0001
 
             quote = PriceQuote(
                 exchange=self.name,
@@ -168,8 +129,6 @@ class HyperliquidClient(ExchangeClient):
                 bid=bid,
                 ask=ask,
             )
-
-            # Cache it
             self._price_cache[symbol] = quote
             self._cache_time[symbol] = now
 
@@ -177,32 +136,30 @@ class HyperliquidClient(ExchangeClient):
             return quote
 
         except Exception as e:
-            logger.error(f"Error fetching price for {symbol}: {e}")
-            return PriceQuote(
-                exchange=self.name,
-                symbol=symbol,
-                bid=0.0,
-                ask=0.0,
-            )
+            logger.error(f"Error fetching price for {symbol} using SDK: {e}")
+            return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0)
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
-        """Fetch orderbook snapshot from Hyperliquid."""
-        asset = symbol.replace("/", "").upper()
+        """Fetch orderbook snapshot from Hyperliquid using SDK."""
+        if not self._info_client:
+            logger.warning("Hyperliquid info client not initialized for orderbook fetch.")
+            return OrderBookDepth(bids=[], asks=[])
 
+        asset = symbol.split("/")[0].upper()
         try:
-            payload = {"type": "l2Book", "coin": asset}
-            result = self._post("/info", payload)
+            book = self._info_client.l2_book(asset)
 
             bids = []
             asks = []
 
-            if result:
-                for bid_level in result.get("bids", [])[:depth]:
+            if book and book.get("bids"):
+                for bid_level in book["bids"][:depth]:
                     price = float(bid_level[0])
                     size = float(bid_level[1])
                     bids.append((price, size))
 
-                for ask_level in result.get("asks", [])[:depth]:
+            if book and book.get("asks"):
+                for ask_level in book["asks"][:depth]:
                     price = float(ask_level[0])
                     size = float(ask_level[1])
                     asks.append((price, size))
@@ -210,60 +167,124 @@ class HyperliquidClient(ExchangeClient):
             return OrderBookDepth(bids=bids, asks=asks)
 
         except Exception as e:
-            logger.error(f"Error fetching orderbook for {symbol}: {e}")
+            logger.error(f"Error fetching orderbook for {symbol} using SDK: {e}")
             return OrderBookDepth(bids=[], asks=[])
 
     def place_open_order(self, request: OrderRequest) -> Order:
-        """Place a new order to open a position."""
-        if not self._trading_enabled:
-            logger.error("Trading disabled - cannot place order")
-            order = Order(
+        """Place a new order to open a position using SDK."""
+        if not self._trading_enabled or not self._exchange_client:
+            logger.error("Trading disabled or Exchange client not initialized - cannot place order.")
+            return Order(
                 id="rejected",
                 exchange=self.name,
                 symbol=request.symbol,
                 side=request.side,
                 price=request.limit_price or 0.0,
                 size=request.size,
+                status="rejected",
             )
-            if self._order_handler:
-                self._order_handler(order)
-            return order
+
+        asset = request.symbol.split("/")[0].upper()
+        is_buy = (request.side == Side.BUY)
+        sz = request.size
+        px = request.limit_price
+
+        # Default order type to market (IOC) for orders without a limit price
+        order_type_sdk = {"market": {"tif": "Ioc"}}
+        if request.limit_price is not None:
+            order_type_sdk = {"limit": {"tif": "Gtc"}}
 
         try:
-            asset = request.symbol.replace("/", "").upper()
-            
-            order_id = f"HL-{int(time.time() * 1000)}"
-            order = Order(
-                id=order_id,
-                exchange=self.name,
-                symbol=request.symbol,
-                side=request.side,
-                price=request.limit_price or 0.0,
-                size=request.size,
+            response = self._exchange_client.order(
+                coin=asset,
+                is_buy=is_buy,
+                sz=sz,
+                px=px,
+                order_type=order_type_sdk,
+                reduce_only=request.reduce_only,
             )
 
-            if self._order_handler:
-                self._order_handler(order)
+            if response and response.get("status") == "ok":
+                status_data = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                order_id = ""
+                actual_price = px or 0.0
+                order_status = "pending" # Default status
 
-            logger.info(f"Order placed: {order_id}")
-            return order
+                if "resting" in status_data: # Limit order
+                    order_id = str(status_data["resting"].get("oid", ""))
+                    actual_price = float(status_data["resting"].get("limitPx", px))
+                    order_status = "open"
+                elif "filled" in status_data: # Market order or filled limit order
+                    order_id = str(status_data["filled"].get("oid", ""))
+                    actual_price = float(status_data["filled"].get("avgPx", px))
+                    order_status = "filled"
+                elif "error" in status_data:
+                    error_msg = status_data["error"]
+                    logger.error(f"Order placement error: {error_msg}")
+                    return Order(
+                        id=f"error-{int(time.time() * 1000)}",
+                        exchange=self.name,
+                        symbol=request.symbol,
+                        side=request.side,
+                        price=px or 0.0,
+                        size=sz,
+                        status="rejected",
+                        error_message=error_msg,
+                    )
+                else:
+                    logger.warning(f"Unknown order response status: {status_data}")
+                    order_id = f"unknown-{int(time.time() * 1000)}"
+                    order_status = "unknown"
+
+                order = Order(
+                    id=order_id,
+                    exchange=self.name,
+                    symbol=request.symbol,
+                    side=request.side,
+                    price=actual_price,
+                    size=sz,
+                    status=order_status,
+                )
+                logger.info(f"✅ Order placed (SDK): ID={order.id}, Price={order.price}, Status={order.status}")
+                if self._order_handler:
+                    self._order_handler(order)
+                return order
+            else:
+                error_msg_detail = "Unknown error"
+                if response:
+                    status_data_list = response.get("response", {}).get("data", {}).get("statuses", [])
+                    if status_data_list and "error" in status_data_list[0]:
+                        error_msg_detail = status_data_list[0]["error"]
+                    else:
+                        error_msg_detail = json.dumps(response) # Log full response if structured error not found
+                
+                logger.error(f"Failed to place order (SDK). Response: {error_msg_detail}")
+                return Order(
+                    id=f"error-{int(time.time() * 1000)}",
+                    exchange=self.name,
+                    symbol=request.symbol,
+                    side=request.side,
+                    price=px or 0.0,
+                    size=sz,
+                    status="rejected",
+                    error_message=error_msg_detail,
+                )
 
         except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            order = Order(
+            logger.error(f"Error placing order using SDK: {e}")
+            return Order(
                 id=f"error-{int(time.time() * 1000)}",
                 exchange=self.name,
                 symbol=request.symbol,
                 side=request.side,
-                price=request.limit_price or 0.0,
-                size=request.size,
+                price=px or 0.0,
+                size=sz,
+                status="rejected",
+                error_message=str(e),
             )
-            if self._order_handler:
-                self._order_handler(order)
-            return order
 
     def place_close_order(self, position: Any, current_price: float) -> Order:
-        """Place a close order for an existing position."""
+        """Place a close order for an existing position using SDK."""
         if not self._trading_enabled:
             logger.error("Trading disabled - cannot close position")
             close_side = "sell" if position.get("side") == "buy" else "buy"
@@ -276,53 +297,72 @@ class HyperliquidClient(ExchangeClient):
                 size=position.get("size", 0),
             )
 
+        # Determine the side to close the position
         close_side = "sell" if position.get("side") == "buy" else "buy"
         
+        # Create an OrderRequest with reduce_only=True
         close_request = OrderRequest(
             symbol=position.get("symbol", ""),
             side=close_side,
             size=position.get("size", 0),
-            limit_price=current_price,
+            limit_price=current_price, # Use current price as limit to ensure it closes as a market order
+            reduce_only=True, # Mark as reduce-only
         )
 
+        # Re-use place_open_order logic for execution
         return self.place_open_order(close_request)
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
-        """Cancel an open order."""
-        if not self._trading_enabled:
-            logger.error("Trading disabled - cannot cancel order")
+        """Cancel an open order using SDK."""
+        if not self._trading_enabled or not self._exchange_client:
+            logger.error("Trading disabled or Exchange client not initialized - cannot cancel order.")
             return
 
+        if not symbol:
+            logger.error("Symbol is required to cancel an order on Hyperliquid.")
+            return
+
+        asset = symbol.split("/")[0].upper()
         try:
-            logger.info(f"Canceling order {order_id}")
+            response = self._exchange_client.cancel(coin=asset, oid=int(order_id))
+            if response and response.get("status") == "ok":
+                logger.info(f"✅ Order {order_id} cancelled successfully.")
+            else:
+                error_msg_detail = "Unknown error"
+                if response:
+                    status_data_list = response.get("response", {}).get("data", {}).get("statuses", [])
+                    if status_data_list and "error" in status_data_list[0]:
+                        error_msg_detail = status_data_list[0]["error"]
+                    else:
+                        error_msg_detail = json.dumps(response) # Log full response if structured error not found
+                logger.error(f"Failed to cancel order {order_id}: {error_msg_detail}")
         except Exception as e:
-            logger.error(f"Error canceling order {order_id}: {e}")
+            logger.error(f"Error canceling order {order_id} using SDK: {e}")
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        """Fetch all active orders for an account."""
+        """Fetch all active orders for an account using SDK."""
+        if not self._info_client:
+            logger.warning("Hyperliquid info client not initialized for active order fetch.")
+            return []
         if not self.account_address:
-            logger.warning("Account address not set - cannot fetch orders")
+            logger.warning("Account address not set - cannot fetch active orders.")
             return []
 
         try:
-            payload = {
-                "type": "openOrders",
-                "user": self.account_address,
-            }
-
-            result = self._post("/info", payload)
+            # SDK's open_orders expects a list of account addresses
+            open_orders_data = self._info_client.open_orders([self.account_address])
             orders = []
 
-            if isinstance(result, list):
-                for order_data in result:
+            if open_orders_data and open_orders_data[0]: # open_orders returns a list of lists (one per account)
+                for order_data in open_orders_data[0]: # first element corresponds to self.account_address
                     order_symbol = order_data.get("coin", "").replace("USDC", "/USDC")
                     
                     if symbol is None or order_symbol == symbol:
                         order = Order(
-                            id=order_data.get("oid", ""),
+                            id=str(order_data.get("oid", "")), # Ensure ID is string
                             exchange=self.name,
                             symbol=order_symbol,
-                            side=order_data.get("side", "buy"),
+                            side="buy" if order_data.get("isBuy") else "sell",
                             price=float(order_data.get("limitPx", 0)),
                             size=float(order_data.get("sz", 0)),
                         )
@@ -332,32 +372,30 @@ class HyperliquidClient(ExchangeClient):
             return orders
 
         except Exception as e:
-            logger.error(f"Error fetching active orders: {e}")
+            logger.error(f"Error fetching active orders using SDK: {e}")
             return []
 
     def get_account_positions(self) -> List[Dict[str, Any]]:
-        """Fetch all open positions for an account."""
+        """Fetch all open positions for an account using SDK."""
+        if not self._info_client:
+            logger.warning("Hyperliquid info client not initialized for position fetch.")
+            return []
         if not self.account_address:
-            logger.warning("Account address not set - cannot fetch positions")
+            logger.warning("Account address not set - cannot fetch positions.")
             return []
 
         try:
-            payload = {
-                "type": "userState",
-                "user": self.account_address,
-            }
-
-            result = self._post("/info", payload)
+            user_state = self._info_client.user_state(self.account_address)
             positions = []
 
-            if result and "assetPositions" in result:
-                for position_data in result["assetPositions"]:
+            if user_state and "assetPositions" in user_state:
+                for position_data in user_state["assetPositions"]:
                     position_info = position_data.get("position", {})
                     
                     coin = position_data.get("coin", "")
                     size = float(position_info.get("szi", 0))
                     
-                    if size == 0:
+                    if size == 0: # Only include open positions
                         continue
 
                     entry_price = float(position_info.get("entryPx", 0))
@@ -374,26 +412,24 @@ class HyperliquidClient(ExchangeClient):
             return positions
 
         except Exception as e:
-            logger.error(f"Error fetching positions: {e}")
+            logger.error(f"Error fetching positions using SDK: {e}")
             return []
 
     def get_account_balances(self) -> List[Balance]:
-        """Fetch account balances."""
+        """Fetch account balances using SDK."""
+        if not self._info_client:
+            logger.warning("Hyperliquid info client not initialized for balance fetch.")
+            return []
         if not self.account_address:
-            logger.warning("Account address not set - cannot fetch balances")
+            logger.warning("Account address not set - cannot fetch balances.")
             return []
 
         try:
-            payload = {
-                "type": "userState",
-                "user": self.account_address,
-            }
-
-            result = self._post("/info", payload)
+            user_state = self._info_client.user_state(self.account_address)
             balances = []
 
-            if result:
-                margin_summary = result.get("marginSummary", {})
+            if user_state and "marginSummary" in user_state:
+                margin_summary = user_state["marginSummary"]
                 account_value = float(margin_summary.get("accountValue", 0))
                 total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
 
@@ -410,7 +446,7 @@ class HyperliquidClient(ExchangeClient):
             return balances
 
         except Exception as e:
-            logger.error(f"Error fetching balances: {e}")
+            logger.error(f"Error fetching balances using SDK: {e}")
             return []
 
     def setup_order_update_handler(self, handler: Callable[[dict], None]) -> None:

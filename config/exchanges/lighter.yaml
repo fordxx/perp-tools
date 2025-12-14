@@ -1,0 +1,7 @@
+exchange: lighter
+# Lighter client maps "BTC/USDT" -> "BTC" internally; keep the unified symbol style here.
+default_symbol: BTC/USDT
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+

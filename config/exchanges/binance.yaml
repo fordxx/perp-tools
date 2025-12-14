@@ -1,0 +1,6 @@
+exchange: binance
+default_symbol: BTC/USDT
+symbols:
+  - BTC/USDT
+  - ETH/USDT
+

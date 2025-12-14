@@ -1,0 +1,7 @@
+exchange: hyperliquid
+# Hyperliquid uses base symbols (e.g., BTC, ETH) in this repo's client.
+default_symbol: BTC
+symbols:
+  - BTC
+  - ETH
+

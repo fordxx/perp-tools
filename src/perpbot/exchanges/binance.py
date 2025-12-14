@@ -36,6 +36,9 @@ class BinanceClient(ExchangeClient):
         self._listen_key: Optional[str] = None
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._listen_key_lock = threading.Lock()
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self._keepalive_stop = threading.Event()
 
     def connect(self) -> None:
         from dotenv import load_dotenv
@@ -49,7 +52,25 @@ class BinanceClient(ExchangeClient):
 
         self._client = httpx.Client(base_url=self.base_url, headers={"X-MBX-APIKEY": self.api_key}, timeout=10)
         logger.info("Initialized Binance client (testnet=%s)", self.use_testnet)
+        self._ensure_listen_key()
         self._start_user_stream()
+        self._start_listen_key_keepalive()
+
+    def disconnect(self) -> None:
+        self._stop_event.set()
+        self._keepalive_stop.set()
+
+        if self._ws_thread and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=2.0)
+
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            self._keepalive_thread.join(timeout=2.0)
+
+        try:
+            if self._client:
+                self._client.close()
+        finally:
+            self._client = None
 
     # REST 辅助方法
     def _signed_request(self, method: str, path: str, params: Optional[dict] = None) -> httpx.Response:
@@ -66,23 +87,71 @@ class BinanceClient(ExchangeClient):
         response.raise_for_status()
         return response
 
-    def _start_user_stream(self) -> None:
+    def _ensure_listen_key(self) -> str:
+        """Create (or refresh) the user-data-stream listenKey."""
         if not self._client:
             raise RuntimeError("Client not connected")
         resp = self._client.post("/fapi/v1/listenKey")
         resp.raise_for_status()
-        self._listen_key = resp.json().get("listenKey")
+        listen_key = resp.json().get("listenKey")
+        with self._listen_key_lock:
+            self._listen_key = listen_key
         logger.info("Obtained Binance listenKey for user stream")
-        if self._listen_key:
-            self._ws_thread = threading.Thread(target=self._run_user_stream, daemon=True)
-            self._ws_thread.start()
+        if not listen_key:
+            raise RuntimeError("Failed to obtain listenKey")
+        return listen_key
+
+    def _start_user_stream(self) -> None:
+        """Start (or restart) the WebSocket consumer thread."""
+        if self._ws_thread and self._ws_thread.is_alive():
+            return
+        self._ws_thread = threading.Thread(target=self._run_user_stream, daemon=True, name="BinanceUserStream")
+        self._ws_thread.start()
+
+    def _start_listen_key_keepalive(self) -> None:
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            return
+
+        def _run() -> None:
+            # Binance Futures: keepalive required within 60 minutes; we renew every 25 minutes.
+            interval = 25 * 60
+            while not self._keepalive_stop.is_set():
+                self._keepalive_stop.wait(interval)
+                if self._keepalive_stop.is_set():
+                    break
+                try:
+                    self._renew_listen_key()
+                except Exception as exc:  # pragma: no cover - network dependent
+                    logger.warning("Binance listenKey keepalive failed: %s", exc)
+                    # Attempt to recreate listenKey; websocket loop will reconnect using the new key.
+                    try:
+                        self._ensure_listen_key()
+                    except Exception as create_exc:
+                        logger.warning("Binance listenKey recreate failed: %s", create_exc)
+
+        self._keepalive_thread = threading.Thread(target=_run, daemon=True, name="BinanceListenKeyKeepalive")
+        self._keepalive_thread.start()
+
+    def _renew_listen_key(self) -> None:
+        if not self._client:
+            raise RuntimeError("Client not connected")
+        with self._listen_key_lock:
+            listen_key = self._listen_key
+        if not listen_key:
+            raise RuntimeError("listenKey missing")
+        resp = self._client.put("/fapi/v1/listenKey", params={"listenKey": listen_key})
+        resp.raise_for_status()
+        logger.debug("Renewed Binance listenKey")
 
     def _run_user_stream(self) -> None:
         async def _consume() -> None:
-            if not self._listen_key:
-                return
-            url = f"{self.ws_base}/ws/{self._listen_key}"
             while not self._stop_event.is_set():
+                with self._listen_key_lock:
+                    listen_key = self._listen_key
+                if not listen_key:
+                    await asyncio.sleep(1)
+                    continue
+                url = f"{self.ws_base}/ws/{listen_key}"
                 try:
                     async with websockets.connect(url, ping_interval=15) as ws:
                         async for msg in ws:

@@ -140,3 +140,10 @@ perpbot/**/cache/
 ##############
 docker-data/
 docker-compose.override.yml
+
+##############
+# Local reference repos / scratch
+##############
+_ref_perp_dex_toolkit/
+claude/
+bench.json*

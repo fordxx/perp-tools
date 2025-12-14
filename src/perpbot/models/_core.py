@@ -89,6 +89,7 @@ class OrderRequest:
     side: Side
     size: float
     limit_price: Optional[float] = None
+    reduce_only: bool = False
 
 
 @dataclass

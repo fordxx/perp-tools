@@ -113,6 +113,47 @@ python test_exchanges.py --select
 
 ---
 
+## 🔌 连接 + 交易链路验证
+
+### 连接颗粒度
+
+```
+python test_exchanges.py hyperliquid paradex --auto-test
+```
+
+每个交易所会依次打印连接、价格、订单簿、余额、持仓的响应时间（例如 `connection_time_ms` / `price_time_ms`），可通过 `--json-report bench.json` 导出后再用 `jq`/Python 提取指标，帮助定位连接或数据拉取的瓶颈。
+
+### 自动交易链路
+
+```
+python test_exchanges.py okx --auto-test --trading --trading-size 0.001
+```
+
+该流程会跑完：1) 限价单下单 + 自动撤单；2) 市价/IOC 单；3) 平仓命令。日志中会呈现：
+
+```
+6️⃣ Testing limit order...
+   ✅ Order placed: ID=12345
+   📍 Attempting to cancel order...
+   ✅ Order cancelled: ID=12345
+7️⃣ Testing market/IOC order...
+   ✅ Market order placed: ID=54321
+8️⃣ Testing close position...
+   ✅ Close order placed: ID=54322
+```
+
+系统会在缺少 `cancel_order` / `place_close_order` 方法或无符合持仓时输出 `⚠️` 警告，方便补全相应客户端接口。
+
+### 交互式交易菜单
+
+运行 `python test_exchanges.py okx --symbol BTC/USDT` 进入菜单后：
+
+- `5️⃣`：下限价单（输入数量 + 偏差）；
+- `6️⃣`：下市价单；
+- `7️⃣`：平仓；
+
+每次操作会提示价格、订单 ID 和执行状态，适合手动验证连接、下单与关单在真实环境中的可用性。
+
 ## 🔄 核心功能详解
 
 ### A. 查询功能 (非交易)

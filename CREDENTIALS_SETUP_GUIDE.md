@@ -508,6 +508,8 @@ python test_exchanges.py --list
 # 测试 OKX
 python test_exchanges.py okx
 
+# ✅ 如果仅测试一个交易所，`test_exchanges.py` 现在会自动检测 `run_exchange_test.sh` 并在对应的 `venv_<exchange>` 下运行（会自动激活环境并安装依赖），你只需运行上面的命令即可。
+
 # 测试所有
 python test_exchanges.py --all
 ```
@@ -519,5 +521,19 @@ python test_exchanges.py --all
 - ✅ 定期检查 API 日志
 - ✅ 使用只读权限
 - ✅ 设置 IP 白名单
+- ✅ `python3 test_exchanges.py aster --auto-test --json-report bench.json` 目前可以拿到正常的连接 / 价格 / 订单簿（Price≈3088.7，Depth=5层），但账户余额与持仓依旧返回 HTTP 400，说明还需要在 Aster 控制台给当前 API Key 授予 `fapi/v2/balance` 和 `fapi/v2/positionRisk` 的读取权限才能把这些数据也带上。
+- ✅ `python3 test_exchanges.py lighter --auto-test --verbose` 会提示 “Lighter SDK not available, using REST API”，后续价格/订单簿/持仓等接口均报 HTTP 404/400；要拿到完整数据，需要先在虚拟环境安装官方 SDK（`pip install lighter-v1-python`）并确保 `LIGHTER_API_KEY` / `LIGHTER_PRIVATE_KEY` 可用，脚本会自动使用 SDK 访问 `https://api.lighter.xyz`，否则只能走 REST 备用接口且部分端点仍然未开放。
+- ⚠️ 当前 `lighter` 测试只能跑到 REST fallback，价格/订单簿/余额/持仓都返回 ~0/404，失败原因是 SDK 尚未安装；已经在 `venv_lighter` 里运行 `pip install lighter-v1-python` 并填好 API Key/Private Key 后，再执行 `python3 test_exchanges.py lighter --auto-test --verbose`，应该会显示 “Lighter SDK initialized” 并返回真实数据。
+- ⚠️ 运行 `python3 test_exchanges.py lighter --auto-test --verbose` 还出现 `URL can't contain control characters` 说明 `.env` 中 `LIGHTER_API_BASE_URL`（或 `LIGHTER_ENV`）后面有空格，编辑 `.env` 去掉即可。
+
+## 🧰 单交易所 venv + 依赖模板
+
+| 类型 | 激活命令 | 安装依赖 | 测试命令 |
+|------|----------|----------|----------|
+| CEX（OKX/Binance/Bitget/Bybit） | `source venv_<exchange>/bin/activate` | `pip install -r requirements/<exchange>.txt` | `python test_exchanges.py <exchange> --auto-test` |
+| DEX（Hyperliquid/Paradex/Extended/EdgeX/Backpack/GRVT/Aster） | 同上 | `pip install -r requirements/<exchange>.txt` | `python test_exchanges.py <exchange> --auto-test --verbose` |
+| Lighter（需 SDK） | `source venv_lighter/bin/activate` | `pip install -r requirements/lighter.txt lighter-v1-python` <br> `pip install python-dotenv httpx websockets` | `python test_exchanges.py lighter --auto-test --verbose` |
+
+> ✅ `run_exchange_test.sh` 会自动完成上述激活+依赖安装的流程，只要你直接 `python test_exchanges.py <exchange>` 就会自动跳到对应 `venv_<exchange>`；但遇到 `ccxt`、`lighter-v1-python` 等缺失时请进入对应 venv 用 `pip install` 補全。
 
 **准备好了?** 运行 `python test_exchanges.py --list` 查看配置状态 🚀

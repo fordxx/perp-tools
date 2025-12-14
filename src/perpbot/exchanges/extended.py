@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Callable, Dict, List, Optional, Sequence
+import time
 
 from dotenv import load_dotenv
 from fast_stark_crypto.lib import get_public_key
@@ -91,6 +92,7 @@ class ExtendedClient(ExchangeClient):
         self._markets: Dict[str, MarketModel] = {}
         self._market_stats_cache: Dict[str, MarketStatsModel] = {}
         self._orderbook_cache: Dict[str, OrderbookUpdateModel] = {}
+        self._orderbook_updated_at: Dict[str, float] = {}
         self._open_orders: Dict[str, OrderInfo] = {}
         self._positions: Dict[str, Position] = {}
         self._partial_fills: Dict[str, PartialFillState] = {}
@@ -104,6 +106,9 @@ class ExtendedClient(ExchangeClient):
         self._stop_stream = threading.Event()
         self._orderbook_tasks: Dict[str, asyncio.Future] = {}
         self._account_task: Optional[asyncio.Future] = None
+        self._disable_account_ws: bool = False
+        self._disable_orderbook_ws: bool = False
+        self._orderbook_stale_sec: float = 30.0
 
         # diagnostics
         self._last_order_error: Optional[str] = None
@@ -128,6 +133,13 @@ class ExtendedClient(ExchangeClient):
         self.base_url = self._endpoint_config.api_base_url
         self.ws_url = self._endpoint_config.stream_url
 
+        self._disable_account_ws = os.getenv("EXTENDED_DISABLE_ACCOUNT_WS", "0").strip().lower() in {"1", "true", "yes", "y"}
+        self._disable_orderbook_ws = os.getenv("EXTENDED_DISABLE_ORDERBOOK_WS", "0").strip().lower() in {"1", "true", "yes", "y"}
+        try:
+            self._orderbook_stale_sec = float(os.getenv("EXTENDED_ORDERBOOK_STALE_SEC", "30"))
+        except Exception:
+            self._orderbook_stale_sec = 30.0
+
         self._trading_enabled = False
 
         if not self.api_key:
@@ -148,6 +160,22 @@ class ExtendedClient(ExchangeClient):
 
         TradingLogger.info("Extended client ready (testnet=%s)", self.use_testnet)
         self._trading_enabled = True
+
+    def _stream_backoff_seconds(self, attempt: int) -> float:
+        """Exponential backoff (capped) for flaky WS streams to avoid hammering."""
+        try:
+            cap = float(os.getenv("EXTENDED_STREAM_BACKOFF_MAX_SEC", "30"))
+        except Exception:
+            cap = 30.0
+        cap = max(cap, 1.0)
+        delay = min(cap, 2 ** max(attempt - 1, 0))
+        try:
+            jitter = float(os.getenv("EXTENDED_STREAM_BACKOFF_JITTER_SEC", "0.25"))
+        except Exception:
+            jitter = 0.25
+        if jitter > 0:
+            delay += (attempt % 5) * (jitter / 5.0)
+        return delay
 
     def disconnect(self) -> None:
         if self._trading_client:
@@ -300,13 +328,13 @@ class ExtendedClient(ExchangeClient):
 
     def get_orderbook(self, symbol: str, depth: int = 5) -> OrderBookDepth:
         market = normalize_symbol(symbol)
-        orderbook = self._orderbook_cache.get(market)
+        orderbook = self._get_cached_orderbook(market)
         if orderbook and orderbook.bid and orderbook.ask:
             bids = [(float(entry.price), float(entry.qty)) for entry in orderbook.bid[:depth]]
             asks = [(float(entry.price), float(entry.qty)) for entry in orderbook.ask[:depth]]
             return OrderBookDepth(bids=bids, asks=asks)
 
-        snapshot = self._load_orderbook_snapshot(symbol)
+        snapshot = self._load_orderbook_snapshot(symbol, depth=max(5, depth))
         if snapshot:
             bids = [(float(entry.price), float(entry.qty)) for entry in snapshot.bid[:depth]]
             asks = [(float(entry.price), float(entry.qty)) for entry in snapshot.ask[:depth]]
@@ -390,7 +418,7 @@ class ExtendedClient(ExchangeClient):
 
     def _quote_from_cache(self, symbol: str) -> Optional[PriceQuote]:
         market_name = normalize_symbol(symbol)
-        book = self._orderbook_cache.get(market_name)
+        book = self._get_cached_orderbook(market_name)
         if not book:
             book = self._load_orderbook_snapshot(symbol)
         if book and book.bid and book.ask:
@@ -618,6 +646,8 @@ class ExtendedClient(ExchangeClient):
     def _start_stream_workers(self) -> None:
         if not self._stream_client or not self.api_key:
             return
+        if self._disable_account_ws and self._disable_orderbook_ws:
+            return
         self._stop_stream.clear()
         loop = asyncio.new_event_loop()
         self._stream_loop = loop
@@ -647,13 +677,15 @@ class ExtendedClient(ExchangeClient):
 
     def _stream_loop_worker(self, loop: asyncio.AbstractEventLoop) -> None:
         asyncio.set_event_loop(loop)
-        self._account_task = loop.create_task(self._account_stream_loop())
+        if not self._disable_account_ws:
+            self._account_task = loop.create_task(self._account_stream_loop())
         self._stream_ready.set()
         loop.run_forever()
 
     async def _account_stream_loop(self) -> None:
         if not self._stream_client or not self.api_key:
             return
+        reconnect_attempt = 0
         while not self._stop_stream.is_set():
             try:
                 async with self._stream_client.subscribe_to_account_updates(self.api_key) as stream:
@@ -661,10 +693,20 @@ class ExtendedClient(ExchangeClient):
                         if self._stop_stream.is_set():
                             break
                         if frame.data:
+                            reconnect_attempt = 0
                             self._process_account_stream(frame.data)
+                # Clean close without exception: still treat as reconnect-worthy.
+                if not self._stop_stream.is_set():
+                    reconnect_attempt += 1
+                    delay = self._stream_backoff_seconds(reconnect_attempt)
+                    TradingLogger.debug("Account stream closed, backoff %.2fs (attempt %d)", delay, reconnect_attempt)
+                    await asyncio.sleep(delay)
             except Exception as exc:
                 TradingLogger.warning("Account stream error: %s", exc)
-                await asyncio.sleep(5)
+                reconnect_attempt += 1
+                delay = self._stream_backoff_seconds(reconnect_attempt)
+                TradingLogger.debug("Account stream reconnect backoff %.2fs (attempt %d)", delay, reconnect_attempt)
+                await asyncio.sleep(delay)
 
     def _process_account_stream(self, data: AccountStreamDataModel) -> None:
         for order_model in data.orders or []:
@@ -731,6 +773,8 @@ class ExtendedClient(ExchangeClient):
 
     def _ensure_orderbook_stream(self, symbol: str) -> None:
         market = normalize_symbol(symbol)
+        if self._disable_orderbook_ws:
+            return
         if market in self._orderbook_tasks or not self._stream_loop or not self._stream_client:
             return
         depth = 5
@@ -742,6 +786,7 @@ class ExtendedClient(ExchangeClient):
 
     async def _orderbook_stream_worker(self, market: str, symbol: str, depth: int) -> None:
         try:
+            reconnect_attempt = 0
             while not self._stop_stream.is_set():
                 try:
                     async with self._stream_client.subscribe_to_orderbooks(market_name=market, depth=depth) as stream:
@@ -749,33 +794,62 @@ class ExtendedClient(ExchangeClient):
                             if self._stop_stream.is_set():
                                 break
                             if frame.data:
+                                reconnect_attempt = 0
                                 trimmed = OrderbookUpdateModel(
                                     market=frame.data.market,
                                     bid=frame.data.bid[:depth],
                                     ask=frame.data.ask[:depth],
                                 )
-                                self._orderbook_cache[market] = trimmed
+                                self._set_orderbook_cache(market, trimmed)
+                    # Clean close without exception: apply backoff to avoid hammering.
+                    if not self._stop_stream.is_set():
+                        reconnect_attempt += 1
+                        delay = self._stream_backoff_seconds(reconnect_attempt)
+                        TradingLogger.debug("Orderbook stream %s closed, backoff %.2fs (attempt %d)", symbol, delay, reconnect_attempt)
+                        await asyncio.sleep(delay)
                 except Exception as exc:
                     TradingLogger.debug("Orderbook stream %s error: %s", symbol, exc)
-                    await asyncio.sleep(3)
+                    reconnect_attempt += 1
+                    delay = self._stream_backoff_seconds(reconnect_attempt)
+                    TradingLogger.debug("Orderbook stream %s reconnect backoff %.2fs (attempt %d)", symbol, delay, reconnect_attempt)
+                    await asyncio.sleep(delay)
         finally:
             self._orderbook_tasks.pop(market, None)
 
-    def _load_orderbook_snapshot(self, symbol: str) -> Optional[OrderbookUpdateModel]:
+    def _is_orderbook_fresh(self, market: str) -> bool:
+        if self._orderbook_stale_sec <= 0:
+            return True
+        updated = self._orderbook_updated_at.get(market)
+        if updated is None:
+            return False
+        return (time.time() - updated) <= self._orderbook_stale_sec
+
+    def _get_cached_orderbook(self, market: str) -> Optional[OrderbookUpdateModel]:
+        book = self._orderbook_cache.get(market)
+        if not book:
+            return None
+        if self._is_orderbook_fresh(market):
+            return book
+        return None
+
+    def _set_orderbook_cache(self, market: str, book: OrderbookUpdateModel) -> None:
+        self._orderbook_cache[market] = book
+        self._orderbook_updated_at[market] = time.time()
+
+    def _load_orderbook_snapshot(self, symbol: str, depth: int = 5) -> Optional[OrderbookUpdateModel]:
         market = normalize_symbol(symbol)
         if not self._trading_client:
             return None
         try:
-            response = self._run_async(self._trading_client.markets_info.get_orderbook(market_name=market))
+            response = self._run_async(self._trading_client.markets_info.get_orderbook_snapshot(market_name=market))
             data = response.data
             if data:
-                depth = 5
                 snapshot = OrderbookUpdateModel(
                     market=data.market,
                     bid=data.bid[:depth],
                     ask=data.ask[:depth],
                 )
-                self._orderbook_cache[market] = snapshot
+                self._set_orderbook_cache(market, snapshot)
                 return snapshot
         except Exception as exc:
             TradingLogger.debug("Orderbook snapshot failed for %s: %s", symbol, exc)

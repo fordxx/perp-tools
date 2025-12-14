@@ -240,6 +240,69 @@ python test_exchanges.py --all --json-report report.json
 
 ---
 
+## 🧪 连接 → 下单 → 关单 三部曲
+
+为了验证交易所连接、下单和关仓能力，我们推荐结合自动化模式和交互式菜单，按照以下顺序逐步走通核心链路。
+
+### 1️⃣ 连接健康检查
+```
+python test_exchanges.py hyperliquid paradex extended --auto-test
+```
+该命令会分别输出连接、价格、订单簿、账户、持仓等步骤的响应时间：
+
+```
+1️⃣ Testing connection...
+   ✅ Connected (42ms)
+2️⃣ Testing price...
+   ✅ Price: 0.25-0.26 (71ms)
+3️⃣ Testing orderbook...
+   ✅ Bids: 5 / Asks: 5 (58ms)
+...
+✅ PARADex test completed
+```
+
+如果需要更细致指标，可以添加 `--json-report bench.json`，再用 `jq`/Python 读取 `connection_time_ms`、`price_time_ms` 等字段。
+
+### 2️⃣ 限价单 + 撤单
+启用了 `--trading` 后，脚本自动执行限价单 + 撤单流程：
+
+```
+python test_exchanges.py okx --auto-test --trading --trading-size 0.001
+```
+
+日志示例：
+
+```
+6️⃣ Testing limit order (BTC/USDT, size=0.001)...
+   ✅ Order placed: ID=12345
+   📍 Attempting to cancel order...
+   ✅ Order cancelled: ID=12345
+```
+
+系统会在无法撤单时输出警告（`⚠️ Exchange does not support cancel_order`），避免交易断链。
+
+### 3️⃣ 市价单 + 平仓
+限价测试之后会依次执行市价单和 `place_close_order` 的验证：
+
+```
+7️⃣ Testing market/IOC order (BTC/USDT, size=0.001)...
+   ✅ Market order placed: ID=54321, Price=45123.45
+
+8️⃣ Testing close position (BTC/USDT)...
+   ✅ Close order placed: ID=54322
+```
+
+如果没有对应持仓或缺少 `place_close_order` 方法，脚本会在日志中明确提示具体原因，便于补全。
+
+### 4️⃣ 交互式菜单体验
+想手动逐步验证也很简单：
+
+```
+python test_exchanges.py okx --symbol BTC/USDT
+```
+
+菜单里的 `5️⃣`/`6️⃣`/`7️⃣` 分别对应下限价单、下市价单、平仓，各操作会提示当前价格、订单 ID 和状态，是体验新版路线的最佳方式。
+
 ## 🔐 凭证配置
 
 ### 方式 1: 编辑 .env 文件

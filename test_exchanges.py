@@ -45,11 +45,14 @@ import argparse
 import json
 import logging
 import os
+import random
+import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -68,6 +71,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger("exchange-test")
 
+_ACCOUNT_OPTIONAL_EXCHANGES = {"binance"}
+
+def configure_noisy_loggers(verbose: bool) -> None:
+    """Reduce wire-level noise unless explicitly requested.
+
+    Set `PERPBOT_VERBOSE_WIRE_LOGS=1` to keep websockets/httpcore debug logs.
+    """
+    wire_verbose = os.getenv("PERPBOT_VERBOSE_WIRE_LOGS", "0").strip().lower() in {"1", "true", "yes", "y"}
+    # `--verbose` should not automatically enable wire-level logs (can leak auth headers and drown signal).
+    if wire_verbose:
+        return
+
+    for name in [
+        "websockets",
+        "websockets.client",
+        "websockets.server",
+        "httpcore",
+        "httpx",
+        "urllib3",
+        "aiohttp",
+        "asyncio",
+    ]:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+def log_diag_env() -> None:
+    keys = [
+        "PERPBOT_HTTP_RETRY_ATTEMPTS",
+        "PERPBOT_HTTP_RETRY_STATUS_CODES",
+        "PERPBOT_WS_STALE_SEC",
+        "PERPBOT_WS_RECONNECT_BACKOFF_MAX_SEC",
+        "PERPBOT_VERBOSE_WIRE_LOGS",
+    ]
+    parts = []
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip() != "":
+            parts.append(f"{k}={v}")
+    if parts:
+        logger.info("[diag-env] %s", " ".join(parts))
+
 
 # ============================================================
 # 数据结构
@@ -84,6 +127,7 @@ class ExchangeConfig:
     use_mainnet: bool = True  # 默认主网
     mainnet_param: str = "use_testnet"  # 参数名称
     mainnet_value: bool = False  # 主网时的值
+    default_symbol: str = "ETH/USDT"  # 默认交易对
 
 
 @dataclass
@@ -153,8 +197,8 @@ EXCHANGE_CONFIGS = {
         name="bybit",
         class_name="BybitClient",
         module_name="perpbot.exchanges.bybit",
-        required_env=["BYBIT_API_KEY", "BYBIT_API_SECRET"],
-        optional_env=["BYBIT_UID"],
+        required_env=[],  # Bybit 支持公共行情接口（无凭证也可跑只读测试）
+        optional_env=["BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_ENV", "BYBIT_UID"],
         use_mainnet=True,
     ),
     
@@ -166,6 +210,7 @@ EXCHANGE_CONFIGS = {
         required_env=[],  # 可选凭证
         optional_env=["HYPERLIQUID_ACCOUNT_ADDRESS", "HYPERLIQUID_PRIVATE_KEY"],
         use_mainnet=True,
+        default_symbol="BTC",  # Hyperliquid 使用 BTC 而不是 BTC/USDT
     ),
     "paradex": ExchangeConfig(
         name="paradex",
@@ -180,12 +225,21 @@ EXCHANGE_CONFIGS = {
         module_name="perpbot.exchanges.extended",
         required_env=["EXTENDED_API_KEY", "EXTENDED_STARK_PRIVATE_KEY", "EXTENDED_VAULT_NUMBER"],
         use_mainnet=True,
+        default_symbol="BTC/USD",  # Extended 市场通常为 BTC-USD / ETH-USD
     ),
     "lighter": ExchangeConfig(
         name="lighter",
         class_name="LighterClient",
         module_name="perpbot.exchanges.lighter",
-        required_env=["LIGHTER_API_KEY", "LIGHTER_PRIVATE_KEY"],
+        required_env=[],  # 支持只读模式（无需凭证）
+        optional_env=[
+            "LIGHTER_API_KEY_PRIVATE_KEY",  # 推荐：API Key 私钥（0x 前缀）
+            "LIGHTER_PRIVATE_KEY",  # 兼容旧命名
+            "LIGHTER_ACCOUNT_INDEX",
+            "LIGHTER_API_KEY_INDEX",
+            "LIGHTER_ENV",
+            "LIGHTER_API_BASE_URL",
+        ],
         use_mainnet=True,
     ),
     "edgex": ExchangeConfig(
@@ -207,22 +261,14 @@ EXCHANGE_CONFIGS = {
         name="grvt",
         class_name="GRVTClient",
         module_name="perpbot.exchanges.grvt",
-        required_env=["GRVT_API_KEY"],
+        required_env=["GRVT_API_KEY", "GRVT_PRIVATE_KEY", "GRVT_TRADING_ACCOUNT_ID"],
         use_mainnet=True,
     ),
     "aster": ExchangeConfig(
         name="aster",
         class_name="AsterClient",
         module_name="perpbot.exchanges.aster",
-        required_env=["ASTER_API_KEY"],
-        use_mainnet=True,
-    ),
-    "sunx": ExchangeConfig(
-        name="sunx",
-        class_name="SunxClient",
-        module_name="perpbot.exchanges.sunx",
-        required_env=["SUNX_API_KEY"],
-        optional_env=["SUNX_API_SECRET"],
+        required_env=["ASTER_API_KEY", "ASTER_API_SECRET"],
         use_mainnet=True,
     ),
 }
@@ -235,13 +281,16 @@ EXCHANGE_CONFIGS = {
 class UnifiedExchangeTester:
     """统一交易所测试器"""
     
-    def __init__(self, include_trading: bool = False, verbose: bool = False):
+    def __init__(self, include_trading: bool = False, verbose: bool = False, skip_account: bool = False):
         self.include_trading = include_trading
         self.verbose = verbose
+        self.skip_account = skip_account
         load_dotenv()
         
         if verbose:
             logging.getLogger().setLevel(logging.DEBUG)
+        configure_noisy_loggers(verbose=verbose)
+        log_diag_env()
         
         self.metrics: List[TestMetrics] = []
         self.errors: Dict[str, str] = {}
@@ -280,14 +329,86 @@ class UnifiedExchangeTester:
         except Exception as e:
             duration_ms = (time.perf_counter() - start) * 1000
             return None, duration_ms, str(e)
-    
-    def test_exchange(self, exchange_name: str, symbol: str = "BTC/USDT") -> Optional[TestMetrics]:
+
+    def _record_step_error(self, exchange_name: str, metrics: TestMetrics, label: str, error: str):
+        """记录当前步骤的错误信息"""
+        if not error:
+            return
+        entry = f"{label}: {error}"
+        if metrics.error:
+            metrics.error = f"{metrics.error}; {entry}"
+        else:
+            metrics.error = entry
+        self.errors[exchange_name] = metrics.error
+
+    def _is_optional_account_error(self, exchange_name: str, error: Optional[str]) -> bool:
+        if not error:
+            return False
+        if exchange_name not in _ACCOUNT_OPTIONAL_EXCHANGES:
+            return False
+        msg = error.lower()
+        return "reference-only" in msg or "trading is disabled" in msg
+
+    def _validate_quote(self, exchange_name: str, symbol: str, metrics: TestMetrics, quote: Any) -> bool:
+        bid_ok = bool(quote) and getattr(quote, "bid", 0) and float(quote.bid) > 0
+        ask_ok = bool(quote) and getattr(quote, "ask", 0) and float(quote.ask) > 0
+        if not (bid_ok and ask_ok):
+            metrics.price_ok = False
+            self._record_step_error(
+                exchange_name,
+                metrics,
+                "Invalid price",
+                f"bid/ask is 0 (symbol={symbol}); check symbol mapping or exchange connectivity",
+            )
+            logger.warning(
+                "   ⚠️ Price invalid (bid=%s, ask=%s)",
+                getattr(quote, "bid", None),
+                getattr(quote, "ask", None),
+            )
+            return False
+        return True
+
+    def _validate_orderbook(self, exchange_name: str, symbol: str, metrics: TestMetrics, orderbook: Any) -> bool:
+        metrics.orderbook_bids = len(orderbook.bids) if orderbook else 0
+        metrics.orderbook_asks = len(orderbook.asks) if orderbook else 0
+        if metrics.orderbook_bids <= 0 or metrics.orderbook_asks <= 0:
+            metrics.orderbook_ok = False
+            self._record_step_error(
+                exchange_name,
+                metrics,
+                "Invalid orderbook",
+                f"empty bids/asks (symbol={symbol}); check symbol mapping or exchange connectivity",
+            )
+            logger.warning(
+                "   ⚠️ Orderbook invalid: %s bids, %s asks",
+                metrics.orderbook_bids,
+                metrics.orderbook_asks,
+            )
+            return False
+        return True
+
+    def test_exchange(self, exchange_name: str, symbol: Optional[str] = None) -> Optional[TestMetrics]:
         """测试单个交易所"""
         if exchange_name not in EXCHANGE_CONFIGS:
             logger.error(f"Unknown exchange: {exchange_name}")
             return None
         
         config = EXCHANGE_CONFIGS[exchange_name]
+
+        # 使用配置的默认交易对（如果没有指定）
+        if symbol is None:
+            try:
+                from perpbot.exchanges.runtime_config import load_exchange_runtime_config
+
+                runtime_cfg = load_exchange_runtime_config(exchange_name)
+            except Exception:
+                runtime_cfg = None
+
+            symbol = (
+                (runtime_cfg.default_symbol if runtime_cfg and runtime_cfg.default_symbol else None)
+                or config.default_symbol
+            )
+
         metrics = TestMetrics(
             exchange=exchange_name,
             timestamp=datetime.now().isoformat(),
@@ -298,7 +419,7 @@ class UnifiedExchangeTester:
             balance_ok=False,
             positions_ok=False,
         )
-        
+
         logger.info(f"\n{'='*60}")
         logger.info(f"Testing {exchange_name.upper()}")
         logger.info(f"{'='*60}")
@@ -346,10 +467,12 @@ class UnifiedExchangeTester:
         metrics.price_ok = error is None
         metrics.price_time_ms = duration
         if error:
+            self._record_step_error(exchange_name, metrics, "Price fetch failed", error)
             logger.warning(f"   ⚠️ Price fetch failed: {error}")
         else:
             metrics.price_value = quote.mid if quote else None
-            logger.info(f"   ✅ Price: {quote.bid:.2f}-{quote.ask:.2f} ({duration:.0f}ms)")
+            if self._validate_quote(exchange_name, symbol, metrics, quote):
+                logger.info(f"   ✅ Price: {quote.bid:.2f}-{quote.ask:.2f} ({duration:.0f}ms)")
         
         # 测试 3: 订单簿
         logger.info(f"3️⃣ Testing orderbook ({symbol})...")
@@ -359,40 +482,60 @@ class UnifiedExchangeTester:
         metrics.orderbook_ok = error is None
         metrics.orderbook_time_ms = duration
         if error:
+            self._record_step_error(exchange_name, metrics, "Orderbook fetch failed", error)
             logger.warning(f"   ⚠️ Orderbook fetch failed: {error}")
         else:
-            metrics.orderbook_bids = len(orderbook.bids) if orderbook else 0
-            metrics.orderbook_asks = len(orderbook.asks) if orderbook else 0
-            logger.info(f"   ✅ Orderbook: {metrics.orderbook_bids} bids, {metrics.orderbook_asks} asks ({duration:.0f}ms)")
+            if self._validate_orderbook(exchange_name, symbol, metrics, orderbook):
+                logger.info(f"   ✅ Orderbook: {metrics.orderbook_bids} bids, {metrics.orderbook_asks} asks ({duration:.0f}ms)")
         
         # 测试 4: 账户余额
-        logger.info("4️⃣ Testing account balances...")
-        def _get_balances():
-            return client.get_account_balances()
-        balances, duration, error = self._time_operation(_get_balances)
-        metrics.balance_ok = error is None
-        metrics.balance_time_ms = duration
-        if error:
-            logger.warning(f"   ⚠️ Balance fetch failed: {error}")
+        if self.skip_account:
+            logger.info("4️⃣ Testing account balances... (skipped)")
+            metrics.balance_ok = True
         else:
-            metrics.balance_count = len(balances) if balances else 0
-            logger.info(f"   ✅ Found {metrics.balance_count} balances ({duration:.0f}ms)")
-            if balances and len(balances) > 0:
-                for balance in balances[:3]:
-                    logger.info(f"      - {balance.currency}: {balance.free} free")
+            logger.info("4️⃣ Testing account balances...")
+            def _get_balances():
+                return client.get_account_balances()
+            balances, duration, error = self._time_operation(_get_balances)
+            if error and self._is_optional_account_error(exchange_name, error):
+                metrics.balance_ok = True
+                metrics.balance_time_ms = duration
+                logger.info("   ⏭️ Balances skipped (%s)", error)
+            else:
+                metrics.balance_ok = error is None
+                metrics.balance_time_ms = duration
+            if error and not self._is_optional_account_error(exchange_name, error):
+                self._record_step_error(exchange_name, metrics, "Balance fetch failed", error)
+                logger.warning(f"   ⚠️ Balance fetch failed: {error}")
+            else:
+                metrics.balance_count = len(balances) if balances else 0
+                logger.info(f"   ✅ Found {metrics.balance_count} balances ({duration:.0f}ms)")
+                if balances and len(balances) > 0:
+                    for balance in balances[:3]:
+                        logger.info(f"      - {balance.asset}: {balance.free} free")
         
         # 测试 5: 持仓
-        logger.info("5️⃣ Testing positions...")
-        def _get_positions():
-            return client.get_account_positions()
-        positions, duration, error = self._time_operation(_get_positions)
-        metrics.positions_ok = error is None
-        metrics.positions_time_ms = duration
-        if error:
-            logger.warning(f"   ⚠️ Positions fetch failed: {error}")
+        if self.skip_account:
+            logger.info("5️⃣ Testing positions... (skipped)")
+            metrics.positions_ok = True
         else:
-            metrics.positions_count = len(positions) if positions else 0
-            logger.info(f"   ✅ Found {metrics.positions_count} positions ({duration:.0f}ms)")
+            logger.info("5️⃣ Testing positions...")
+            def _get_positions():
+                return client.get_account_positions()
+            positions, duration, error = self._time_operation(_get_positions)
+            if error and self._is_optional_account_error(exchange_name, error):
+                metrics.positions_ok = True
+                metrics.positions_time_ms = duration
+                logger.info("   ⏭️ Positions skipped (%s)", error)
+            else:
+                metrics.positions_ok = error is None
+                metrics.positions_time_ms = duration
+            if error and not self._is_optional_account_error(exchange_name, error):
+                self._record_step_error(exchange_name, metrics, "Positions fetch failed", error)
+                logger.warning(f"   ⚠️ Positions fetch failed: {error}")
+            else:
+                metrics.positions_count = len(positions) if positions else 0
+                logger.info(f"   ✅ Found {metrics.positions_count} positions ({duration:.0f}ms)")
         
         logger.info(f"✅ {exchange_name.upper()} test completed")
         self.metrics.append(metrics)
@@ -517,22 +660,30 @@ class UnifiedExchangeTester:
     
     def interactive_menu(self, exchange_name: str, client: Any, symbol: str) -> None:
         """交互式菜单"""
+        # 预设的下单大小和价格偏差
+        SIZE_OPTIONS = [0.0001, 0.0005, 0.001, 0.005, 0.01]
+        OFFSET_OPTIONS = [0.005, 0.01, 0.02, 0.05, 0.1]
+        
         while True:
             print(f"\n{'='*60}")
             print(f"🔄 {exchange_name.upper()} - 交互式菜单")
             print(f"{'='*60}")
             print(f"交易对: {symbol}")
             print()
-            print("1️⃣  查询价格")
-            print("2️⃣  查询订单簿")
-            print("3️⃣  查询账户余额")
-            print("4️⃣  查询持仓")
-            print("5️⃣  下限价单 (买)")
-            print("6️⃣  下市价单 (买)")
-            print("7️⃣  撤销最近订单")
-            print("8️⃣  平仓")
-            print("9️⃣  切换交易对")
-            print("0️⃣  返回")
+            print("📊 查询功能:")
+            print("  1️⃣  查询价格")
+            print("  2️⃣  查询订单簿")
+            print("  3️⃣  查询账户余额")
+            print("  4️⃣  查询持仓")
+            print()
+            print("💰 交易功能:")
+            print("  5️⃣  下限价单 (买)")
+            print("  6️⃣  下市价单 (买)")
+            print("  7️⃣  平仓")
+            print()
+            print("⚙️  其他:")
+            print("  8️⃣  切换交易对")
+            print("  0️⃣  返回")
             print()
             
             choice = input("请选择操作 (0-9): ").strip()
@@ -555,10 +706,10 @@ class UnifiedExchangeTester:
                     print(f"\n📊 {symbol} 订单簿 (深度5)")
                     print(f"   卖盘 (Asks):")
                     for ask in (ob.asks[:3] if ob.asks else []):
-                        print(f"      {ask.price:.2f} x {ask.size}")
+                        print(f"      {ask[0]:.2f} x {ask[1]}")
                     print(f"   买盘 (Bids):")
                     for bid in (ob.bids[:3] if ob.bids else []):
-                        print(f"      {bid.price:.2f} x {bid.size}")
+                        print(f"      {bid[0]:.2f} x {bid[1]}")
                 except Exception as e:
                     print(f"❌ 获取订单簿失败: {e}")
             
@@ -567,7 +718,7 @@ class UnifiedExchangeTester:
                     balances = client.get_account_balances()
                     print(f"\n💰 账户余额 ({len(balances)} 种资产)")
                     for b in balances[:5]:
-                        print(f"   {b.currency}: 可用={b.free}, 锁定={b.locked}")
+                        print(f"   {b.asset}: 可用={b.free}, 锁定={b.locked}")
                 except Exception as e:
                     print(f"❌ 获取余额失败: {e}")
             
@@ -585,32 +736,15 @@ class UnifiedExchangeTester:
                     print(f"❌ 获取持仓失败: {e}")
             
             elif choice == "5":
-                try:
-                    size = float(input(f"请输入下单数量 (default=0.001): ").strip() or "0.001")
-                    offset = float(input(f"请输入限价偏差 (default=0.01): ").strip() or "0.01")
-                    success, msg = self.test_limit_order(client, symbol, size, offset)
-                    if success:
-                        print(f"✅ {msg}")
-                    else:
-                        print(f"❌ {msg}")
-                except Exception as e:
-                    print(f"❌ 下单失败: {e}")
+                # 下限价单 - 用数字选择
+                self._order_with_selection(client, symbol, SIZE_OPTIONS, OFFSET_OPTIONS, "limit")
             
             elif choice == "6":
-                try:
-                    size = float(input(f"请输入下单数量 (default=0.001): ").strip() or "0.001")
-                    success, msg = self.test_market_order(client, symbol, size)
-                    if success:
-                        print(f"✅ {msg}")
-                    else:
-                        print(f"❌ {msg}")
-                except Exception as e:
-                    print(f"❌ 下单失败: {e}")
+                # 下市价单 - 用数字选择
+                self._order_with_selection(client, symbol, SIZE_OPTIONS, None, "market")
             
             elif choice == "7":
-                print("⚠️  此功能需要保存最后的订单 ID (未实现)")
-            
-            elif choice == "8":
+                # 平仓
                 try:
                     success, msg = self.test_close_position(client, symbol)
                     if success:
@@ -620,14 +754,69 @@ class UnifiedExchangeTester:
                 except Exception as e:
                     print(f"❌ 平仓失败: {e}")
             
-            elif choice == "9":
+            elif choice == "8":
                 symbol = input("请输入新交易对 (e.g., BTC/USDT): ").strip()
-                print(f"✅ 已切换到 {symbol}")
+                if symbol:
+                    print(f"✅ 已切换到 {symbol}")
             
             else:
                 print("❌ 无效选择")
     
-    def run_tests(self, exchanges: Optional[List[str]] = None, symbol: str = "BTC/USDT") -> TestReport:
+    def _order_with_selection(self, client: Any, symbol: str, size_options: List[float], offset_options: Optional[List[float]], order_type: str) -> None:
+        """通过数字选择来下单"""
+        try:
+            # 第 1 步: 选择下单数量
+            print(f"\n{'='*50}")
+            print(f"📊 选择下单数量")
+            print(f"{'='*50}")
+            for i, size in enumerate(size_options, 1):
+                print(f"  {i}️⃣  {size}")
+            print(f"  0️⃣  自定义")
+            
+            size_choice = input("请选择 (0-5): ").strip()
+            
+            if size_choice == "0":
+                size = float(input("请输入自定义数量: ").strip())
+            elif size_choice in [str(i) for i in range(1, len(size_options) + 1)]:
+                size = size_options[int(size_choice) - 1]
+            else:
+                print("❌ 无效选择")
+                return
+            
+            # 第 2 步: 如果是限价单，选择价格偏差
+            if order_type == "limit" and offset_options:
+                print(f"\n{'='*50}")
+                print(f"📊 选择限价偏差（距离当前价格的百分比）")
+                print(f"{'='*50}")
+                for i, offset in enumerate(offset_options, 1):
+                    print(f"  {i}️⃣  {offset*100:.1f}%")
+                print(f"  0️⃣  自定义")
+                
+                offset_choice = input("请选择 (0-5): ").strip()
+                
+                if offset_choice == "0":
+                    offset = float(input("请输入自定义偏差 (例如 0.02 表示 2%): ").strip())
+                elif offset_choice in [str(i) for i in range(1, len(offset_options) + 1)]:
+                    offset = offset_options[int(offset_choice) - 1]
+                else:
+                    print("❌ 无效选择")
+                    return
+                
+                success, msg = self.test_limit_order(client, symbol, size, offset)
+            else:
+                success, msg = self.test_market_order(client, symbol, size)
+            
+            if success:
+                print(f"\n✅ {msg}")
+            else:
+                print(f"\n❌ {msg}")
+        
+        except ValueError:
+            print("❌ 输入格式错误")
+        except Exception as e:
+            print(f"❌ 下单失败: {e}")
+    
+    def run_tests(self, exchanges: Optional[List[str]] = None, symbol: Optional[str] = None) -> TestReport:
         """运行测试"""
         start_time = time.time()
         
@@ -673,6 +862,123 @@ class UnifiedExchangeTester:
     def print_summary(self, report: TestReport):
         """打印汇总报告"""
         logger.info(f"\n{'='*70}")
+
+    def soak_exchange(
+        self,
+        exchange_name: str,
+        duration_sec: float,
+        symbols: List[str],
+        interval_sec: float,
+        jitter_sec: float,
+        account_every: int,
+        max_fail_rate: float,
+    ) -> int:
+        """长时间 Soak 测试，用于暴露间歇性失败/断连/限频/符号映射问题。
+
+        - 单进程长连接：connect 一次，循环多次请求
+        - 每轮输出一条 `[soak]` 行，方便 grep/统计
+        - 失败率超过阈值直接退出（暴露问题优先）
+        """
+        if exchange_name not in EXCHANGE_CONFIGS:
+            logger.error("Unknown exchange: %s", exchange_name)
+            return 2
+
+        config = EXCHANGE_CONFIGS[exchange_name]
+        has_env, missing = self._check_env(config)
+        if not has_env:
+            logger.error("❌ Missing env vars for %s: %s", exchange_name, ", ".join(missing))
+            return 2
+
+        client = self._load_exchange_client(config)
+        client.connect()
+
+        start = time.time()
+        end = start + duration_sec if duration_sec > 0 else float("inf")
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            symbols = [config.default_symbol]
+
+        total = 0
+        failures = 0
+
+        logger.info(
+            "[soak] exchange=%s duration=%ss interval=%ss jitter=%ss symbols=%s account_every=%s max_fail_rate=%s",
+            exchange_name,
+            duration_sec,
+            interval_sec,
+            jitter_sec,
+            symbols,
+            account_every,
+            max_fail_rate,
+        )
+
+        if self.skip_account:
+            account_every = 0
+
+        i = 0
+        while time.time() < end:
+            i += 1
+            symbol = symbols[(i - 1) % len(symbols)]
+
+            metrics = TestMetrics(
+                exchange=exchange_name,
+                timestamp=datetime.now().isoformat(),
+                connection_ok=True,
+                connection_time_ms=0,
+                price_ok=False,
+                orderbook_ok=False,
+                balance_ok=False,
+                positions_ok=False,
+            )
+
+            quote, dt_price, err_price = self._time_operation(lambda: client.get_current_price(symbol))
+            metrics.price_time_ms = dt_price
+            metrics.price_ok = err_price is None and self._validate_quote(exchange_name, symbol, metrics, quote)
+
+            ob, dt_ob, err_ob = self._time_operation(lambda: client.get_orderbook(symbol, depth=5))
+            metrics.orderbook_time_ms = dt_ob
+            metrics.orderbook_ok = err_ob is None and self._validate_orderbook(exchange_name, symbol, metrics, ob)
+
+            if account_every > 0 and (i % account_every == 0):
+                _, dt_bal, err_bal = self._time_operation(lambda: client.get_account_balances())
+                metrics.balance_time_ms = dt_bal
+                metrics.balance_ok = err_bal is None or self._is_optional_account_error(exchange_name, err_bal)
+
+                _, dt_pos, err_pos = self._time_operation(lambda: client.get_account_positions())
+                metrics.positions_time_ms = dt_pos
+                metrics.positions_ok = err_pos is None or self._is_optional_account_error(exchange_name, err_pos)
+            else:
+                metrics.balance_ok = True
+                metrics.positions_ok = True
+
+            ok = metrics.price_ok and metrics.orderbook_ok and metrics.balance_ok and metrics.positions_ok
+            total += 1
+            if not ok:
+                failures += 1
+
+            fail_rate = failures / max(total, 1)
+            logger.info(
+                "[soak] i=%d symbol=%s ok=%s fail_rate=%.4f price_ms=%.0f ob_ms=%.0f err=%s",
+                i,
+                symbol,
+                "1" if ok else "0",
+                fail_rate,
+                metrics.price_time_ms,
+                metrics.orderbook_time_ms,
+                metrics.error or "",
+            )
+
+            if max_fail_rate >= 0 and fail_rate > max_fail_rate:
+                logger.error("[soak] abort: fail_rate %.4f > max_fail_rate %.4f", fail_rate, max_fail_rate)
+                return 1
+
+            sleep_for = max(interval_sec, 0.0)
+            if jitter_sec > 0:
+                sleep_for += random.uniform(0, jitter_sec)
+            time.sleep(sleep_for)
+
+        logger.info("[soak] done: total=%d failures=%d fail_rate=%.4f", total, failures, failures / max(total, 1))
+        return 0 if failures == 0 else 1
         logger.info("📊 TEST SUMMARY")
         logger.info(f"{'='*70}")
         
@@ -844,8 +1150,8 @@ Examples:
     )
     parser.add_argument(
         "--symbol",
-        default="BTC/USDT",
-        help="要查询的交易对 (默认: BTC/USDT)",
+        default=None,
+        help="要查询的交易对 (默认: 根据交易所自动选择)",
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -877,6 +1183,47 @@ Examples:
         "--json-report",
         help="输出 JSON 报告到指定文件",
     )
+    parser.add_argument(
+        "--soak",
+        type=float,
+        default=0.0,
+        help="Soak 测试持续秒数（>0 启用；仅支持单交易所单进程长跑）",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=5.0,
+        help="Soak 模式每轮间隔秒数（默认 5）",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=0.5,
+        help="Soak 模式随机抖动秒数（每轮额外 sleep 0..jitter）",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default="",
+        help="Soak 模式轮换的交易对列表（逗号分隔），如 BTC/USDT,ETH/USDT",
+    )
+    parser.add_argument(
+        "--account-every",
+        type=int,
+        default=12,
+        help="Soak 模式每 N 轮做一次余额/持仓查询（默认 12；0 表示关闭）",
+    )
+    parser.add_argument(
+        "--max-fail-rate",
+        type=float,
+        default=0.0,
+        help="Soak 模式失败率阈值，超过就退出（默认 0 = 任意失败都退出）",
+    )
+    parser.add_argument(
+        "--skip-account",
+        action="store_true",
+        help="跳过余额/持仓查询（仅测连接+行情；适合 reference-only 或凭证不完整时）",
+    )
     
     args = parser.parse_args()
     
@@ -885,11 +1232,12 @@ Examples:
         print("\n" + "="*70)
         print("🌍 Supported Exchanges (生产级)")
         print("="*70)
-        
+
+        tester_for_list = UnifiedExchangeTester()
         exchange_list = list(EXCHANGE_CONFIGS.keys())
         for idx, name in enumerate(exchange_list, 1):
             config = EXCHANGE_CONFIGS[name]
-            has_env, _ = UnifiedExchangeTester()._check_env(config)
+            has_env, _ = tester_for_list._check_env(config)
             status = "✅ 已配置" if has_env else "❌ 缺凭证"
             mainnet = "主网" if config.use_mainnet else "DEMO"
             env_vars = ", ".join(config.required_env) if config.required_env else "optional"
@@ -914,12 +1262,62 @@ Examples:
     if not selected_exchanges:
         logger.error("No exchanges selected!")
         sys.exit(1)
+
+    # 如果只选了一个交易所，且还未由 wrapper 调用，交给 run_exchange_test.sh 自动激活虚拟环境
+    wrapper_script = Path(__file__).resolve().parent / "run_exchange_test.sh"
+    if (
+        len(selected_exchanges) == 1
+        and os.environ.get("USE_VENV_WRAPPER") != "1"
+        and wrapper_script.exists()
+    ):
+        script_args = sys.argv[1:]
+        env = os.environ.copy()
+        env["USE_VENV_WRAPPER"] = "1"
+        logger.info("Detected single-exchange run, delegating to %s for venv handling", wrapper_script)
+        return_code = subprocess.call([str(wrapper_script)] + script_args, env=env)
+        sys.exit(return_code)
     
     # 创建测试器
     tester = UnifiedExchangeTester(
         include_trading=args.trading,
         verbose=args.verbose,
+        skip_account=args.skip_account,
     )
+
+    # Soak 模式：单交易所长跑，专门用来暴露间歇性问题
+    if args.soak and args.soak > 0:
+        if len(selected_exchanges) != 1:
+            logger.error("--soak only supports a single exchange per run")
+            sys.exit(2)
+
+        exchange_name = selected_exchanges[0]
+        config = EXCHANGE_CONFIGS[exchange_name]
+
+        from perpbot.exchanges.runtime_config import load_exchange_runtime_config
+
+        runtime_cfg = load_exchange_runtime_config(exchange_name)
+        cfg_symbols: List[str] = []
+        if runtime_cfg and runtime_cfg.symbols:
+            cfg_symbols = list(runtime_cfg.symbols)
+
+        if args.symbols.strip():
+            cfg_symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+        # `--symbol` 优先，放在轮换列表开头（更快暴露符号映射问题）
+        preferred_symbol = args.symbol if args.symbol is not None else (runtime_cfg.default_symbol if runtime_cfg and runtime_cfg.default_symbol else None)
+        if preferred_symbol:
+            cfg_symbols = [preferred_symbol] + [s for s in cfg_symbols if s != preferred_symbol]
+
+        rc = tester.soak_exchange(
+            exchange_name=exchange_name,
+            duration_sec=float(args.soak),
+            symbols=cfg_symbols or [config.default_symbol],
+            interval_sec=float(args.interval),
+            jitter_sec=float(args.jitter),
+            account_every=int(args.account_every),
+            max_fail_rate=float(args.max_fail_rate),
+        )
+        sys.exit(rc)
     
     # 如果只选择了一个交易所，可能进入交互式模式或带交易的自动测试
     if len(selected_exchanges) == 1 and (args.interactive or not args.auto_test):
@@ -941,40 +1339,45 @@ Examples:
             logger.error(f"❌ Failed to connect: {e}")
             sys.exit(1)
         
+        # 使用配置的默认交易对（如果没有指定）
+        symbol = args.symbol if args.symbol is not None else config.default_symbol
+
         # 基础测试
         logger.info(f"\n{'='*60}")
         logger.info(f"交易所: {exchange_name.upper()}")
-        logger.info(f"交易对: {args.symbol}")
+        logger.info(f"交易对: {symbol}")
         logger.info(f"{'='*60}")
-        
-        tester.test_exchange(exchange_name, args.symbol)
-        
+
+        tester.test_exchange(exchange_name, symbol)
+
         # 如果指定了 --trading，运行交易测试
         if args.trading:
             logger.info(f"\n{'='*60}")
             logger.info(f"🔄 运行交易测试 (大小: {args.trading_size})")
             logger.info(f"{'='*60}")
-            
+
             # 测试限价单
-            success, msg = tester.test_limit_order(client, args.symbol, args.trading_size)
-            
+            success, msg = tester.test_limit_order(client, symbol, args.trading_size)
+
             # 测试市价单
             time.sleep(1)
-            success, msg = tester.test_market_order(client, args.symbol, args.trading_size)
-            
+            success, msg = tester.test_market_order(client, symbol, args.trading_size)
+
             # 测试平仓
             time.sleep(1)
-            success, msg = tester.test_close_position(client, args.symbol)
+            success, msg = tester.test_close_position(client, symbol)
         else:
             # 进入交互式菜单
             logger.info(f"\n💡 提示: 使用 --trading 启用交易功能，或使用 --auto-test 自动化模式")
-            tester.interactive_menu(exchange_name, client, args.symbol)
+            tester.interactive_menu(exchange_name, client, symbol)
     
     else:
         # 多个交易所的自动化测试模式
         if not args.auto_test:
             print(f"\n💡 多个交易所检测到，自动进入自动化测试模式")
-        
+
+        # 使用默认交易对（如果没有指定）
+        # 注意：多交易所测试时，每个交易所会使用自己的默认交易对
         report = tester.run_tests(selected_exchanges, args.symbol)
         tester.print_summary(report)
         

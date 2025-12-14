@@ -15,6 +15,7 @@ import hmac
 import logging
 import os
 import time
+from urllib.parse import urlencode
 from typing import Callable, List, Optional
 
 from dotenv import load_dotenv
@@ -69,11 +70,14 @@ class AsterClient(ExchangeClient):
         self.base_url = self.TESTNET_API if self.use_testnet else self.MAINNET_API
         self.ws_url = self.TESTNET_WS if self.use_testnet else self.MAINNET_WS
 
-        if not self.api_key:
-            logger.warning("⚠️ Aster trading DISABLED: ASTER_API_KEY missing (read-only mode)")
-            self._trading_enabled = False
-        else:
-            self._trading_enabled = True
+        self._trading_enabled = bool(self.api_key and self.api_secret)
+        if not self._trading_enabled:
+            missing = []
+            if not self.api_key:
+                missing.append("ASTER_API_KEY")
+            if not self.api_secret:
+                missing.append("ASTER_API_SECRET")
+            logger.warning("⚠️ Aster trading DISABLED (missing %s) - read-only mode", ",".join(missing))
 
         try:
             import httpx
@@ -137,6 +141,15 @@ class AsterClient(ExchangeClient):
     def _normalize_symbol(self, symbol: str) -> str:
         """Convert BTC/USDT to BTCUSDT."""
         return symbol.replace("/", "").replace("-", "").upper()
+
+    def _sign(self, params: dict) -> str:
+        """Sign parameters with API secret."""
+        if not self.api_secret:
+            raise ValueError("ASTER_API_SECRET missing - cannot sign request.")
+        # Signature must match the exact query string that will be sent.
+        # Do NOT sort; rely on insertion order + standard URL encoding.
+        query_string = urlencode(params, doseq=True)
+        return hmac.new(self.api_secret.encode("utf-8"), query_string.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def get_current_price(self, symbol: str) -> PriceQuote:
         """Fetch current price."""

@@ -4,7 +4,7 @@
 
 ```bash
 # 查看所有支持的交易所
-python test_exchanges.py --list
+python3 test_exchanges.py --list
 ```
 
 **输出示例：**
@@ -27,7 +27,7 @@ python test_exchanges.py --list
 
 ### 方式 1️⃣：交互式选择 (推荐)
 ```bash
-python test_exchanges.py
+python3 test_exchanges.py
 ```
 
 **按提示输入：**
@@ -38,22 +38,22 @@ python test_exchanges.py
 ### 方式 2️⃣：直接指定交易所名称
 ```bash
 # 测试单个
-python test_exchanges.py hyperliquid
+python3 test_exchanges.py hyperliquid
 
 # 测试多个
-python test_exchanges.py hyperliquid paradex extended
+python3 test_exchanges.py hyperliquid paradex extended
 ```
 
 ### 方式 3️⃣：快捷方式
 ```bash
 # 测试所有 CEX
-python test_exchanges.py --cex
+python3 test_exchanges.py --cex
 
 # 测试所有 DEX
-python test_exchanges.py --dex
+python3 test_exchanges.py --dex
 
 # 测试所有交易所
-python test_exchanges.py --all
+python3 test_exchanges.py --all
 ```
 
 ---
@@ -74,7 +74,7 @@ export OKX_API_PASSPHRASE="your_passphrase"
 
 **然后立即测试：**
 ```bash
-python test_exchanges.py okx
+python3 test_exchanges.py okx
 ```
 
 ---
@@ -107,13 +107,13 @@ Testing HYPERLIQUID
 
 | 命令 | 用途 |
 |------|------|
-| `python test_exchanges.py --list` | 列出所有交易所 |
-| `python test_exchanges.py` | 交互式选择 |
-| `python test_exchanges.py hyperliquid paradex` | 测试指定交易所 |
-| `python test_exchanges.py --cex` | 测试所有 CEX |
-| `python test_exchanges.py --dex` | 测试所有 DEX |
-| `python test_exchanges.py okx --verbose` | 详细日志 |
-| `python test_exchanges.py --all --json-report report.json` | 完整报告 |
+| `python3 test_exchanges.py --list` | 列出所有交易所 |
+| `python3 test_exchanges.py` | 交互式选择 |
+| `python3 test_exchanges.py hyperliquid paradex` | 测试指定交易所 |
+| `python3 test_exchanges.py --cex` | 测试所有 CEX |
+| `python3 test_exchanges.py --dex` | 测试所有 DEX |
+| `python3 test_exchanges.py okx --verbose` | 详细日志 |
+| `python3 test_exchanges.py --all --json-report report.json` | 完整报告 |
 
 ---
 
@@ -175,8 +175,8 @@ Connection timeout
 
 ## 💡 提示
 
-1. **首次运行** → 执行 `python test_exchanges.py --list` 了解情况
-2. **测试已有凭证** → 运行 `python test_exchanges.py hyperliquid`
+1. **首次运行** → 执行 `python3 test_exchanges.py --list` 了解情况
+2. **测试已有凭证** → 运行 `python3 test_exchanges.py hyperliquid`
 3. **添加新交易所** → 编辑 `.env`，然后运行测试
 4. **保存报告** → 使用 `--json-report report.json`
 

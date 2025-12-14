@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -107,6 +109,10 @@ class WebSocketMarketDataFeed(ABC):
     async def connect(self) -> None:
         """Connect to WebSocket and start message loop."""
         self._running = True
+        attempt = 0
+        stale_sec = float(os.getenv("PERPBOT_WS_STALE_SEC", "60"))
+        backoff_max = float(os.getenv("PERPBOT_WS_RECONNECT_BACKOFF_MAX_SEC", "60"))
+        jitter_sec = float(os.getenv("PERPBOT_WS_RECONNECT_JITTER_SEC", "0.5"))
 
         while self._running:
             try:
@@ -119,6 +125,7 @@ class WebSocketMarketDataFeed(ABC):
                 ) as ws:
                     self._ws = ws
                     self._last_heartbeat = time.time()
+                    attempt = 0
 
                     logger.info(f"✅ {self.exchange_name} WebSocket connected")
 
@@ -126,19 +133,58 @@ class WebSocketMarketDataFeed(ABC):
                     if self.subscribed_symbols:
                         await self.subscribe(list(self.subscribed_symbols))
 
+                    watchdog_task: Optional[asyncio.Task] = None
+                    if stale_sec > 0 and self.subscribed_symbols:
+                        watchdog_task = asyncio.create_task(self._stale_watchdog(ws, stale_sec))
+
                     # Message processing loop
-                    async for message in ws:
-                        await self._process_message(message)
+                    try:
+                        async for message in ws:
+                            await self._process_message(message)
+                    finally:
+                        if watchdog_task:
+                            watchdog_task.cancel()
+                            try:
+                                await watchdog_task
+                            except Exception:
+                                pass
+
+            except asyncio.CancelledError:
+                raise
 
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"⚠️ {self.exchange_name} WebSocket disconnected: {e}")
                 if self._running:
-                    await asyncio.sleep(5)  # Wait before reconnecting
+                    attempt += 1
+                    await self._sleep_reconnect_backoff(attempt, backoff_max, jitter_sec)
 
             except Exception as e:
                 logger.error(f"❌ {self.exchange_name} WebSocket error: {e}")
                 if self._running:
-                    await asyncio.sleep(5)
+                    attempt += 1
+                    await self._sleep_reconnect_backoff(attempt, backoff_max, jitter_sec)
+
+    async def _sleep_reconnect_backoff(self, attempt: int, max_sec: float, jitter_sec: float) -> None:
+        base = min(max_sec, 1.0 * (2 ** max(0, attempt - 1)))
+        delay = min(max_sec, base + random.uniform(0.0, max(0.0, jitter_sec)))
+        logger.info("Reconnecting %s in %.2fs (attempt %d)", self.exchange_name, delay, attempt)
+        await asyncio.sleep(delay)
+
+    async def _stale_watchdog(self, ws: websockets.WebSocketClientProtocol, stale_sec: float) -> None:
+        while self._running and ws and not ws.closed:
+            await asyncio.sleep(min(5.0, max(1.0, stale_sec / 2)))
+            age = self.heartbeat_age
+            if age > stale_sec and self.subscribed_symbols:
+                logger.warning(
+                    "⚠️ %s WS stale (no updates %.1fs > %.1fs), forcing reconnect",
+                    self.exchange_name,
+                    age,
+                    stale_sec,
+                )
+                try:
+                    await ws.close()
+                finally:
+                    return
 
     async def _process_message(self, raw_message: str) -> None:
         """Process incoming WebSocket message."""

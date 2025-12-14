@@ -1,0 +1,6 @@
+exchange: extended
+default_symbol: BTC/USD
+symbols:
+  - BTC/USD
+  - ETH/USD
+

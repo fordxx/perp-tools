@@ -16,6 +16,8 @@ import httpx
 import websockets
 from dotenv import load_dotenv
 
+from perpbot.utils.retry import RetryConfig, retry_call
+
 # Due to models/ being a package, we import from the parent perpbot.models which is models.py
 # Python will prefer models.py over models/ package when we do:
 from perpbot.models import (
@@ -201,10 +203,55 @@ class RESTWebSocketExchangeClient(ExchangeClient):
         headers = self._auth_headers()
         if signature:
             headers["X-SIGNATURE"] = signature
-        logger.debug("%s %s %s", self.name, method, path)
-        response = self._client.request(method, path, params=params, json=json_body, headers=headers)
-        response.raise_for_status()
-        return response
+
+        def _retry_config() -> RetryConfig:
+            return RetryConfig(
+                max_attempts=int(os.getenv("PERPBOT_HTTP_RETRY_ATTEMPTS", "3")),
+                min_delay_sec=float(os.getenv("PERPBOT_HTTP_RETRY_MIN_DELAY_SEC", "0.25")),
+                max_delay_sec=float(os.getenv("PERPBOT_HTTP_RETRY_MAX_DELAY_SEC", "2.0")),
+                jitter_sec=float(os.getenv("PERPBOT_HTTP_RETRY_JITTER_SEC", "0.25")),
+            )
+
+        retry_statuses = {
+            int(s.strip())
+            for s in os.getenv("PERPBOT_HTTP_RETRY_STATUS_CODES", "429,500,502,503,504").split(",")
+            if s.strip()
+        }
+
+        def _is_retryable(exc: Exception) -> bool:
+            if isinstance(exc, httpx.TimeoutException):
+                return True
+            if isinstance(exc, httpx.RequestError):
+                return True
+            if isinstance(exc, httpx.HTTPStatusError):
+                return exc.response is not None and int(exc.response.status_code) in retry_statuses
+            return False
+
+        def _delay_override(exc: Exception) -> Optional[float]:
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+                if int(exc.response.status_code) == 429:
+                    retry_after = exc.response.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            return float(retry_after)
+                        except ValueError:
+                            return None
+            return None
+
+        def _do() -> httpx.Response:
+            logger.debug("%s %s %s", self.name, method, path)
+            response = self._client.request(method, path, params=params, json=json_body, headers=headers)
+            response.raise_for_status()
+            return response
+
+        return retry_call(
+            _do,
+            config=_retry_config(),
+            is_retryable=_is_retryable,
+            delay_override=_delay_override,
+            label=f"{self.name} HTTP {method} {path}",
+            log=logger,
+        )
 
     def _parse_orderbook(self, data: dict) -> OrderBookDepth:
         bids = data.get("bids") or data.get("bid") or []

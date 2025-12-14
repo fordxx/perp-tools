@@ -132,14 +132,19 @@ EXTENDED_VAULT_NUMBER=123456
 # 获取链接: https://app.extended.exchange/api-management
 # 模式: 主网
 # 支持: 永续合约
-python test_exchanges.py extended
+python test_exchanges.py extended --symbol BTC/USD
 ```
 
 #### 8. **Lighter** (Ethereum L2 DEX)
 ```bash
 # 配置 .env
-LIGHTER_API_KEY=your_api_key
-LIGHTER_PRIVATE_KEY=0xyour_eth_private_key
+# ✅ 推荐（三件套）
+LIGHTER_API_KEY_PRIVATE_KEY=0x...your_lighter_api_key_private_key
+LIGHTER_ACCOUNT_INDEX=1
+LIGHTER_API_KEY_INDEX=0
+
+# 兼容旧命名（不推荐）
+# LIGHTER_PRIVATE_KEY=0x...legacy_alias_do_not_use
 
 # 获取链接: https://app.lighter.xyz
 # 模式: 主网
@@ -230,8 +235,9 @@ EXTENDED_STARK_PRIVATE_KEY=0xyour_stark_key
 EXTENDED_VAULT_NUMBER=123456
 
 # ===== Lighter (DEX) =====
-LIGHTER_API_KEY=your_lighter_api_key
-LIGHTER_PRIVATE_KEY=0xyour_eth_private_key
+LIGHTER_API_KEY_PRIVATE_KEY=0x...your_lighter_api_key_private_key
+LIGHTER_ACCOUNT_INDEX=1
+LIGHTER_API_KEY_INDEX=0
 
 # ===== EdgeX (DEX) =====
 EDGEX_API_KEY=your_edgex_api_key

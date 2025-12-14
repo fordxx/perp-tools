@@ -15,14 +15,17 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from dotenv import load_dotenv
 
 from perpbot.exchanges.base import ExchangeClient
 from perpbot.models import Balance, Order, OrderBookDepth, OrderRequest, Position, PriceQuote
+from perpbot.utils.retry import RetryConfig, retry_call
 
 logger = logging.getLogger(__name__)
+
+_GRVT_ALLOWED_BOOK_DEPTHS = (10, 50, 100)
 
 
 class GRVTClient(ExchangeClient):
@@ -72,132 +75,116 @@ class GRVTClient(ExchangeClient):
         self.base_url = self.TESTNET_API if self.use_testnet else self.MAINNET_API
         self.ws_url = self.TESTNET_WS if self.use_testnet else self.MAINNET_WS
 
-        # Always initialize client for read-only mode support
-        self._trading_enabled = False
+        self._trading_enabled = False # Reset trading status
+
+        # Suppress SDK internal logs that may contain sensitive cookies/session details.
+        if os.getenv("PERPBOT_VERBOSE_WIRE_LOGS", "0").strip().lower() not in {"1", "true", "yes", "y"}:
+            logging.getLogger("pysdk").setLevel(logging.WARNING)
+            logging.getLogger("pysdk.grvt_raw_base").setLevel(logging.WARNING)
+
+        # --- SDK Initialization ---
+        # If all mandatory credentials for SDK are provided, attempt to initialize the SDK
+        if all([self.api_key, self.private_key, self.trading_account_id]):
+            try:
+                from pysdk.grvt_raw_sync import GrvtRawSync
+                from pysdk.grvt_raw_base import GrvtApiConfig
+                from pysdk.grvt_raw_env import GrvtEnv
+
+                env_type = GrvtEnv.TESTNET if self.use_testnet else GrvtEnv.PROD
+                config = GrvtApiConfig(
+                    env=env_type,
+                    trading_account_id=self.trading_account_id,
+                    private_key=self.private_key,
+                    api_key=self.api_key,
+                    # Avoid logging sensitive cookies/session details from SDK internals.
+                    logger=None,
+                )
+                self._sdk = GrvtRawSync(config=config)
+                self._trading_enabled = True
+                logger.info("✅ GRVT SDK initialized and connected (testnet=%s, trading=True)", self.use_testnet)
+
+            except ImportError:
+                logger.error("❌ GRVT SDK not installed. Please install 'grvt-pysdk' to enable GRVT trading and account queries.")
+            except Exception as e:
+                logger.exception("❌ GRVT SDK initialization failed: %s", e)
+        else:
+            logger.warning("⚠️ GRVT trading DISABLED: Missing GRVT_API_KEY, GRVT_PRIVATE_KEY, or GRVT_TRADING_ACCOUNT_ID. Running in read-only mode if possible.")
         
-        if not self.api_key:
-            logger.warning("⚠️ GRVT trading DISABLED: GRVT_API_KEY missing (read-only mode)")
-            # Initialize basic HTTP client for read-only operations
+        # --- Fallback HTTP Client for Public Read-Only (if SDK is not used for trading) ---
+        if not self._trading_enabled or not self._sdk: # If SDK didn't enable trading or wasn't initialized
             try:
                 import httpx
+                # For public market data, a different base_url might be needed.
+                # Assuming `self.base_url` (trades.grvt.io) can handle some public info for now.
                 self._client = httpx.Client(
-                    base_url=self.base_url,
+                    base_url=self.base_url, 
                     headers={"Content-Type": "application/json"},
                     timeout=15.0
                 )
+                logger.info("✅ GRVT read-only HTTP client initialized.")
             except ImportError:
-                logger.debug("httpx not available for fallback mode")
-            logger.info("✅ GRVT connected (testnet=%s, trading=False)", self.use_testnet)
-            return
+                logger.debug("httpx not available for public fallback mode.")
+            except Exception as e:
+                logger.warning("⚠️ Failed to initialize GRVT public HTTP client: %s", e)
 
-        try:
-            # Try to use official SDK
-            try:
-                from grvt.grvt_raw_sync import GrvtRawSync
-                from grvt.grvt_env_config import GrvtEnvConfig
-                
-                env_config = GrvtEnvConfig.TESTNET if self.use_testnet else GrvtEnvConfig.PROD
-                self._sdk = GrvtRawSync(
-                    env=env_config,
-                    api_key=self.api_key,
-                    private_key=self.private_key,
-                    trading_account_id=self.trading_account_id,
-                )
-                logger.info("✅ GRVT SDK initialized")
-            except ImportError:
-                logger.info("GRVT SDK not available, using REST API")
-                import httpx
-                self._client = httpx.Client(
-                    base_url=self.base_url,
-                    headers={
-                        "X-API-Key": self.api_key,
-                        "Content-Type": "application/json",
-                    },
-                    timeout=15.0
-                )
+        if not self._trading_enabled:
+            logger.info("✅ GRVT connected (testnet=%s, trading=False - read-only or SDK issue)", self.use_testnet)
 
-            self._trading_enabled = True
-            logger.info("✅ GRVT connected (testnet=%s, trading=True)", self.use_testnet)
 
-        except Exception as e:
-            logger.exception("❌ GRVT connection failed: %s", e)
-            self._trading_enabled = False
 
-    def _request(self, method: str, path: str, params: dict = None, json_body: dict = None):
-        """Make HTTP request."""
-        if not self._client:
-            logger.warning("⚠️ No HTTP client available, returning mock data")
-            if "/ticker" in path:
-                return self._mock_price_response(params.get("instrument", "BTC_USDT_Perp") if params else "BTC_USDT_Perp")
-            elif "/depth" in path or "/orderbook" in path:
-                return self._mock_orderbook_response(params.get("instrument", "BTC_USDT_Perp") if params else "BTC_USDT_Perp")
-            return {}
-        
-        headers = {"X-Timestamp": str(int(time.time() * 1000))}
-        resp = self._client.request(method, path, params=params, json=json_body, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
-
-    def _mock_price_response(self, instrument: str) -> dict:
-        """Return mock price data."""
-        import random
-        base_price = 92000.0  # BTC realistic price
-        rand_offset = random.uniform(-500, 500)
-        bid = base_price + rand_offset
-        ask = bid + 1.0
-        return {
-            "result": {
-                "bestBidPrice": str(bid),
-                "bestAskPrice": str(ask),
-                "bid": str(bid),
-                "ask": str(ask),
-                "instrument": instrument
-            }
-        }
-
-    def _mock_orderbook_response(self, instrument: str) -> dict:
-        """Return mock orderbook data."""
-        import random
-        mid_price = 92000.0
-        bids = [[mid_price - (i * 10), random.uniform(0.1, 5.0)] for i in range(1, 11)]
-        asks = [[mid_price + (i * 10), random.uniform(0.1, 5.0)] for i in range(1, 11)]
-        return {
-            "result": {
-                "bids": bids,
-                "asks": asks,
-                "instrument": instrument
-            }
-        }
 
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Convert BTC/USDT to BTC_USDT_Perp."""
-        if "Perp" in symbol:
-            return symbol
         base = symbol.replace("/", "_").replace("-", "_")
-        if not base.endswith("_Perp"):
-            base += "_Perp"
-        return base
+        # Normalize any existing perp suffix, then re-append in the format GRVT expects.
+        for suffix in ("_Perp", "_PERP", "_perp", "_PerP"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return f"{base}_Perp"
+
+    def _build_order_payload(self, request: OrderRequest, instrument: str) -> Dict[str, Any]:
+        """Build the GRVT SDK payload from a shared OrderRequest."""
+        payload: Dict[str, Any] = {
+            "instrument": instrument,
+            "side": request.side.upper(),
+            "size": str(request.size),
+        }
+        if request.limit_price is not None:
+            payload.update(
+                {
+                    "order_type": "LIMIT",
+                    "price": str(request.limit_price),
+                    "time_in_force": "GTC",
+                }
+            )
+        else:
+            payload["order_type"] = "MARKET"
+        return payload
 
     def get_current_price(self, symbol: str) -> PriceQuote:
         """Fetch current price."""
         market = self._normalize_symbol(symbol)
         
         try:
-            if self._sdk:
-                result = self._sdk.get_ticker(instrument=market)
-                bid = float(result.best_bid_price or 0)
-                ask = float(result.best_ask_price or 0)
-            else:
-                data = self._request("GET", f"/full/v1/ticker", params={"instrument": market})
-                result = data.get("result", data)
-                bid = float(result.get("bestBidPrice", result.get("bid", 0)))
-                ask = float(result.get("bestAskPrice", result.get("ask", 0)))
+            if not self._sdk:
+                logger.warning("GRVT SDK not initialized for price fetch. Cannot fetch real-time prices.")
+                return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0, venue_type="dex")
+
+            from pysdk.grvt_raw_base import GrvtError
+            from pysdk.grvt_raw_types import ApiTickerRequest
+
+            resp = self._sdk.ticker_v1(ApiTickerRequest(instrument=market))
+            if isinstance(resp, GrvtError):
+                raise RuntimeError(f"GRVT ticker error code={resp.code} status={resp.status} msg={resp.message}")
+            ticker = resp.result
+            bid = float(ticker.best_bid_price or 0)
+            ask = float(ticker.best_ask_price or 0)
             
             return PriceQuote(exchange=self.name, symbol=symbol, bid=bid, ask=ask, venue_type="dex")
         except Exception as e:
             logger.error("❌ GRVT price fetch failed: %s", e)
-            # Return zero quote on failure
             return PriceQuote(exchange=self.name, symbol=symbol, bid=0.0, ask=0.0, venue_type="dex")
 
     def get_orderbook(self, symbol: str, depth: int = 20) -> OrderBookDepth:
@@ -205,78 +192,57 @@ class GRVTClient(ExchangeClient):
         market = self._normalize_symbol(symbol)
         
         try:
-            if self._sdk:
-                result = self._sdk.get_orderbook(instrument=market, depth=depth)
-                bids = [(float(l.price), float(l.size)) for l in result.bids[:depth]]
-                asks = [(float(l.price), float(l.size)) for l in result.asks[:depth]]
-            else:
-                data = self._request("GET", f"/full/v1/orderbook", params={"instrument": market, "depth": depth})
-                result = data.get("result", data)
-                bids = [(float(b["price"]), float(b["size"])) for b in result.get("bids", [])[:depth]]
-                asks = [(float(a["price"]), float(a["size"])) for a in result.get("asks", [])[:depth]]
+            if not self._sdk:
+                logger.warning("GRVT SDK not initialized for orderbook fetch. Cannot fetch orderbook data.")
+                return OrderBookDepth(bids=[], asks=[])
+
+            from pysdk.grvt_raw_base import GrvtError
+            from pysdk.grvt_raw_types import ApiOrderbookLevelsRequest
+
+            requested_depth = int(depth)
+            api_depth = next((d for d in _GRVT_ALLOWED_BOOK_DEPTHS if d >= requested_depth), _GRVT_ALLOWED_BOOK_DEPTHS[-1])
+
+            resp = self._sdk.orderbook_levels_v1(ApiOrderbookLevelsRequest(instrument=market, depth=api_depth))
+            if isinstance(resp, GrvtError):
+                raise RuntimeError(f"GRVT orderbook error code={resp.code} status={resp.status} msg={resp.message}")
+            book = resp.result
+            bids = [(float(l.price), float(l.size)) for l in book.bids[:requested_depth]]
+            asks = [(float(l.price), float(l.size)) for l in book.asks[:requested_depth]]
             
             return OrderBookDepth(bids=bids, asks=asks)
         except Exception as e:
             logger.error("❌ GRVT orderbook fetch failed: %s", e)
-            # Return empty orderbook on failure
             return OrderBookDepth(bids=[], asks=[])
 
     def place_open_order(self, request: OrderRequest) -> Order:
         """Place an order."""
-        if not self._trading_enabled:
+        if not self._trading_enabled or not self._sdk: # Ensure SDK is ready
+            logger.error("GRVT trading disabled or SDK not initialized. Cannot place order.")
             return Order(id="rejected", exchange=self.name, symbol=request.symbol,
-                        side=request.side, size=request.size, price=0.0)
+                        side=request.side, size=request.size, price=0.0, status="rejected", error_message="SDK not initialized or trading disabled")
 
         market = self._normalize_symbol(request.symbol)
-        
+        payload = self._build_order_payload(request, market)
+
         try:
-            is_limit = request.limit_price is not None
-            
-            if self._sdk:
-                if is_limit:
-                    result = self._sdk.create_order(
-                        instrument=market,
-                        side=request.side.upper(),
-                        order_type="LIMIT",
-                        size=str(request.size),
-                        price=str(request.limit_price),
-                        time_in_force="GTC",
-                    )
-                else:
-                    result = self._sdk.create_order(
-                        instrument=market,
-                        side=request.side.upper(),
-                        order_type="MARKET",
-                        size=str(request.size),
-                    )
-                order_id = str(result.order_id)
-                filled_price = float(result.price or request.limit_price or 0)
-            else:
-                order_data = {
-                    "instrument": market,
-                    "side": request.side.upper(),
-                    "type": "LIMIT" if is_limit else "MARKET",
-                    "size": str(request.size),
-                }
-                if is_limit:
-                    order_data["price"] = str(request.limit_price)
-                    order_data["timeInForce"] = "GTC"
-                
-                resp = self._request("POST", "/full/v1/create_order", json_body=order_data)
-                result = resp.get("result", resp)
-                order_id = str(result.get("orderId", result.get("id", "unknown")))
-                filled_price = float(result.get("price", request.limit_price or 0))
-            
+            result = self._sdk.create_order(**payload)
+            order_id = str(result.order_id)
+            filled_price = float(result.price or request.limit_price or 0)
+
             logger.info("✅ GRVT order placed: %s - ID: %s", request.symbol, order_id)
-            
+
             return Order(
-                id=order_id, exchange=self.name, symbol=request.symbol,
-                side=request.side, size=request.size, price=filled_price,
+                id=order_id,
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                size=request.size,
+                price=filled_price,
             )
         except Exception as e:
             logger.exception("❌ GRVT order failed: %s", e)
             return Order(id=f"error-{os.urandom(4).hex()}", exchange=self.name,
-                        symbol=request.symbol, side=request.side, size=request.size, price=0.0)
+                        symbol=request.symbol, side=request.side, size=request.size, price=0.0, status="rejected", error_message=str(e))
 
     def place_close_order(self, position: Position, current_price: float) -> Order:
         """Close position."""
@@ -288,47 +254,30 @@ class GRVTClient(ExchangeClient):
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
         """Cancel order."""
-        if not self._trading_enabled:
+        if not self._trading_enabled or not self._sdk:
+            logger.error("GRVT trading disabled or SDK not initialized. Cannot cancel order.")
             return
         try:
-            if self._sdk:
-                self._sdk.cancel_order(order_id=order_id)
-            else:
-                self._request("POST", "/full/v1/cancel_order", json_body={"orderId": order_id})
+            self._sdk.cancel_order(order_id=order_id)
             logger.info("✅ GRVT order cancelled: %s", order_id)
         except Exception as e:
             logger.error("❌ GRVT cancel failed: %s", e)
 
     def get_active_orders(self, symbol: Optional[str] = None) -> List[Order]:
         """Get active orders."""
-        if not self._trading_enabled:
+        if not self._trading_enabled or not self._sdk:
+            logger.warning("GRVT SDK not initialized or trading disabled. Cannot fetch active orders.")
             return []
         try:
-            if self._sdk:
-                orders_data = self._sdk.get_open_orders()
-            else:
-                params = {}
-                if symbol:
-                    params["instrument"] = self._normalize_symbol(symbol)
-                resp = self._request("POST", "/full/v1/open_orders", json_body=params)
-                orders_data = resp.get("result", resp)
+            orders_data = self._sdk.open_orders_v1()
             
             orders = []
             for o in orders_data or []:
-                if hasattr(o, 'instrument'):
-                    sym = o.instrument.replace("_Perp", "").replace("_", "/")
-                    orders.append(Order(
-                        id=str(o.order_id), exchange=self.name, symbol=sym,
-                        side=str(o.side).lower(), size=float(o.size), price=float(o.price or 0),
-                    ))
-                else:
-                    sym = o.get("instrument", "").replace("_Perp", "").replace("_", "/")
-                    orders.append(Order(
-                        id=str(o.get("orderId", o.get("id", ""))),
-                        exchange=self.name, symbol=sym,
-                        side=str(o.get("side", "")).lower(),
-                        size=float(o.get("size", 0)), price=float(o.get("price", 0)),
-                    ))
+                sym = o.instrument.replace("_Perp", "").replace("_", "/")
+                orders.append(Order(
+                    id=str(o.order_id), exchange=self.name, symbol=sym,
+                    side=str(o.side).lower(), size=float(o.size), price=float(o.price or 0),
+                ))
             return orders
         except Exception as e:
             logger.error("❌ GRVT orders query failed: %s", e)
@@ -336,31 +285,27 @@ class GRVTClient(ExchangeClient):
 
     def get_account_positions(self) -> List[Position]:
         """Get positions."""
-        if not self._trading_enabled:
+        if not self._trading_enabled or not self._sdk:
+            logger.warning("GRVT SDK not initialized or trading disabled. Cannot fetch positions.")
             return []
         try:
-            if self._sdk:
-                positions_data = self._sdk.get_positions()
-            else:
-                resp = self._request("POST", "/full/v1/positions")
-                positions_data = resp.get("result", resp)
+            from pysdk.grvt_raw_base import GrvtError
+            from pysdk.grvt_raw_types import ApiPositionsRequest
+
+            req = ApiPositionsRequest(sub_account_id=str(self.trading_account_id or ""))
+            resp = self._sdk.positions_v1(req)
+            if isinstance(resp, GrvtError):
+                raise RuntimeError(f"GRVT positions error code={resp.code} status={resp.status} msg={resp.message}")
+            positions_data = resp.result
             
             positions = []
             for p in positions_data or []:
-                if hasattr(p, 'size'):
-                    size = float(p.size)
-                    if size == 0:
-                        continue
-                    side = "buy" if size > 0 else "sell"
-                    sym = p.instrument.replace("_Perp", "").replace("_", "/")
-                    entry = float(p.entry_price or 0)
-                else:
-                    size = float(p.get("size", 0))
-                    if size == 0:
-                        continue
-                    side = "buy" if size > 0 else "sell"
-                    sym = p.get("instrument", "").replace("_Perp", "").replace("_", "/")
-                    entry = float(p.get("entryPrice", p.get("avgPrice", 0)))
+                size = float(p.size)
+                if size == 0:
+                    continue
+                side = "buy" if size > 0 else "sell"
+                sym = str(p.instrument or "").replace("_PerP", "").replace("_Perp", "").replace("_", "/")
+                entry = float(p.entry_price or 0)
                 
                 order = Order(
                     id=f"pos-{sym}", exchange=self.name, symbol=sym,
@@ -374,21 +319,46 @@ class GRVTClient(ExchangeClient):
 
     def get_account_balances(self) -> List[Balance]:
         """Get balances."""
-        if not self._trading_enabled:
+        if not self._trading_enabled or not self._sdk:
+            logger.warning("GRVT SDK not initialized or trading disabled. Cannot fetch balances.")
             return []
         try:
-            if self._sdk:
-                account = self._sdk.get_account()
-                total = float(account.equity or 0)
-                available = float(account.available or total)
-            else:
-                resp = self._request("POST", "/full/v1/account_summary")
-                data = resp.get("result", resp)
-                total = float(data.get("equity", data.get("balance", 0)))
-                available = float(data.get("available", data.get("freeCollateral", total)))
-            
-            if total > 0:
-                return [Balance(asset="USDC", free=available, locked=total-available, total=total)]
+            from pysdk.grvt_raw_base import GrvtError
+            from pysdk.grvt_raw_types import EmptyRequest
+
+            def _do():
+                return self._sdk.aggregated_account_summary_v1(EmptyRequest())
+
+            def _is_retryable(exc: Exception) -> bool:
+                # GRVT occasionally drops the connection during cookie refresh.
+                msg = f"{exc!r}"
+                return "RemoteDisconnected" in msg or "Connection aborted" in msg
+
+            resp = retry_call(
+                _do,
+                config=RetryConfig(max_attempts=3, min_delay_sec=0.5, max_delay_sec=3.0, jitter_sec=0.25),
+                is_retryable=_is_retryable,
+                label="grvt aggregated_account_summary_v1",
+                log=logger,
+            )
+            if isinstance(resp, GrvtError):
+                raise RuntimeError(f"GRVT balance error code={resp.code} status={resp.status} msg={resp.message}")
+            summary = resp.result
+
+            balances: List[Balance] = []
+            for b in getattr(summary, "spot_balances", []) or []:
+                total = float(getattr(b, "balance", 0) or 0)
+                asset = getattr(b, "currency", "USDC") or "USDC"
+                if total <= 0:
+                    continue
+                balances.append(Balance(asset=asset, free=total, locked=0.0, total=total))
+
+            if balances:
+                return balances
+
+            total_equity = float(getattr(summary, "total_equity", 0) or 0)
+            if total_equity > 0:
+                return [Balance(asset="USDC", free=total_equity, locked=0.0, total=total_equity)]
             return []
         except Exception as e:
             logger.error("❌ GRVT balance query failed: %s", e)
