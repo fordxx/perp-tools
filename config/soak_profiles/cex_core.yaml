@@ -1,0 +1,14 @@
+name: cex_core
+description: Core CEX market-data soak (account checks optional/disabled).
+runs:
+  - exchange_a: binance
+    exchange_b: bitget
+    symbol_a: BTC/USDT
+    symbol_b: BTC/USDT
+    skip_account: true
+  - exchange_a: okx
+    exchange_b: binance
+    symbol_a: BTC/USDT
+    symbol_b: BTC/USDT
+    skip_account: true
+

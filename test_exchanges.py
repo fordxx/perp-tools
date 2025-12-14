@@ -46,11 +46,13 @@ import json
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
 import time
+from statistics import median
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -72,6 +74,39 @@ logging.basicConfig(
 logger = logging.getLogger("exchange-test")
 
 _ACCOUNT_OPTIONAL_EXCHANGES = {"binance"}
+
+_SENSITIVE_PATTERNS = [
+    (re.compile(r"(signature=)[0-9a-fA-F]+"), r"\1REDACTED"),
+    (re.compile(r"(api_key=)[^&\\s]+", re.IGNORECASE), r"\1REDACTED"),
+    (re.compile(r"(apikey=)[^&\\s]+", re.IGNORECASE), r"\1REDACTED"),
+    (re.compile(r"(Authorization:\\s*Bearer\\s+)[A-Za-z0-9._\\-]+", re.IGNORECASE), r"\1REDACTED"),
+]
+
+
+def redact_text(text: str) -> str:
+    if not text:
+        return text
+    redacted = text
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _jsonl_append(path: str, obj: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _post_webhook(url: str, payload: dict) -> None:
+    try:
+        import httpx
+    except Exception:
+        return
+    try:
+        httpx.post(url, json=payload, timeout=5.0)
+    except Exception:
+        return
 
 def configure_noisy_loggers(verbose: bool) -> None:
     """Reduce wire-level noise unless explicitly requested.
@@ -281,10 +316,19 @@ EXCHANGE_CONFIGS = {
 class UnifiedExchangeTester:
     """统一交易所测试器"""
     
-    def __init__(self, include_trading: bool = False, verbose: bool = False, skip_account: bool = False):
+    def __init__(
+        self,
+        include_trading: bool = False,
+        verbose: bool = False,
+        skip_account: bool = False,
+        jsonl_log: Optional[str] = None,
+        alert_webhook: Optional[str] = None,
+    ):
         self.include_trading = include_trading
         self.verbose = verbose
         self.skip_account = skip_account
+        self.jsonl_log = jsonl_log
+        self.alert_webhook = alert_webhook
         load_dotenv()
         
         if verbose:
@@ -294,6 +338,19 @@ class UnifiedExchangeTester:
         
         self.metrics: List[TestMetrics] = []
         self.errors: Dict[str, str] = {}
+
+    def _emit_event(self, event: dict) -> None:
+        if self.jsonl_log:
+            sanitized = json.loads(json.dumps(event))
+            if isinstance(sanitized.get("error"), str):
+                sanitized["error"] = redact_text(sanitized["error"])
+            _jsonl_append(self.jsonl_log, sanitized)
+
+        if self.alert_webhook and event.get("level") in {"error", "critical"}:
+            payload = json.loads(json.dumps(event))
+            if isinstance(payload.get("error"), str):
+                payload["error"] = redact_text(payload["error"])
+            _post_webhook(self.alert_webhook, payload)
     
     def _check_env(self, config: ExchangeConfig) -> Tuple[bool, List[str]]:
         """检查环境变量是否齐全"""
@@ -539,6 +596,23 @@ class UnifiedExchangeTester:
         
         logger.info(f"✅ {exchange_name.upper()} test completed")
         self.metrics.append(metrics)
+        self._emit_event(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "auto_test",
+                "exchange": exchange_name,
+                "symbol": symbol,
+                "ok": bool(metrics.price_ok and metrics.orderbook_ok and metrics.balance_ok and metrics.positions_ok),
+                "price_ok": metrics.price_ok,
+                "orderbook_ok": metrics.orderbook_ok,
+                "balance_ok": metrics.balance_ok,
+                "positions_ok": metrics.positions_ok,
+                "price_ms": metrics.price_time_ms,
+                "ob_ms": metrics.orderbook_time_ms,
+                "error": metrics.error or "",
+                "level": "info" if not metrics.error else "error",
+            }
+        )
         return metrics
     
     def test_limit_order(self, client: Any, symbol: str, size: float, limit_offset: float = 0.01) -> Tuple[bool, str]:
@@ -900,6 +974,8 @@ class UnifiedExchangeTester:
 
         total = 0
         failures = 0
+        price_ms_hist: List[float] = []
+        ob_ms_hist: List[float] = []
 
         logger.info(
             "[soak] exchange=%s duration=%ss interval=%ss jitter=%ss symbols=%s account_every=%s max_fail_rate=%s",
@@ -910,6 +986,20 @@ class UnifiedExchangeTester:
             symbols,
             account_every,
             max_fail_rate,
+        )
+        self._emit_event(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "soak_start",
+                "exchange": exchange_name,
+                "duration_sec": duration_sec,
+                "interval_sec": interval_sec,
+                "jitter_sec": jitter_sec,
+                "symbols": symbols,
+                "account_every": 0 if self.skip_account else account_every,
+                "max_fail_rate": max_fail_rate,
+                "level": "info",
+            }
         )
 
         if self.skip_account:
@@ -934,10 +1024,12 @@ class UnifiedExchangeTester:
             quote, dt_price, err_price = self._time_operation(lambda: client.get_current_price(symbol))
             metrics.price_time_ms = dt_price
             metrics.price_ok = err_price is None and self._validate_quote(exchange_name, symbol, metrics, quote)
+            price_ms_hist.append(metrics.price_time_ms)
 
             ob, dt_ob, err_ob = self._time_operation(lambda: client.get_orderbook(symbol, depth=5))
             metrics.orderbook_time_ms = dt_ob
             metrics.orderbook_ok = err_ob is None and self._validate_orderbook(exchange_name, symbol, metrics, ob)
+            ob_ms_hist.append(metrics.orderbook_time_ms)
 
             if account_every > 0 and (i % account_every == 0):
                 _, dt_bal, err_bal = self._time_operation(lambda: client.get_account_balances())
@@ -967,9 +1059,37 @@ class UnifiedExchangeTester:
                 metrics.orderbook_time_ms,
                 metrics.error or "",
             )
+            self._emit_event(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "type": "soak_tick",
+                    "exchange": exchange_name,
+                    "i": i,
+                    "symbol": symbol,
+                    "ok": ok,
+                    "fail_rate": round(fail_rate, 6),
+                    "price_ms": round(metrics.price_time_ms, 3),
+                    "ob_ms": round(metrics.orderbook_time_ms, 3),
+                    "error": metrics.error or "",
+                    "level": "info" if ok else "error",
+                }
+            )
 
             if max_fail_rate >= 0 and fail_rate > max_fail_rate:
                 logger.error("[soak] abort: fail_rate %.4f > max_fail_rate %.4f", fail_rate, max_fail_rate)
+                self._emit_event(
+                    {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                        "type": "soak_abort",
+                        "exchange": exchange_name,
+                        "total": total,
+                        "failures": failures,
+                        "fail_rate": round(fail_rate, 6),
+                        "max_fail_rate": max_fail_rate,
+                        "level": "critical",
+                        "error": metrics.error or "fail_rate exceeded",
+                    }
+                )
                 return 1
 
             sleep_for = max(interval_sec, 0.0)
@@ -977,7 +1097,29 @@ class UnifiedExchangeTester:
                 sleep_for += random.uniform(0, jitter_sec)
             time.sleep(sleep_for)
 
-        logger.info("[soak] done: total=%d failures=%d fail_rate=%.4f", total, failures, failures / max(total, 1))
+        p50_price = median(price_ms_hist) if price_ms_hist else 0.0
+        p50_ob = median(ob_ms_hist) if ob_ms_hist else 0.0
+        logger.info(
+            "[soak] done: total=%d failures=%d fail_rate=%.4f p50_price_ms=%.0f p50_ob_ms=%.0f",
+            total,
+            failures,
+            failures / max(total, 1),
+            p50_price,
+            p50_ob,
+        )
+        self._emit_event(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "type": "soak_done",
+                "exchange": exchange_name,
+                "total": total,
+                "failures": failures,
+                "fail_rate": round(failures / max(total, 1), 6),
+                "p50_price_ms": round(p50_price, 3),
+                "p50_ob_ms": round(p50_ob, 3),
+                "level": "info" if failures == 0 else "error",
+            }
+        )
         return 0 if failures == 0 else 1
         logger.info("📊 TEST SUMMARY")
         logger.info(f"{'='*70}")
@@ -1013,10 +1155,11 @@ def interactive_select_exchanges() -> List[str]:
     print("\n" + "="*70)
     print("📋 Available Exchanges (按编号选择)")
     print("="*70)
-    
+
+    tester_for_select = UnifiedExchangeTester()
     for idx, name in enumerate(exchange_list, 1):
         config = EXCHANGE_CONFIGS[name]
-        has_env, _ = UnifiedExchangeTester()._check_env(config)
+        has_env, _ = tester_for_select._check_env(config)
         status = "✅ 已配置" if has_env else "❌ 缺凭证"
         mainnet = "主网" if config.use_mainnet else "DEMO"
         print(f"  {idx:2d}. {name:<15} | {status:<10} | {mainnet:<6}")
@@ -1224,6 +1367,16 @@ Examples:
         action="store_true",
         help="跳过余额/持仓查询（仅测连接+行情；适合 reference-only 或凭证不完整时）",
     )
+    parser.add_argument(
+        "--jsonl-log",
+        default="",
+        help="将测试事件追加写入 JSONL 文件（用于聚合/报警/回溯），如 logs/soak_bitget.jsonl；也可用 PERPBOT_JSONL_LOG",
+    )
+    parser.add_argument(
+        "--alert-webhook",
+        default="",
+        help="失败时 POST JSON 到 webhook（也可用 PERPBOT_ALERT_WEBHOOK_URL）",
+    )
     
     args = parser.parse_args()
     
@@ -1282,6 +1435,8 @@ Examples:
         include_trading=args.trading,
         verbose=args.verbose,
         skip_account=args.skip_account,
+        jsonl_log=(args.jsonl_log.strip() or os.getenv("PERPBOT_JSONL_LOG") or None),
+        alert_webhook=(args.alert_webhook.strip() or os.getenv("PERPBOT_ALERT_WEBHOOK_URL") or None),
     )
 
     # Soak 模式：单交易所长跑，专门用来暴露间歇性问题

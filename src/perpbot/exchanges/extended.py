@@ -109,6 +109,11 @@ class ExtendedClient(ExchangeClient):
         self._disable_account_ws: bool = False
         self._disable_orderbook_ws: bool = False
         self._orderbook_stale_sec: float = 30.0
+        self._orderbook_ws_fail_count: int = 0
+        self._orderbook_ws_disabled_until: float = 0.0
+        self._orderbook_ws_disable_cooldown_sec: float = 300.0
+        self._orderbook_ws_fail_threshold: int = 8
+        self._orderbook_ws_stale_disable_sec: float = 0.0
 
         # diagnostics
         self._last_order_error: Optional[str] = None
@@ -139,6 +144,20 @@ class ExtendedClient(ExchangeClient):
             self._orderbook_stale_sec = float(os.getenv("EXTENDED_ORDERBOOK_STALE_SEC", "30"))
         except Exception:
             self._orderbook_stale_sec = 30.0
+        try:
+            self._orderbook_ws_disable_cooldown_sec = float(os.getenv("EXTENDED_ORDERBOOK_WS_DISABLE_COOLDOWN_SEC", "300"))
+        except Exception:
+            self._orderbook_ws_disable_cooldown_sec = 300.0
+        try:
+            self._orderbook_ws_fail_threshold = int(float(os.getenv("EXTENDED_ORDERBOOK_WS_FAIL_THRESHOLD", "8")))
+        except Exception:
+            self._orderbook_ws_fail_threshold = 8
+        try:
+            self._orderbook_ws_stale_disable_sec = float(os.getenv("EXTENDED_ORDERBOOK_WS_STALE_DISABLE_SEC", "0"))
+        except Exception:
+            self._orderbook_ws_stale_disable_sec = 0.0
+        self._orderbook_ws_fail_count = 0
+        self._orderbook_ws_disabled_until = 0.0
 
         self._trading_enabled = False
 
@@ -775,6 +794,14 @@ class ExtendedClient(ExchangeClient):
         market = normalize_symbol(symbol)
         if self._disable_orderbook_ws:
             return
+        now = time.time()
+        if self._orderbook_ws_disabled_until and now < self._orderbook_ws_disabled_until:
+            return
+        if self._orderbook_ws_disabled_until and now >= self._orderbook_ws_disabled_until:
+            # cooldown elapsed, allow WS again
+            self._orderbook_ws_disabled_until = 0.0
+            self._orderbook_ws_fail_count = 0
+            TradingLogger.info("Extended orderbook WS re-enabled after cooldown")
         if market in self._orderbook_tasks or not self._stream_loop or not self._stream_client:
             return
         depth = 5
@@ -795,6 +822,7 @@ class ExtendedClient(ExchangeClient):
                                 break
                             if frame.data:
                                 reconnect_attempt = 0
+                                self._orderbook_ws_fail_count = 0
                                 trimmed = OrderbookUpdateModel(
                                     market=frame.data.market,
                                     bid=frame.data.bid[:depth],
@@ -804,12 +832,16 @@ class ExtendedClient(ExchangeClient):
                     # Clean close without exception: apply backoff to avoid hammering.
                     if not self._stop_stream.is_set():
                         reconnect_attempt += 1
+                        self._orderbook_ws_fail_count += 1
+                        self._maybe_disable_orderbook_ws(symbol, reason="clean_close")
                         delay = self._stream_backoff_seconds(reconnect_attempt)
                         TradingLogger.debug("Orderbook stream %s closed, backoff %.2fs (attempt %d)", symbol, delay, reconnect_attempt)
                         await asyncio.sleep(delay)
                 except Exception as exc:
                     TradingLogger.debug("Orderbook stream %s error: %s", symbol, exc)
                     reconnect_attempt += 1
+                    self._orderbook_ws_fail_count += 1
+                    self._maybe_disable_orderbook_ws(symbol, reason=str(exc))
                     delay = self._stream_backoff_seconds(reconnect_attempt)
                     TradingLogger.debug("Orderbook stream %s reconnect backoff %.2fs (attempt %d)", symbol, delay, reconnect_attempt)
                     await asyncio.sleep(delay)
@@ -830,11 +862,38 @@ class ExtendedClient(ExchangeClient):
             return None
         if self._is_orderbook_fresh(market):
             return book
+        # If the cache is stale for too long, disable WS temporarily and force REST snapshots.
+        if self._orderbook_ws_stale_disable_sec and self._orderbook_ws_stale_disable_sec > 0:
+            updated = self._orderbook_updated_at.get(market)
+            if updated is not None:
+                age = time.time() - updated
+                if age >= self._orderbook_ws_stale_disable_sec:
+                    self._maybe_disable_orderbook_ws(human_symbol(market), reason=f"stale>{self._orderbook_ws_stale_disable_sec}s")
         return None
 
     def _set_orderbook_cache(self, market: str, book: OrderbookUpdateModel) -> None:
         self._orderbook_cache[market] = book
         self._orderbook_updated_at[market] = time.time()
+
+    def _maybe_disable_orderbook_ws(self, symbol: str, *, reason: str) -> None:
+        if self._disable_orderbook_ws:
+            return
+        if self._orderbook_ws_fail_threshold <= 0:
+            return
+        if self._orderbook_ws_fail_count < self._orderbook_ws_fail_threshold:
+            return
+        now = time.time()
+        if self._orderbook_ws_disabled_until and now < self._orderbook_ws_disabled_until:
+            return
+        cooldown = max(float(self._orderbook_ws_disable_cooldown_sec), 5.0)
+        self._orderbook_ws_disabled_until = now + cooldown
+        TradingLogger.warning(
+            "Extended orderbook WS disabled for %.0fs after %d failures (reason=%s, last_symbol=%s)",
+            cooldown,
+            self._orderbook_ws_fail_count,
+            reason,
+            symbol,
+        )
 
     def _load_orderbook_snapshot(self, symbol: str, depth: int = 5) -> Optional[OrderbookUpdateModel]:
         market = normalize_symbol(symbol)

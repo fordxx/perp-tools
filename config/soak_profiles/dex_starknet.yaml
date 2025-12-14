@@ -1,0 +1,9 @@
+name: dex_starknet
+description: Starknet DEX soak focusing on WS stability + REST fallbacks.
+runs:
+  - exchange_a: paradex
+    exchange_b: extended
+    symbol_a: BTC/USDT
+    symbol_b: BTC/USD
+    skip_account: false
+

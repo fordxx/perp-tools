@@ -81,6 +81,9 @@ TRADING_SIZE=0.001
 # 是否跳过账户查询（仅测连接+行情）
 SKIP_ACCOUNT_CHECKS="${SKIP_ACCOUNT_CHECKS:-false}"
 
+# 可选：报警 webhook（失败时由 test_exchanges.py POST）
+ALERT_WEBHOOK_URL="${ALERT_WEBHOOK_URL:-${PERPBOT_ALERT_WEBHOOK_URL:-}}"
+
 # 监控循环间隔（秒）
 MONITOR_INTERVAL=60
 
@@ -139,6 +142,7 @@ if [[ "$SKIP_ACCOUNT_CHECKS" =~ ^(true|1|yes|y)$ ]]; then
     EXTRA_PRECHECK_ARGS+=(--skip-account)
 fi
 
+PERPBOT_ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" \
 ./run_exchange_test.sh $EXCHANGE_A --auto-test --symbol $SYMBOL_A "${EXTRA_PRECHECK_ARGS[@]}"
 
 if [ $? -ne 0 ]; then
@@ -156,6 +160,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "3️⃣  测试交易所 B: $EXCHANGE_B"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+PERPBOT_ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" \
 ./run_exchange_test.sh $EXCHANGE_B --auto-test --symbol $SYMBOL_B "${EXTRA_PRECHECK_ARGS[@]}"
 
 if [ $? -ne 0 ]; then
@@ -226,6 +231,7 @@ if [ "$USE_SOAK" = true ]; then
         local symbol="$2"
         local log_file="$3"
         local extra_args=()
+        local jsonl_file="${log_file%.log}.jsonl"
         # SOAK 也支持 verbose，但不要默认打开，避免 wire-level debug 泄露鉴权头/爆日志
         if [ "${VERBOSE:-false}" = "true" ]; then
             extra_args+=(--verbose)
@@ -234,7 +240,7 @@ if [ "$USE_SOAK" = true ]; then
             extra_args+=(--skip-account)
             extra_args+=(--account-every 0)
         fi
-        nohup ./run_exchange_test.sh "$exchange" \
+        nohup PERPBOT_JSONL_LOG="$jsonl_file" PERPBOT_ALERT_WEBHOOK_URL="$ALERT_WEBHOOK_URL" ./run_exchange_test.sh "$exchange" \
             --soak "$RUN_DURATION_SEC" \
             --interval "$MONITOR_INTERVAL" \
             --jitter "$SOAK_JITTER_SEC" \
