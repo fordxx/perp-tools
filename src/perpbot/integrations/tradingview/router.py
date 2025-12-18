@@ -173,6 +173,7 @@ def create_tradingview_router(service: Any) -> APIRouter:
         payload = TvPayload.model_validate(data)
 
         if payload.secret != settings.secret:
+            logger.warning("Webhook 401: secret mismatch. Expected: %s... Received: %s...", settings.secret[:2], payload.secret[:2])
             raise HTTPException(status_code=401, detail="Bad secret")
         inst_raw = payload.instId.strip()
         inst_aliased = settings.symbol_aliases.get(inst_raw.upper(), inst_raw)
