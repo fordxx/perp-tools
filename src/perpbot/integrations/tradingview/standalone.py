@@ -13,6 +13,10 @@ from perpbot.integrations.tradingview.router import create_tradingview_router
 
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
 _INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
