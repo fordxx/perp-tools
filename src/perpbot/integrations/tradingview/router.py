@@ -298,6 +298,7 @@ def create_tradingview_router(service: Any) -> APIRouter:
                     side=side,
                     size=size,
                     stop_loss_price=float(sl),
+                    take_profit_price=float(tp) if tp else None,
                     entry_price=float(entry_price),
                     symbol_overrides=settings.symbol_overrides_by_exchange,
                     hedge_mode=hedge_mode,
@@ -308,10 +309,11 @@ def create_tradingview_router(service: Any) -> APIRouter:
                     state.mark_traded(key)
                     logger.info(
                         "tv168 execution success: exchange=%s symbol=%s side=%s status=%s "
-                        "entry_order=%s sl_order=%s elapsed_ms=%s",
+                        "entry_order=%s sl_order=%s tp_order=%s elapsed_ms=%s",
                         exchange_name, symbol, side, exec_result.status.value,
                         exec_result.order.id if exec_result.order else None,
                         exec_result.stop_loss_order.id if exec_result.stop_loss_order else None,
+                        exec_result.take_profit_order.id if exec_result.take_profit_order else None,
                         exec_result.elapsed_ms,
                     )
                 else:

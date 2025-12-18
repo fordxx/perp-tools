@@ -56,8 +56,10 @@ class ExecutionResult:
     error_class: Optional[ErrorClass] = None
     error_msg: Optional[str] = None
     stop_loss_order: Optional[Order] = None
+    take_profit_order: Optional[Order] = None
     entry_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
+    take_profit_price: Optional[float] = None
     elapsed_ms: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -97,6 +99,7 @@ def execute_market_with_stop_loss(
     side: str,
     size: float,
     stop_loss_price: Optional[float] = None,
+    take_profit_price: Optional[float] = None,
     entry_price: Optional[float] = None,
     symbol_overrides: dict[str, dict[str, str]],
     hedge_mode: bool = True,
@@ -180,6 +183,7 @@ def execute_market_with_stop_loss(
             order=order,
             entry_price=filled_price if filled_price > 0 else entry_price,
             stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
             elapsed_ms=int((time.time() - start_ts) * 1000),
         )
 
@@ -205,6 +209,29 @@ def execute_market_with_stop_loss(
                     )
             except Exception as exc:
                 logger.exception("tv168_exec: stop-loss placement exception: %s", exc)
+
+        # Step 4: Place take-profit order if requested and we have a filled price
+        if take_profit_price and filled_price > 0:
+            try:
+                tp_result = _place_take_profit_order(
+                    exchange_client=exchange_client,
+                    exchange_name=exchange_name,
+                    symbol=symbol,
+                    canonical_symbol=canonical_symbol,
+                    side=side,
+                    size=size,
+                    take_profit_price=take_profit_price,
+                    entry_price=filled_price,
+                    hedge_mode=hedge_mode,
+                )
+                result.take_profit_order = tp_result.order
+                if not tp_result.ok:
+                    logger.warning(
+                        "tv168_exec: take-profit placement failed but entry filled error=%s",
+                        tp_result.error_msg
+                    )
+            except Exception as exc:
+                logger.exception("tv168_exec: take-profit placement exception: %s", exc)
 
         return result
 
@@ -298,6 +325,67 @@ def _place_stop_loss_order(
     except Exception as exc:
         error_class = classify_error(exc)
         logger.exception("tv168_exec: stop-loss placement failed: %s", exc)
+        return ExecutionResult(
+            ok=False,
+            status=OrderStatus.FAILED,
+            error_class=error_class,
+            error_msg=str(exc),
+        )
+
+
+def _place_take_profit_order(
+    *,
+    exchange_client: Any,
+    exchange_name: str,
+    symbol: str,
+    canonical_symbol: str,
+    side: str,
+    size: float,
+    take_profit_price: float,
+    entry_price: float,
+    hedge_mode: bool,
+) -> ExecutionResult:
+    """Place take-profit order after entry fill."""
+    try:
+        # Determine TP order side (opposite of entry)
+        tp_side = "sell" if side == "buy" else "buy"
+
+        logger.info(
+            "tv168_exec: placing take-profit exchange=%s symbol=%s entry_side=%s tp_side=%s "
+            "tp_price=%.4f entry_price=%.4f size=%s",
+            exchange_name, symbol, side, tp_side, take_profit_price, entry_price, size
+        )
+
+        if exchange_name.lower() == "okx" and hasattr(exchange_client, 'place_take_profit_order'):
+            tp_order = exchange_client.place_take_profit_order(
+                symbol=canonical_symbol,
+                side=tp_side,
+                size=size,
+                tp_price=take_profit_price,
+                hedge_mode=hedge_mode,
+            )
+
+            if tp_order and tp_order.id and not tp_order.id.startswith("rejected") and not tp_order.id.startswith("error"):
+                return ExecutionResult(ok=True, status=OrderStatus.PLACED, order=tp_order)
+            else:
+                return ExecutionResult(
+                    ok=False,
+                    status=OrderStatus.REJECTED,
+                    error_class=ErrorClass.EXCHANGE_ERROR,
+                    error_msg=f"Take-profit rejected: {tp_order.id if tp_order else 'null'}",
+                )
+        else:
+            logger.warning("tv168_exec: take-profit not implemented for %s, skipping", exchange_name)
+            return ExecutionResult(
+                ok=False,
+                status=OrderStatus.REJECTED,
+                error_class=ErrorClass.EXCHANGE_ERROR,
+                error_msg=f"Take-profit not implemented for {exchange_name}",
+            )
+
+    except Exception as exc:
+        error_class = classify_error(exc)
+        logger.exception("tv168_exec: take-profit placement failed: %s", exc)
         return ExecutionResult(
             ok=False,
             status=OrderStatus.FAILED,

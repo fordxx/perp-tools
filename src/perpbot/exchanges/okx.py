@@ -603,6 +603,93 @@ class OKXClient(ExchangeClient):
                 price=0.0,
             )
 
+    def place_take_profit_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        tp_price: float,
+        hedge_mode: bool = True,
+    ) -> Order:
+        """Place a take-profit order (conditional order) on OKX.
+
+        Args:
+            symbol: Symbol in canonical format (e.g., "BTC/USDT")
+            side: Order side ("buy" or "sell")
+            size: Order size
+            tp_price: Take-profit trigger price
+            hedge_mode: Enable hedge mode (dual position)
+
+        Returns:
+            Order object with algo order ID
+        """
+        if not self._trading_enabled:
+            logger.warning("❌ Take-profit REJECTED: Trading disabled")
+            return Order(
+                id="rejected-tp",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=tp_price,
+            )
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            ccxt_symbol = self._normalize_symbol(symbol)
+
+            # OKX algo order params for TP
+            # tpOrdPx must be -1 for market execution
+            params = {
+                "tpTriggerPx": str(tp_price),  # Take-profit trigger price
+                "tpOrdPx": "-1",  # -1 = market price
+                "reduceOnly": True,
+                "ordType": "conditional",
+            }
+            if hedge_mode:
+                params["tdMode"] = "cross"
+                # For TP, posSide is opposite of entry
+                params["posSide"] = "short" if side == "buy" else "long"
+
+            logger.info(
+                "🎯 Placing OKX take-profit: symbol=%s side=%s size=%s tp_price=%.4f hedge=%s posSide=%s",
+                symbol, side, size, tp_price, hedge_mode, params.get("posSide")
+            )
+
+            order = self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type="market",
+                side=side,
+                amount=size,
+                price=None,
+                params=params
+            )
+
+            logger.info("✅ OKX take-profit placed: order_id=%s symbol=%s side=%s tp=%.4f",
+                       order.get('id'), symbol, side, tp_price)
+
+            return Order(
+                id=str(order.get('id', 'tp-unknown')),
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=tp_price,
+            )
+
+        except Exception as e:
+            logger.exception("❌ OKX take-profit failed: %s", e)
+            return Order(
+                id=f"error-tp-{int(os.urandom(4).hex(), 16)}",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=0.0,
+            )
+
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
         """Cancel an order (not implemented for this phase)."""
         raise NotImplementedError("Order cancellation not required for MARKET-only phase")
