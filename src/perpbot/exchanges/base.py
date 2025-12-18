@@ -434,7 +434,8 @@ def provision_exchanges() -> List[ExchangeClient]:
             "okx",
             "cex",
             lambda: __import__("perpbot.exchanges.okx", fromlist=["OKXClient"]).OKXClient(
-                use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"
+                use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet",
+                allow_mainnet=True  # Allow mainnet for production trading
             ),
             ["OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"],
         ),

@@ -13,21 +13,26 @@ logger = logging.getLogger(__name__)
 
 
 class OKXClient(ExchangeClient):
-    """OKX SWAP (perpetual) client using CCXT (Testnet/Demo Trading only).
+    """OKX SWAP (perpetual) client using CCXT.
 
-    ✅ 100% Testnet Mode - Mainnet connection is absolutely forbidden.
-    ✅ Uses ccxt.okx with demo trading mode (x-simulated-trading: 1).
+    ⚠️ Supports both Demo Trading and Mainnet (use with caution).
+    ✅ Demo mode uses ccxt.okx with demo trading mode (x-simulated-trading: 1).
+    ✅ Mainnet mode for small position testing (real funds).
     ✅ Auto-disables trading if credentials are missing.
     """
 
-    def __init__(self, use_testnet: bool = True) -> None:
-        # 🔒 Safety: Force testnet mode
-        if not use_testnet:
-            raise ValueError("❌ Mainnet is absolutely forbidden for OKX. Only testnet/demo is allowed.")
+    def __init__(self, use_testnet: bool = True, allow_mainnet: bool = False) -> None:
+        # 🔒 Safety: Require explicit mainnet confirmation
+        if not use_testnet and not allow_mainnet:
+            raise ValueError(
+                "❌ Mainnet requires explicit confirmation. "
+                "Set allow_mainnet=True to enable real money trading."
+            )
 
         self.name = "okx"
         self.venue_type = "cex"
         self.use_testnet = use_testnet
+        self.allow_mainnet = allow_mainnet
         self.api_key: Optional[str] = None
         self.api_secret: Optional[str] = None
         self.passphrase: Optional[str] = None
@@ -37,7 +42,7 @@ class OKXClient(ExchangeClient):
         self._position_handler: Optional[Callable[[dict], None]] = None
 
     def connect(self) -> None:
-        """Connect to OKX Demo Trading and validate configuration."""
+        """Connect to OKX (Demo Trading or Mainnet) and validate configuration."""
         import ccxt
 
         load_dotenv()
@@ -53,8 +58,8 @@ class OKXClient(ExchangeClient):
             self.exchange = ccxt.okx()
             return
 
-        # Create CCXT exchange instance
-        self.exchange = ccxt.okx({
+        # Build config based on testnet/mainnet
+        config = {
             'apiKey': self.api_key,
             'secret': self.api_secret,
             'password': self.passphrase,  # OKX uses 'password' for passphrase
@@ -62,19 +67,32 @@ class OKXClient(ExchangeClient):
             'options': {
                 'defaultType': 'swap',
             },
-            'headers': {
-                'x-simulated-trading': '1',  # 🔒 Demo trading mode
-            }
-        })
+        }
 
-        # 🔒 Safety: Verify demo trading is enabled
+        # Add Demo Trading header if testnet mode
+        if self.use_testnet:
+            config['headers'] = {'x-simulated-trading': '1'}
+            logger.info("🧪 Connecting to OKX Demo Trading (x-simulated-trading=1)")
+        else:
+            logger.warning("⚠️ ⚠️ ⚠️ MAINNET MODE - REAL MONEY TRADING ⚠️ ⚠️ ⚠️")
+
+        # Create CCXT exchange instance
+        self.exchange = ccxt.okx(config)
+
+        # 🔒 Safety: Verify mode matches expectation
         demo_header = self.exchange.headers.get('x-simulated-trading')
-        if demo_header != '1':
+        if self.use_testnet and demo_header != '1':
             raise RuntimeError(f"❌ SAFETY ABORT: Demo trading not enabled (x-simulated-trading={demo_header})")
 
+        if not self.use_testnet and demo_header == '1':
+            raise RuntimeError(f"❌ SAFETY ABORT: Mainnet expected but demo header found")
+
         self._trading_enabled = True
-        logger.info("✅ OKX Demo Trading connected (x-simulated-trading=1, trading=%s)", self._trading_enabled)
-        logger.info("🧪 Demo mode: Enabled")
+
+        if self.use_testnet:
+            logger.info("✅ OKX Demo Trading connected (trading=%s)", self._trading_enabled)
+        else:
+            logger.warning("✅ OKX MAINNET connected (trading=%s) - REAL FUNDS!", self._trading_enabled)
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Convert BTC/USDT to BTC/USDT:USDT (CCXT swap format)."""
@@ -243,13 +261,31 @@ class OKXClient(ExchangeClient):
             logger.info("✅ OKX MARKET %s %.4f %s - OrderID: %s (hedge=%s)",
                        request.side.upper(), request.size, request.symbol, order['id'], hedge_mode)
 
+            # Parse order response safely
+            order_size = float(order.get('amount') or order.get('filled') or request.size)
+            order_price = float(order.get('average') or order.get('price') or 0)
+
+            # If price is 0, try to fetch order details for actual fill price
+            if order_price == 0:
+                try:
+                    logger.debug("Fetching order details for accurate fill price...")
+                    order_detail = self.exchange.fetch_order(order['id'], symbol=ccxt_symbol)
+                    order_price = float(order_detail.get('average') or order_detail.get('price') or 0)
+                    order_size = float(order_detail.get('filled') or order_detail.get('amount') or order_size)
+                    logger.info("📊 Fetched fill price: %.2f (filled: %.4f)", order_price, order_size)
+                except Exception as fetch_err:
+                    logger.warning("⚠️ Could not fetch order details: %s", fetch_err)
+
+            # Log raw order for debugging
+            logger.debug("OKX order response: %s", order)
+
             return Order(
                 id=str(order['id']),
                 exchange=self.name,
                 symbol=request.symbol,
                 side=request.side,
-                size=float(order['amount']),
-                price=float(order.get('average') or order.get('price', 0)),
+                size=order_size,
+                price=order_price,
             )
 
         except Exception as e:
@@ -320,6 +356,100 @@ class OKXClient(ExchangeClient):
                 symbol=position.order.symbol,
                 side="sell" if position.order.side == "buy" else "buy",
                 size=position.order.size,
+                price=0.0,
+            )
+
+    def place_close_order_partial(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        hedge_mode: bool = True
+    ) -> Order:
+        """分批平仓：关闭指定数量的持仓
+
+        Args:
+            symbol: 交易对（如 SOL/USDT）
+            side: 平仓方向（buy 平空仓，sell 平多仓）
+            size: 平仓数量
+            hedge_mode: 双向持仓模式
+
+        Returns:
+            Order object
+        """
+        if not self._trading_enabled:
+            logger.warning("❌ Partial close REJECTED: Trading disabled")
+            return Order(
+                id="rejected-partial-close",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=0.0,
+            )
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            ccxt_symbol = self._normalize_symbol(symbol)
+
+            # Build params for hedge mode + reduceOnly
+            params = {"reduceOnly": True}
+            if hedge_mode:
+                params["tdMode"] = "cross"
+                # 平仓方向：sell 平多仓（posSide=long），buy 平空仓（posSide=short）
+                params["posSide"] = "long" if side == "sell" else "short"
+
+            logger.info(
+                "🔄 OKX 分批平仓: symbol=%s side=%s size=%.4f hedge=%s posSide=%s",
+                symbol, side, size, hedge_mode, params.get("posSide")
+            )
+
+            # Place MARKET order
+            order = self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type='market',
+                side=side,
+                amount=size,
+                params=params
+            )
+
+            # Parse response safely
+            order_size = float(order.get('amount') or order.get('filled') or size)
+            order_price = float(order.get('average') or order.get('price') or 0)
+
+            # Fetch order detail if price is 0
+            if order_price == 0:
+                try:
+                    order_detail = self.exchange.fetch_order(order['id'], symbol=ccxt_symbol)
+                    order_price = float(order_detail.get('average') or order_detail.get('price') or 0)
+                    order_size = float(order_detail.get('filled') or order_detail.get('amount') or order_size)
+                except Exception:
+                    pass
+
+            logger.info(
+                "✅ OKX 分批平仓成功: order_id=%s symbol=%s side=%s size=%.4f price=%.2f",
+                order['id'], symbol, side, order_size, order_price
+            )
+
+            return Order(
+                id=str(order['id']),
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=order_size,
+                price=order_price,
+            )
+
+        except Exception as e:
+            logger.exception("❌ OKX 分批平仓失败: symbol=%s size=%.4f error=%s", symbol, size, e)
+            return Order(
+                id=f"error-partial-close-{int(os.urandom(4).hex(), 16)}",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
                 price=0.0,
             )
 
@@ -422,9 +552,12 @@ class OKXClient(ExchangeClient):
             ccxt_symbol = self._normalize_symbol(symbol)
 
             # OKX algo order params
+            # For stop-market orders, orderPx must be -1 (market price execution)
             params = {
-                "stopPrice": stop_price,
+                "slTriggerPx": str(stop_price),  # Stop-loss trigger price
+                "slOrdPx": "-1",  # -1 = market price
                 "reduceOnly": True,
+                "ordType": "conditional",  # Conditional order
             }
             if hedge_mode:
                 params["tdMode"] = "cross"
@@ -437,12 +570,13 @@ class OKXClient(ExchangeClient):
                 symbol, side, size, stop_price, hedge_mode, params.get("posSide")
             )
 
-            # Use CCXT create_order with type='stop_market'
+            # Use CCXT create_order with conditional order params
             order = self.exchange.create_order(
                 symbol=ccxt_symbol,
-                type="stop_market",
+                type="market",  # Order type is market
                 side=side,
                 amount=size,
+                price=None,  # No price for market order
                 params=params
             )
 

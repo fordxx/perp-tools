@@ -48,12 +48,23 @@ credentials/
 
 # 禁止密钥意外被提交
 .env
+.env.*
 .env.local
 .env.production
 .env.development
 .env.test
 .env.mainnet
 .env.testnet
+.env.tv168
+.env.sol_demo
+
+# AWS Lightsail and SSH keys
+*LightsailDefaultKey*.pem
+*.ppk
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
 
 ##############
 # Logs / Cache / Temp
