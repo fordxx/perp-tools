@@ -179,11 +179,16 @@ class OKXClient(ExchangeClient):
             asks=[(float(p), float(q)) for p, q in book.get('asks', [])],
         )
 
-    def place_open_order(self, request: OrderRequest) -> Order:
+    def place_open_order(self, request: OrderRequest, hedge_mode: bool = True, extra_params: Optional[dict] = None) -> Order:
         """Place a MARKET order to open a position (Demo Trading only).
 
         ✅ Only supports MARKET orders.
         ❌ Limit orders are forbidden.
+
+        Args:
+            request: Order request with symbol, side, size
+            hedge_mode: Enable hedge mode (dual position) - requires OKX account setting
+            extra_params: Additional CCXT params (e.g., for stop-loss)
 
         Returns:
             Order object if successful, Order with id="rejected*" if disabled.
@@ -218,17 +223,25 @@ class OKXClient(ExchangeClient):
         try:
             ccxt_symbol = self._normalize_symbol(request.symbol)
 
+            # Build params for hedge mode
+            params = extra_params.copy() if extra_params else {}
+            if hedge_mode:
+                # OKX hedge mode: tdMode=cross, posSide=long/short
+                params["tdMode"] = "cross"
+                params["posSide"] = "long" if request.side == "buy" else "short"
+                logger.info("🔄 OKX hedge mode: tdMode=cross posSide=%s", params["posSide"])
+
             # Place MARKET order
             order = self.exchange.create_order(
                 symbol=ccxt_symbol,
                 type='market',
                 side=request.side,
                 amount=request.size,
-                params={}
+                params=params
             )
 
-            logger.info("✅ OKX MARKET %s %.4f %s - OrderID: %s",
-                       request.side.upper(), request.size, request.symbol, order['id'])
+            logger.info("✅ OKX MARKET %s %.4f %s - OrderID: %s (hedge=%s)",
+                       request.side.upper(), request.size, request.symbol, order['id'], hedge_mode)
 
             return Order(
                 id=str(order['id']),
@@ -370,6 +383,91 @@ class OKXClient(ExchangeClient):
         except Exception as e:
             logger.exception("❌ Failed to fetch OKX positions: %s", e)
             return []
+
+    def place_stop_loss_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        stop_price: float,
+        hedge_mode: bool = True,
+    ) -> Order:
+        """Place a stop-loss order (conditional order) on OKX.
+
+        Args:
+            symbol: Symbol in canonical format (e.g., "BTC/USDT")
+            side: Order side ("buy" or "sell")
+            size: Order size
+            stop_price: Stop-loss trigger price
+            hedge_mode: Enable hedge mode (dual position)
+
+        Returns:
+            Order object with algo order ID
+        """
+        if not self._trading_enabled:
+            logger.warning("❌ Stop-loss REJECTED: Trading disabled")
+            return Order(
+                id="rejected-sl",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=stop_price,
+            )
+
+        if not self.exchange:
+            raise RuntimeError("Client not connected")
+
+        try:
+            ccxt_symbol = self._normalize_symbol(symbol)
+
+            # OKX algo order params
+            params = {
+                "stopPrice": stop_price,
+                "reduceOnly": True,
+            }
+            if hedge_mode:
+                params["tdMode"] = "cross"
+                # For stop-loss, posSide is opposite of entry
+                # If we're placing a sell stop, we're closing a long position
+                params["posSide"] = "short" if side == "buy" else "long"
+
+            logger.info(
+                "🛑 Placing OKX stop-loss: symbol=%s side=%s size=%s stop_price=%.4f hedge=%s posSide=%s",
+                symbol, side, size, stop_price, hedge_mode, params.get("posSide")
+            )
+
+            # Use CCXT create_order with type='stop_market'
+            order = self.exchange.create_order(
+                symbol=ccxt_symbol,
+                type="stop_market",
+                side=side,
+                amount=size,
+                params=params
+            )
+
+            logger.info("✅ OKX stop-loss placed: order_id=%s symbol=%s side=%s stop=%.4f",
+                       order.get('id'), symbol, side, stop_price)
+
+            return Order(
+                id=str(order.get('id', 'sl-unknown')),
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=stop_price,
+            )
+
+        except Exception as e:
+            logger.exception("❌ OKX stop-loss failed: %s", e)
+            return Order(
+                id=f"error-sl-{int(os.urandom(4).hex(), 16)}",
+                exchange=self.name,
+                symbol=symbol,
+                side=side,
+                size=size,
+                price=0.0,
+            )
 
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> None:
         """Cancel an order (not implemented for this phase)."""

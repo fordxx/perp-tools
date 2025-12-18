@@ -27,6 +27,7 @@ from perpbot.position_guard import PositionGuard
 from perpbot.persistence import AlertRecorder, TradeRecorder
 from perpbot.risk_manager import RiskManager
 from perpbot.strategy.take_profit import TakeProfitStrategy
+from perpbot.integrations.tradingview.router import create_tradingview_router
 
 logger = logging.getLogger(__name__)
 
@@ -369,6 +370,7 @@ def create_web_app(cfg: BotConfig, service: Optional[TradingService] = None) -> 
     static_dir = Path(__file__).parent / "static"
 
     app = FastAPI(title="PerpBot Web Console", version="0.2.0")
+    app.include_router(create_tradingview_router(service))
 
     @app.on_event("startup")
     def _start() -> None:  # pragma: no cover - framework hook

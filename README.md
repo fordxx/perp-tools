@@ -98,6 +98,7 @@ python test_exchanges.py hyperliquid --auto-test --trading --trading-size 0.001
 |:---|:---|
 | **[ENHANCED_TEST_GUIDE.md](ENHANCED_TEST_GUIDE.md)** | **v2.2 新功能详解** |
 | **[docs/SOAK_MONITORING.md](docs/SOAK_MONITORING.md)** | **Soak 长跑监控、JSONL 指标、Webhook 告警、Profiles** |
+| **[docs/TRADINGVIEW_WEBHOOK.md](docs/TRADINGVIEW_WEBHOOK.md)** | **TradingView Webhook (ZONE/DIV) → 下单/纸面决策** |
 | [QUICK_TEST_GUIDE.md](QUICK_TEST_GUIDE.md) | 快速开始（5 min）|
 | [EXCHANGE_TEST_GUIDE.md](EXCHANGE_TEST_GUIDE.md) | 完整指南（30 min）|
 | [CREDENTIALS_SETUP_GUIDE.md](CREDENTIALS_SETUP_GUIDE.md) | 凭证配置指南 |

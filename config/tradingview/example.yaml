@@ -1,0 +1,29 @@
+enabled: true
+default_exchange: okx
+exchange_allowlist:
+  - okx
+  - binance
+  - bitget
+
+exchange_aliases:
+  ok: okx
+  okex: okx
+
+symbol_allowlist:
+  - ETH-USDT-SWAP
+  - SOLUSDT.P
+
+symbol_aliases:
+  SOLUSDT.P: SOL/USDT
+  BTCUSDT.P: BTC/USDT
+
+order_size: 1
+order_size_by_exchange:
+  binance: 0.01
+  bitget: 0.01
+
+# Optional: override canonical `BASE/QUOTE` to exchange-specific symbols when needed.
+# Most exchanges are fine with canonical and will normalize internally.
+symbol_overrides_by_exchange:
+  okx:
+    ETH/USDT: ETH-USDT-SWAP

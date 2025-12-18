@@ -429,29 +429,57 @@ def provision_exchanges() -> List[ExchangeClient]:
     load_dotenv()
     exchanges: List[ExchangeClient] = []
 
-    from perpbot.exchanges.okx import OKXClient
-    from perpbot.exchanges.edgex import EdgeXClient
-    from perpbot.exchanges.backpack import BackpackClient
-    from perpbot.exchanges.paradex import ParadexClient
-    from perpbot.exchanges.aster import AsterClient
-    from perpbot.exchanges.grvt import GRVTClient
-    from perpbot.exchanges.extended import ExtendedClient
-    from perpbot.exchanges.lighter import LighterClient
-
     exchange_builders = [
         (
             "okx",
             "cex",
-            lambda: OKXClient(use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"),
+            lambda: __import__("perpbot.exchanges.okx", fromlist=["OKXClient"]).OKXClient(
+                use_testnet=os.getenv("OKX_ENV", "testnet").lower() == "testnet"
+            ),
             ["OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE"],
         ),
-        ("edgex", "dex", lambda: EdgeXClient(), ["EDGEX_API_KEY"]),
-        ("backpack", "dex", lambda: BackpackClient(), ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"]),
-        ("paradex", "dex", lambda: ParadexClient(), ["PARADEX_L2_PRIVATE_KEY", "PARADEX_ACCOUNT_ADDRESS"]),
-        ("aster", "dex", lambda: AsterClient(), ["ASTER_API_KEY"]),
-        ("grvt", "dex", lambda: GRVTClient(), ["GRVT_API_KEY"]),
-        ("extended", "dex", lambda: ExtendedClient(), ["EXTENDED_API_KEY"]),
-        ("lighter", "dex", lambda: LighterClient(), ["LIGHTER_API_KEY"]),
+        (
+            "edgex",
+            "dex",
+            lambda: __import__("perpbot.exchanges.edgex", fromlist=["EdgeXClient"]).EdgeXClient(),
+            ["EDGEX_API_KEY"],
+        ),
+        (
+            "backpack",
+            "dex",
+            lambda: __import__("perpbot.exchanges.backpack", fromlist=["BackpackClient"]).BackpackClient(),
+            ["BACKPACK_API_KEY", "BACKPACK_API_SECRET"],
+        ),
+        (
+            "paradex",
+            "dex",
+            lambda: __import__("perpbot.exchanges.paradex", fromlist=["ParadexClient"]).ParadexClient(),
+            ["PARADEX_L2_PRIVATE_KEY", "PARADEX_ACCOUNT_ADDRESS"],
+        ),
+        (
+            "aster",
+            "dex",
+            lambda: __import__("perpbot.exchanges.aster", fromlist=["AsterClient"]).AsterClient(),
+            ["ASTER_API_KEY"],
+        ),
+        (
+            "grvt",
+            "dex",
+            lambda: __import__("perpbot.exchanges.grvt", fromlist=["GRVTClient"]).GRVTClient(),
+            ["GRVT_API_KEY"],
+        ),
+        (
+            "extended",
+            "dex",
+            lambda: __import__("perpbot.exchanges.extended", fromlist=["ExtendedClient"]).ExtendedClient(),
+            ["EXTENDED_API_KEY"],
+        ),
+        (
+            "lighter",
+            "dex",
+            lambda: __import__("perpbot.exchanges.lighter", fromlist=["LighterClient"]).LighterClient(),
+            ["LIGHTER_API_KEY"],
+        ),
     ]
 
     for name, venue_type, builder, required_keys in exchange_builders:
@@ -465,6 +493,8 @@ def provision_exchanges() -> List[ExchangeClient]:
             client.connect()
             exchanges.append(client)
             logger.info("Provisioned %s exchange (%s)", name, venue_type)
+        except ModuleNotFoundError as exc:  # pragma: no cover - optional deps
+            logger.warning("Skipping %s: missing dependency %s", name, exc)
         except Exception as exc:  # pragma: no cover - runtime resilience
             logger.exception("Failed to initialise %s client: %s", name, exc)
 

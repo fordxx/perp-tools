@@ -143,6 +143,38 @@
         color: #9aa5c2;
         font-size: 11px;
       }
+      select,
+      input[type="text"],
+      input[type="password"] {
+        background: #0f172a;
+        border: 1px solid #1f2a52;
+        color: #fff;
+        padding: 6px;
+        border-radius: 6px;
+        width: 100%;
+      }
+      .tv-row {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .tv-row-3 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      pre {
+        background: #0f172a;
+        border: 1px solid #1f2a52;
+        padding: 10px;
+        border-radius: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        margin: 8px 0 0 0;
+        font-size: 12px;
+      }
       @media (max-width: 960px) {
         .row {
           grid-template-columns: 1fr;
@@ -171,6 +203,52 @@
             <input id="profitInput" type="number" step="0.01" min="0" />
             <button id="updateThreshold">更新</button>
           </div>
+        </div>
+        <div class="card">
+          <h2>TV168（TradingView 信号）</h2>
+          <div class="subtitle">鼠标点选交易所/交易对，生成并发送 Webhook</div>
+          <div class="tv-row">
+            <div>
+              <label class="muted-small">交易所（exchange）</label>
+              <select id="tvExchange"></select>
+            </div>
+            <div>
+              <label class="muted-small">交易对（instId）</label>
+              <select id="tvSymbol"></select>
+            </div>
+          </div>
+          <div class="tv-row-3">
+            <div>
+              <label class="muted-small">周期（tf）</label>
+              <input id="tvTf" type="text" value="1m" />
+            </div>
+            <div>
+              <label class="muted-small">ZONE</label>
+              <select id="tvZone">
+                <option value="OVERSOLD">OVERSOLD</option>
+                <option value="OVERBOUGHT">OVERBOUGHT</option>
+              </select>
+            </div>
+            <div>
+              <label class="muted-small">过滤</label>
+              <input id="tvSearch" type="text" placeholder="BTC / SOL / USDT..." />
+            </div>
+          </div>
+          <div id="tvSource" class="muted-small"></div>
+          <div style="margin-top: 6px">
+            <label class="muted-small">Secret（不会从服务端读取，请手动填）</label>
+            <input id="tvSecret" type="password" placeholder="PERPBOT_TV_WEBHOOK_SECRET" />
+          </div>
+          <div style="margin-top: 10px">
+            <button id="tvGenZone" class="secondary">生成 ZONE JSON</button>
+            <button id="tvGenDiv" class="secondary">生成 DIV JSON</button>
+          </div>
+          <div style="margin-top: 10px">
+            <button id="tvSendZone">发送 ZONE</button>
+            <button id="tvSendDiv">发送 DIV</button>
+          </div>
+          <pre id="tvPayload" class="muted-small">等待加载选项...</pre>
+          <pre id="tvResponse" class="muted-small"></pre>
         </div>
         <div class="card">
           <h2>账户</h2>
@@ -728,7 +806,148 @@
         refresh();
       });
 
+      function tvGetValue(id) {
+        const el = document.getElementById(id);
+        return el ? el.value : "";
+      }
+
+      function tvBuildPayload(type) {
+        const exchange = tvGetValue("tvExchange");
+        const instId = tvGetValue("tvSymbol");
+        const tf = tvGetValue("tvTf") || "1m";
+        const secret = tvGetValue("tvSecret") || "CHANGE_ME";
+        const base = { secret, type, exchange, instId, tf, t: new Date().toISOString() };
+        if (type === "ZONE") {
+          base.zone = tvGetValue("tvZone") || "OVERSOLD";
+        }
+        return base;
+      }
+
+      function tvRenderPayload(payload) {
+        const pre = document.getElementById("tvPayload");
+        if (!pre) return;
+        pre.textContent = JSON.stringify(payload, null, 2);
+      }
+
+      function tvRenderResponse(obj, isError = false) {
+        const pre = document.getElementById("tvResponse");
+        if (!pre) return;
+        pre.textContent = (isError ? "ERROR: " : "") + (typeof obj === "string" ? obj : JSON.stringify(obj, null, 2));
+      }
+
+      async function tvSend(payload) {
+        tvRenderPayload(payload);
+        tvRenderResponse("");
+        try {
+          const resp = await fetch("/webhook/tradingview", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            tvRenderResponse(data, true);
+            return;
+          }
+          tvRenderResponse(data, false);
+        } catch (err) {
+          tvRenderResponse(String(err), true);
+        }
+      }
+
+      async function tvInit() {
+        const exchangeSel = document.getElementById("tvExchange");
+        const symbolSel = document.getElementById("tvSymbol");
+        const searchEl = document.getElementById("tvSearch");
+        const sourceEl = document.getElementById("tvSource");
+        if (!exchangeSel || !symbolSel || !searchEl || !sourceEl) return;
+        try {
+          const opts = await fetchJSON("/api/tv168/options");
+          const exchangesAvailable = new Set(opts.exchanges_available || []);
+          const exchangesMarkets = opts.exchanges_supported_markets || [];
+          const defaultEx = opts.default_exchange || "";
+          exchangeSel.innerHTML = "";
+          const exList = exchangesMarkets.length ? exchangesMarkets : [defaultEx || "okx"];
+          exList.forEach((ex) => {
+            const o = document.createElement("option");
+            o.value = ex;
+            o.textContent = exchangesAvailable.has(ex) ? `${ex}` : `${ex} (no client)`;
+            if (ex === defaultEx) o.selected = true;
+            exchangeSel.appendChild(o);
+          });
+
+          const fallbackSymbols = opts.symbols_allowlist || [];
+          const aliases = opts.symbol_aliases || {};
+          const fallbackChoices = [];
+          fallbackSymbols.forEach((s) => fallbackChoices.push({ value: s, label: s, canonical: s }));
+          Object.entries(aliases).forEach(([k, v]) => {
+            const label = `${k}  →  ${v}`;
+            fallbackChoices.push({ value: k, label, canonical: v });
+          });
+          let allChoices = fallbackChoices;
+
+          async function loadMarketsForExchange(ex) {
+            try {
+              const resp = await fetchJSON(`/api/tv168/markets?exchange=${encodeURIComponent(ex)}`);
+              if (!resp.ok || !resp.markets || !resp.markets.length) {
+                sourceEl.textContent = `交易对来源：allowlist（未拉到市场列表）`;
+                allChoices = fallbackChoices;
+                return;
+              }
+              allChoices = resp.markets.map((m) => ({
+                value: m.symbol,
+                label: `${m.symbol}  (${m.raw})`,
+                canonical: m.symbol,
+              }));
+              sourceEl.textContent = `交易对来源：markets（${allChoices.length}）`;
+            } catch (e) {
+              sourceEl.textContent = `交易对来源：allowlist（markets 拉取失败）`;
+              allChoices = fallbackChoices;
+            }
+          }
+
+          function applyFilter() {
+            const q = (searchEl.value || "").trim().toUpperCase();
+            const filtered = !q
+              ? allChoices
+              : allChoices.filter((c) => (c.label || "").toUpperCase().includes(q) || (c.value || "").toUpperCase().includes(q));
+            symbolSel.innerHTML = "";
+            filtered.slice(0, 800).forEach((c) => {
+              const o = document.createElement("option");
+              o.value = c.value;
+              o.textContent = c.label;
+              symbolSel.appendChild(o);
+            });
+          }
+
+          const cachedEx = localStorage.getItem("tv168.exchange");
+          const cachedSym = localStorage.getItem("tv168.symbol");
+          if (cachedEx && [...exchangeSel.options].some((o) => o.value === cachedEx)) exchangeSel.value = cachedEx;
+          exchangeSel.addEventListener("change", async () => {
+            localStorage.setItem("tv168.exchange", exchangeSel.value);
+            await loadMarketsForExchange(exchangeSel.value);
+            applyFilter();
+          });
+          symbolSel.addEventListener("change", () => localStorage.setItem("tv168.symbol", symbolSel.value));
+          searchEl.addEventListener("input", applyFilter);
+
+          await loadMarketsForExchange(exchangeSel.value);
+          applyFilter();
+          if (cachedSym && [...symbolSel.options].some((o) => o.value === cachedSym)) symbolSel.value = cachedSym;
+
+          tvRenderPayload(tvBuildPayload("ZONE"));
+        } catch (err) {
+          tvRenderPayload({ error: String(err), hint: "请确认已启用 TradingView router（/api/tv168/options）" });
+        }
+      }
+
+      document.getElementById("tvGenZone").addEventListener("click", () => tvRenderPayload(tvBuildPayload("ZONE")));
+      document.getElementById("tvGenDiv").addEventListener("click", () => tvRenderPayload(tvBuildPayload("DIV")));
+      document.getElementById("tvSendZone").addEventListener("click", () => tvSend(tvBuildPayload("ZONE")));
+      document.getElementById("tvSendDiv").addEventListener("click", () => tvSend(tvBuildPayload("DIV")));
+
       connectSocket();
+      tvInit();
       refresh();
       setInterval(refresh, 4000);
     </script>
