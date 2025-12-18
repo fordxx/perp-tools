@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
@@ -56,10 +56,12 @@ class ExecutionResult:
     error_class: Optional[ErrorClass] = None
     error_msg: Optional[str] = None
     stop_loss_order: Optional[Order] = None
-    take_profit_order: Optional[Order] = None
+    take_profit_order: Optional[Order] = None  # Legacy single TP
+    take_profit_orders: list[Order] = field(default_factory=list)  # Multi-level TP
     entry_price: Optional[float] = None
     stop_loss_price: Optional[float] = None
-    take_profit_price: Optional[float] = None
+    take_profit_price: Optional[float] = None  # Legacy single TP
+    take_profit_levels: list[dict[str, float]] = field(default_factory=list)  # Multi-level TP info
     elapsed_ms: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -100,6 +102,7 @@ def execute_market_with_stop_loss(
     size: float,
     stop_loss_price: Optional[float] = None,
     take_profit_price: Optional[float] = None,
+    tp_rr: Optional[float] = None,
     entry_price: Optional[float] = None,
     symbol_overrides: dict[str, dict[str, str]],
     hedge_mode: bool = True,
@@ -232,6 +235,40 @@ def execute_market_with_stop_loss(
                     )
             except Exception as exc:
                 logger.exception("tv168_exec: take-profit placement exception: %s", exc)
+
+        # Step 5: Place Multi-Level Take-Profit orders (1.5R, 2.0R, 2.5R, 3.0R)
+        # This overrides Step 4 if valid SL and Entry are present
+        if stop_loss_price and filled_price > 0:
+             try:
+                tp_levels = _calculate_tp_levels(
+                    side=side,
+                    entry_price=filled_price,
+                    stop_loss=stop_loss_price,
+                    total_size=size
+                )
+                result.take_profit_levels = tp_levels
+                
+                for lvl in tp_levels:
+                    tp_res = _place_take_profit_order(
+                        exchange_client=exchange_client,
+                        exchange_name=exchange_name,
+                        symbol=symbol,
+                        canonical_symbol=canonical_symbol,
+                        side=side,
+                        size=lvl["size"],
+                        take_profit_price=lvl["price"],
+                        entry_price=filled_price,
+                        hedge_mode=hedge_mode,
+                    )
+                    if tp_res.ok and tp_res.order:
+                        result.take_profit_orders.append(tp_res.order)
+                    else:
+                        logger.warning(
+                            "tv168_exec: multi-tp level failed: price=%.4f size=%.4f error=%s",
+                            lvl["price"], lvl["size"], tp_res.error_msg
+                        )
+             except Exception as exc:
+                logger.exception("tv168_exec: multi-tp placement exception: %s", exc)
 
         return result
 
@@ -391,4 +428,64 @@ def _place_take_profit_order(
             status=OrderStatus.FAILED,
             error_class=error_class,
             error_msg=str(exc),
+            elapsed_ms=int((time.time() - start_ts) * 1000),
         )
+
+
+def _calculate_tp_levels(
+    side: str,
+    entry_price: float,
+    stop_loss: float,
+    total_size: float,
+    min_size: float = 0.01
+) -> list[dict[str, float]]:
+    """Calculate 4 levels of TP based on RR: 1.5, 2.0, 2.5, 3.0.
+
+    Ratios:
+    - 1.5R -> 70%
+    - 2.0R -> 15%
+    - 2.5R -> 10%
+    - 3.0R -> 5%
+    """
+    risk = abs(entry_price - stop_loss)
+    if risk <= 0:
+        return []
+
+    rrs = [1.5, 2.0, 2.5, 3.0]
+    pcts = [0.70, 0.15, 0.10, 0.05]
+    levels = []
+
+    accumulated_size = 0.0
+    for i, rr in enumerate(rrs):
+        # Calculate price for this RR
+        if side == "buy":
+            tp_price = entry_price + (risk * rr)
+        else:
+            tp_price = entry_price - (risk * rr)
+
+        # Calculate size for this level
+        lvl_size = total_size * pcts[i]
+
+        # Round to 4 decimal places for generic precision
+        lvl_size = round(lvl_size, 4)
+
+        # Check if this is the last level
+        is_last = (i == len(rrs) - 1)
+
+        if is_last:
+            lvl_size = round(total_size - accumulated_size, 4)
+
+        if lvl_size < min_size and not is_last:
+            # Too small, roll into next level
+            continue
+
+        if lvl_size > 0:
+            levels.append({"price": round(tp_price, 4), "size": lvl_size, "rr": rr})
+            accumulated_size += lvl_size
+
+    # Final safety: if we skipped levels due to min_size, ensure the last one
+    # covers the full remaining amount
+    if levels and accumulated_size < total_size:
+        levels[-1]["size"] = round(levels[-1]["size"] + (total_size - accumulated_size), 4)
+
+    return levels

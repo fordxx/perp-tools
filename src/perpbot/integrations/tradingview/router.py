@@ -307,13 +307,14 @@ def create_tradingview_router(service: Any) -> APIRouter:
 
                 if exec_result.ok:
                     state.mark_traded(key)
+                    tp_ids = [o.id for o in exec_result.take_profit_orders]
                     logger.info(
                         "tv168 execution success: exchange=%s symbol=%s side=%s status=%s "
-                        "entry_order=%s sl_order=%s tp_order=%s elapsed_ms=%s",
+                        "entry_order=%s sl_order=%s tp_orders=%s elapsed_ms=%s",
                         exchange_name, symbol, side, exec_result.status.value,
                         exec_result.order.id if exec_result.order else None,
                         exec_result.stop_loss_order.id if exec_result.stop_loss_order else None,
-                        exec_result.take_profit_order.id if exec_result.take_profit_order else None,
+                        tp_ids,
                         exec_result.elapsed_ms,
                     )
                 else:
@@ -349,6 +350,8 @@ def create_tradingview_router(service: Any) -> APIRouter:
             "paper": not can_execute,
             "order": (asdict(exec_result.order) if exec_result and exec_result.order else None),
             "stop_loss_order": (asdict(exec_result.stop_loss_order) if exec_result and exec_result.stop_loss_order else None),
+            "take_profit_orders": ([asdict(o) for o in exec_result.take_profit_orders] if exec_result else []),
+            "take_profit_levels": (exec_result.take_profit_levels if exec_result else []),
             "execution": (exec_result.to_dict() if exec_result else None),
         }
 
