@@ -47,6 +47,7 @@ class TradingViewSettings:
     enable_short: bool
     order_size: float
     order_size_by_exchange: dict[str, float]
+    order_size_by_symbol: dict[str, float]
     candles_base_url: str
     candle_limit: int
     pivot_len: int
@@ -149,6 +150,28 @@ class TradingViewSettings:
                 except Exception:
                     continue
 
+        order_size_by_symbol_raw = cfg.get("order_size_by_symbol") or {}
+        order_size_by_symbol: dict[str, float] = {}
+        if isinstance(order_size_by_symbol_raw, dict):
+            for k, v in order_size_by_symbol_raw.items():
+                try:
+                    order_size_by_symbol[str(k).strip().upper()] = float(v)
+                except Exception:
+                    continue
+
+        # Also parse from environment variable JSON if exists
+        sz_by_sym_env = os.getenv("PERPBOT_TV_ORDER_SIZE_BY_SYMBOL")
+        if sz_by_sym_env:
+            try:
+                import json
+                env_map = json.loads(sz_by_sym_env)
+                if isinstance(env_map, dict):
+                    for k, v in env_map.items():
+                        order_size_by_symbol[str(k).strip().upper()] = float(v)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to parse PERPBOT_TV_ORDER_SIZE_BY_SYMBOL: %s", e)
+
         return TradingViewSettings(
             enabled=_getenv_bool("PERPBOT_TV_ENABLED", bool(cfg.get("enabled", True))),
             secret=secret,
@@ -165,6 +188,7 @@ class TradingViewSettings:
             enable_short=_getenv_bool("PERPBOT_TV_ENABLE_SHORT", _getenv_bool("ENABLE_SHORT", True)),
             order_size=order_size,
             order_size_by_exchange=order_size_by_exchange,
+            order_size_by_symbol=order_size_by_symbol,
             candles_base_url=_getenv("PERPBOT_TV_CANDLES_BASE_URL", os.getenv("OKX_BASE_URL", "https://www.okx.com")).rstrip("/"),
             candle_limit=_getenv_int("PERPBOT_TV_CANDLE_LIMIT", 300),
             pivot_len=_getenv_int("PERPBOT_TV_PIVOT_LEN", _getenv_int("PIVOT_LEN", 3)),

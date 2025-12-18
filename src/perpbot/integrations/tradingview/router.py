@@ -30,6 +30,7 @@ class TvPayload(BaseModel):
     t: Optional[str] = None
     close: Optional[str] = None
     zone: Optional[str] = None
+    size: Optional[float] = None
 
 
 def _key(inst_id: str, tf: str) -> str:
@@ -278,8 +279,11 @@ def create_tradingview_router(service: Any) -> APIRouter:
             try:
                 size = resolve_size_for_exchange(
                     exchange=exchange_name,
+                    symbol=symbol,
                     default_size=settings.order_size,
                     per_exchange=settings.order_size_by_exchange,
+                    per_symbol=settings.order_size_by_symbol,
+                    payload_size=payload.size,
                 )
 
                 # Use new executor with stop-loss support

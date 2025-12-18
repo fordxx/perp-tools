@@ -26,9 +26,21 @@ def resolve_symbol_for_exchange(
 def resolve_size_for_exchange(
     *,
     exchange: str,
+    symbol: str,
     default_size: float,
     per_exchange: dict[str, float],
+    per_symbol: dict[str, float] = {},
+    payload_size: Optional[float] = None,
 ) -> float:
+    # Priority: Payload > Symbol Config > Exchange Config > Default
+    if payload_size is not None:
+        return float(payload_size)
+    
+    # Try per-symbol (canonical symbol upper case)
+    sym_key = symbol.strip().upper()
+    if sym_key in per_symbol:
+        return float(per_symbol[sym_key])
+        
     return float(per_exchange.get(exchange.lower(), default_size))
 
 
