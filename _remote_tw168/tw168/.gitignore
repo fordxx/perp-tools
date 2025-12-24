@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.venv/
+logs/
+tw168.log
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
