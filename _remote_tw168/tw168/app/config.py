@@ -48,6 +48,61 @@ def _getenv_optional(name: str) -> str | None:
     return value
 
 
+def _validate_settings(settings: "Settings") -> None:
+    """Validate settings for common configuration errors."""
+    import sys
+
+    errors = []
+    warnings = []
+
+    # Validate TP percentages
+    total_tp_pct = settings.tp1_pct + settings.tp2_pct + settings.tp3_pct + settings.tp4_pct
+    if abs(total_tp_pct - 1.0) > 0.01:
+        warnings.append(
+            f"TP percentages sum to {total_tp_pct:.2%} (expected 100%). "
+            f"TP1={settings.tp1_pct:.1%} TP2={settings.tp2_pct:.1%} "
+            f"TP3={settings.tp3_pct:.1%} TP4={settings.tp4_pct:.1%}"
+        )
+
+    # Validate R-multiples are ascending
+    if not (settings.tp1_r < settings.tp2_r < settings.tp3_r < settings.tp4_r):
+        warnings.append(
+            f"TP R-multiples should be ascending: "
+            f"TP1={settings.tp1_r} TP2={settings.tp2_r} TP3={settings.tp3_r} TP4={settings.tp4_r}"
+        )
+
+    # Validate trailing stop
+    if settings.trail_start_r <= settings.trail_back_r:
+        warnings.append(
+            f"TRAIL_START_R ({settings.trail_start_r}) should be > TRAIL_BACK_R ({settings.trail_back_r})"
+        )
+
+    # Validate risk-based sizing vs fixed sizing
+    if settings.trading_enabled and settings.risk_per_trade_usdt == 0:
+        warnings.append(
+            f"Trading enabled with RISK_PER_TRADE_USDT=0, using fixed ORDER_SZ={settings.order_sz}. "
+            "This may create inconsistent risk across different symbols!"
+        )
+
+    # Validate exchange credentials
+    if settings.trading_enabled:
+        if settings.exchange == "okx":
+            if not all([settings.okx_api_key, settings.okx_api_secret, settings.okx_api_passphrase]):
+                errors.append("OKX credentials incomplete (API_KEY, API_SECRET, API_PASSPHRASE required)")
+        # Extended validation would need env vars check
+
+    # Print warnings
+    for warning in warnings:
+        print(f"⚠️  CONFIG WARNING: {warning}", file=sys.stderr)
+
+    # Print errors and exit if critical
+    for error in errors:
+        print(f"❌ CONFIG ERROR: {error}", file=sys.stderr)
+
+    if errors:
+        sys.exit(1)
+
+
 @dataclass(frozen=True)
 class Settings:
     tv_webhook_secret: str = _getenv("TV_WEBHOOK_SECRET", "CHANGE_ME")
@@ -68,6 +123,7 @@ class Settings:
 
     zone_ttl_seconds: int = _getenv_int("ZONE_TTL_SECONDS", 900)
     cooldown_seconds: int = _getenv_int("COOLDOWN_SECONDS", 120)
+    dedupe_ttl_seconds: int = _getenv_int("DEDUPE_TTL_SECONDS", 1800)
 
     enable_long: bool = _getenv_bool("ENABLE_LONG", True)
     enable_short: bool = _getenv_bool("ENABLE_SHORT", True)
@@ -77,6 +133,11 @@ class Settings:
     order_sz: str = _getenv("ORDER_SZ", "1")
     risk_per_trade_usdt: float = _getenv_float("RISK_PER_TRADE_USDT", 0.0)
 
+    # TODO: Add global risk controls
+    # max_total_exposure_usdt: float = 0.0  # Maximum total position value
+    # max_positions: int = 0  # Maximum number of concurrent positions
+    # max_position_per_symbol_usdt: float = 0.0  # Per-symbol position limit
+
     pivot_len: int = _getenv_int("PIVOT_LEN", 3)
     atr_len: int = _getenv_int("ATR_LEN", 14)
     atr_buffer_mult: float = _getenv_float("ATR_BUFFER_MULT", 0.2)
@@ -84,6 +145,7 @@ class Settings:
     min_stop_distance_bps: float = _getenv_float("MIN_STOP_DISTANCE_BPS", 0.0)
     stop_method: str = _getenv("STOP_METHOD", "lookback").lower()  # lookback | pivot
     stop_lookback_bars: int = _getenv_int("STOP_LOOKBACK_BARS", 50)
+    backup_sl_enabled: bool = _getenv_bool("BACKUP_SL_ENABLED", False)  # Try limit order SL as backup
 
     # Optional pattern filters (approximate, pivot-based)
     pattern_long: str = _getenv("PATTERN_LONG", "none").lower()  # none | w_bottom
@@ -118,7 +180,13 @@ class Settings:
     rsi_smooth: bool = _getenv_bool("RSI_SMOOTH", True)
     rsi_smooth_period: int = _getenv_int("RSI_SMOOTH_PERIOD", 4)
     rsi_ma_type: str = _getenv("RSI_MA_TYPE", "ema")
+    rsi_pct_low: float = _getenv_float("RSI_PCT_LOW", 25.0)
+    rsi_pct_high: float = _getenv_float("RSI_PCT_HIGH", 75.0)
+    rsi_pct_by_tf: str = _getenv("RSI_PCT_BY_TF", "")
+    rsi_pct_by_symbol: str = _getenv("RSI_PCT_BY_SYMBOL", "")
     rsi_max_data: int = _getenv_int("RSI_MAX_DATA", 3000)
+    rsi_max_data_by_tf: str = _getenv("RSI_MAX_DATA_BY_TF", "")
+    rsi_max_data_by_symbol: str = _getenv("RSI_MAX_DATA_BY_SYMBOL", "")
     rsi_max_iter: int = _getenv_int("RSI_MAX_ITER", 1000)
     rsi_allow_no_zone: bool = _getenv_bool("RSI_ALLOW_NO_ZONE", True)
 
@@ -137,3 +205,4 @@ class Settings:
 
 
 SETTINGS = Settings()
+_validate_settings(SETTINGS)
