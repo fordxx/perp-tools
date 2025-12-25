@@ -14,6 +14,7 @@ from x10.perpetual.configuration import EndpointConfig, MAINNET_CONFIG, TESTNET_
 from x10.perpetual.markets import MarketModel
 from x10.perpetual.order_object import OrderTpslTriggerParam
 from x10.perpetual.orders import OrderPriceType, OrderSide, OrderTpslType, OrderTriggerPriceType, TimeInForce
+from x10.perpetual.positions import PositionSide
 from x10.perpetual.trading_client import PerpetualTradingClient
 
 from app.risk import Candle
@@ -88,18 +89,18 @@ class ExtendedClient:
         if self._trading_client is not None:
             try:
                 self._run_async(self._trading_client.close())
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error closing trading client: {e}")
         if self._loop is not None:
             try:
                 self._loop.call_soon_threadsafe(self._loop.stop)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error stopping event loop: {e}")
         if self._loop_thread is not None:
             try:
                 self._loop_thread.join(timeout=2)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Error joining loop thread: {e}")
 
     def _load_markets(self) -> None:
         """Load market information from Extended."""
@@ -143,6 +144,10 @@ class ExtendedClient:
         else:
             lower = floor_val
             upper = cap_val
+        # Validate bounds
+        if upper <= lower:
+            print(f"WARNING: Invalid price bounds upper={upper} <= lower={lower}, using defaults")
+            return None
         return lower, upper
 
     def _clamp_price(self, market: MarketModel, price: Decimal, ref_price: Decimal | None) -> Decimal:
@@ -241,6 +246,7 @@ class ExtendedClient:
             "instId": symbol,
             "ctVal": "1",
             "lotSz": str(market.trading_config.min_order_size),
+            "lotStep": str(market.trading_config.min_order_size_change),
             "tickSz": str(market.trading_config.min_price_change),
         }
 
@@ -306,6 +312,34 @@ class ExtendedClient:
         return None
 
     def get_position(self, *, inst_id: str, pos_side: str) -> dict[str, Any] | None:
+        if not self._trading_client:
+            return None
+        symbol = inst_id.replace("-USDT-SWAP", "-USD")
+        side = PositionSide.LONG if pos_side.lower() == "long" else PositionSide.SHORT
+        try:
+            response = self._run_async(
+                self._trading_client.account.get_positions(market_names=[symbol], position_side=side)
+            )
+            data = response.data or []
+            for pos in data:
+                if getattr(pos, "market", None) != symbol:
+                    continue
+                size = getattr(pos, "size", None)
+                try:
+                    size_val = Decimal(str(size))
+                except Exception:
+                    size_val = Decimal("0")
+                if size_val <= 0:
+                    continue
+                return {
+                    "instId": inst_id,
+                    "posSide": pos_side,
+                    "pos": str(size_val),
+                    "market": symbol,
+                    "raw": pos,
+                }
+        except Exception:
+            return None
         return None
 
     def place_order(
@@ -342,20 +376,12 @@ class ExtendedClient:
                 if ref_price is None:
                     price = Decimal("100000") if side == "buy" else Decimal("0.01")
                 else:
-                    bounds = self._price_bounds(market, ref_price)
-                    if bounds:
-                        lower, upper = bounds
-                        price = upper if side == "buy" else lower
-                    else:
-                        price = ref_price
+                    # Use the current reference price for IOC orders to avoid
+                    # invalid limit values on Extended.
+                    price = ref_price
             else:
                 ref_price = Decimal(str(px))
-                bounds = self._price_bounds(market, ref_price)
-                if bounds:
-                    lower, upper = bounds
-                    price = upper if side == "buy" else lower
-                else:
-                    price = ref_price * (Decimal("1.01") if side == "buy" else Decimal("0.99"))
+                price = ref_price
             price = self._normalize_price(market, price, ref_price)
         else:
             if not px:

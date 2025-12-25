@@ -12,6 +12,7 @@ from app.config import SETTINGS
 from app.charting import plot_kline
 from app.candle_cache import CandleCache, CandleWsManager
 from app.fill_tracker import FillTracker
+from app.metrics import get_metrics
 from app.notify import notify_error, notify_info, notify_photo
 from app.risk import (
     detect_head_shoulders_top,
@@ -22,7 +23,7 @@ from app.risk import (
     stop_loss_price_lookback,
     take_profit_price,
 )
-from app.rsi_ml import compute_rsi_thresholds, compute_rsi_thresholds_percentile
+from app.rsi_ml import RsiThresholds, compute_rsi_thresholds, compute_rsi_thresholds_percentile
 from app.state import InMemoryState
 from app.telegram_control import TelegramControl
 from app.trade_manager import TradeManager, TradePlan
@@ -40,6 +41,10 @@ tg_control: TelegramControl | None = None
 candle_cache: CandleCache | None = None
 candle_ws_manager: CandleWsManager | None = None
 candle_ws_symbol_tfs: dict[str, list[str]] = {}
+rsi_pct_overrides: dict[str, tuple[float, float]] = {}
+rsi_max_data_overrides: dict[str, int] = {}
+rsi_pct_symbol_overrides: dict[tuple[str, str | None], tuple[float, float]] = {}
+rsi_max_data_symbol_overrides: dict[tuple[str, str | None], int] = {}
 
 # Initialize exchange client based on configuration
 if SETTINGS.exchange == "extended":
@@ -64,6 +69,8 @@ else:
         ),
     )
     exchange = okx
+    # TradeManager handles TP ladder execution for OKX
+    # Extended mode uses limit orders for TP instead
     manager = TradeManager(okx=exchange, settings=SETTINGS, fill_tracker=fill_tracker)
     ws_manager = WsFillManager(
         fill_tracker=fill_tracker,
@@ -92,6 +99,116 @@ def _parse_symbol_tfs(raw: str) -> dict[str, list[str]]:
         tfs = [t.strip().lower() for t in re.split(r"[,\s|]+", tf_raw) if t.strip()]
         if inst_id and tfs:
             out[inst_id] = tfs
+    return out
+
+
+def _parse_pct_overrides(raw: str) -> dict[str, tuple[float, float]]:
+    out: dict[str, tuple[float, float]] = {}
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for part in line.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            tf_raw, pct_raw = part.split(":", 1)
+            if "/" not in pct_raw:
+                continue
+            low_raw, high_raw = pct_raw.split("/", 1)
+            try:
+                low = float(low_raw.strip())
+                high = float(high_raw.strip())
+            except ValueError:
+                continue
+            tf_key = tf_raw.strip().lower()
+            if tf_key:
+                out[tf_key] = (low, high)
+    return out
+
+
+def _parse_int_overrides(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for part in line.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            tf_raw, val_raw = part.split(":", 1)
+            try:
+                val = int(val_raw.strip())
+            except ValueError:
+                continue
+            tf_key = tf_raw.strip().lower()
+            if tf_key:
+                out[tf_key] = val
+    return out
+
+
+def _parse_symbol_pct_overrides(raw: str) -> dict[tuple[str, str | None], tuple[float, float]]:
+    out: dict[tuple[str, str | None], tuple[float, float]] = {}
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for part in line.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            key_raw, pct_raw = part.split(":", 1)
+            if "/" not in pct_raw:
+                continue
+            low_raw, high_raw = pct_raw.split("/", 1)
+            try:
+                low = float(low_raw.strip())
+                high = float(high_raw.strip())
+            except ValueError:
+                continue
+            key_raw = key_raw.strip()
+            if not key_raw:
+                continue
+            if "@" in key_raw:
+                symbol_raw, tf_raw = key_raw.split("@", 1)
+                symbol = symbol_raw.strip().upper()
+                tf_key = tf_raw.strip().lower()
+            else:
+                symbol = key_raw.strip().upper()
+                tf_key = None
+            if symbol:
+                out[(symbol, tf_key)] = (low, high)
+    return out
+
+
+def _parse_symbol_int_overrides(raw: str) -> dict[tuple[str, str | None], int]:
+    out: dict[tuple[str, str | None], int] = {}
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        for part in line.split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            key_raw, val_raw = part.split(":", 1)
+            try:
+                val = int(val_raw.strip())
+            except ValueError:
+                continue
+            key_raw = key_raw.strip()
+            if not key_raw:
+                continue
+            if "@" in key_raw:
+                symbol_raw, tf_raw = key_raw.split("@", 1)
+                symbol = symbol_raw.strip().upper()
+                tf_key = tf_raw.strip().lower()
+            else:
+                symbol = key_raw.strip().upper()
+                tf_key = None
+            if symbol:
+                out[(symbol, tf_key)] = val
     return out
 
 
@@ -143,6 +260,15 @@ if SETTINGS.candle_ws_enabled:
         extended_idle_seconds=SETTINGS.candle_ws_extended_idle_seconds,
     )
 
+if SETTINGS.rsi_pct_by_tf:
+    rsi_pct_overrides = _parse_pct_overrides(SETTINGS.rsi_pct_by_tf)
+if SETTINGS.rsi_pct_by_symbol:
+    rsi_pct_symbol_overrides = _parse_symbol_pct_overrides(SETTINGS.rsi_pct_by_symbol)
+if SETTINGS.rsi_max_data_by_tf:
+    rsi_max_data_overrides = _parse_int_overrides(SETTINGS.rsi_max_data_by_tf)
+if SETTINGS.rsi_max_data_by_symbol:
+    rsi_max_data_symbol_overrides = _parse_symbol_int_overrides(SETTINGS.rsi_max_data_by_symbol)
+
 
 class TvPayload(BaseModel):
     secret: str
@@ -152,6 +278,10 @@ class TvPayload(BaseModel):
     t: str | None = None
     close: str | None = None
     zone: str | None = None
+    side: str | None = None
+    rsi: float | str | None = None
+    rsi_long: float | str | None = None
+    rsi_short: float | str | None = None
 
 
 def _key(inst_id: str, tf: str) -> str:
@@ -160,13 +290,16 @@ def _key(inst_id: str, tf: str) -> str:
 
 def _log_payload(payload: TvPayload) -> None:
     logger.info(
-        "tv_webhook received type=%s instId=%s tf=%s zone=%s t=%s close=%s",
+        "tv_webhook received type=%s instId=%s tf=%s zone=%s t=%s close=%s rsi=%s long=%s short=%s",
         payload.type,
         payload.instId,
         payload.tf,
         payload.zone,
         payload.t,
         payload.close,
+        payload.rsi,
+        payload.rsi_long,
+        payload.rsi_short,
     )
 
 
@@ -187,6 +320,45 @@ def _normalize_inst_id(raw_inst_id: str) -> str:
         if base:
             return f"{base}-USDT-SWAP"
     return inst_id
+
+
+def _parse_float(value: float | str | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_side(value: str | None) -> str | None:
+    if not value:
+        return None
+    val = value.strip().lower()
+    if val in {"buy", "sell"}:
+        return val
+    return None
+
+
+def _round_price_to_tick(price: float, tick_size: str | None) -> str:
+    """Round price to exchange tick size and format as string."""
+    if not tick_size or tick_size == "":
+        return f"{price:.8f}".rstrip("0").rstrip(".")
+    try:
+        from decimal import Decimal, ROUND_DOWN
+        tick = Decimal(str(tick_size))
+        if tick <= 0:
+            return f"{price:.8f}".rstrip("0").rstrip(".")
+        price_dec = Decimal(str(price))
+        rounded = (price_dec / tick).quantize(Decimal("1"), rounding=ROUND_DOWN) * tick
+        return str(rounded).rstrip("0").rstrip(".")
+    except Exception:
+        return f"{price:.8f}".rstrip("0").rstrip(".")
 
 
 def _getenv_optional(name: str) -> str | None:
@@ -233,20 +405,39 @@ async def _startup() -> None:
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     if ws_manager is not None:
-        await ws_manager.stop()
+        try:
+            await ws_manager.stop()
+        except Exception as e:
+            logger.error("Error stopping ws_manager: %s", str(e))
     if candle_ws_manager is not None:
-        await candle_ws_manager.stop()
+        try:
+            await candle_ws_manager.stop()
+        except Exception as e:
+            logger.error("Error stopping candle_ws_manager: %s", str(e))
     if tg_control is not None:
-        tg_control.stop()
+        try:
+            tg_control.stop()
+        except Exception as e:
+            logger.error("Error stopping tg_control: %s", str(e))
     if SETTINGS.exchange == "extended":
-        close_fn = getattr(exchange, "close", None)
-        if callable(close_fn):
-            close_fn()
+        try:
+            close_fn = getattr(exchange, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception as e:
+            logger.error("Error closing extended exchange: %s", str(e))
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics_endpoint() -> dict:
+    """Get system metrics."""
+    metrics = get_metrics()
+    return metrics.get_summary()
 
 
 @app.post("/webhook/tradingview")
@@ -277,7 +468,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     _log_payload(payload)
 
     dedupe_key = f"{payload.type}:{inst_id}:{tf}:{payload.t or ''}"
-    if state.seen(dedupe_key, ttl_seconds=60 * 30):
+    if state.seen(dedupe_key, ttl_seconds=SETTINGS.dedupe_ttl_seconds):
         _log_decision(inst_id, tf, action="skip", reason="deduped", dedupe_key=dedupe_key)
         return {"ok": True, "deduped": True}
 
@@ -287,6 +478,8 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             close_f = float(payload.close)
         except ValueError:
             close_f = None
+    payload_side = _parse_side(payload.side)
+    skip_rsi_filter = payload_side is not None
 
     if candle_ws_manager is not None and SETTINGS.candle_ws_enabled:
         try:
@@ -313,19 +506,25 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         raise HTTPException(status_code=400, detail="Unknown type")
 
     zone_state = state.get_zone(key)
-    if zone_state is None and not (allow_no_zone or SETTINGS.rsi_allow_no_zone):
-        _log_decision(inst_id, tf, action="skip", reason="no_zone_state")
-        return {"ok": True, "skipped": "no_zone_state"}
-    if zone_state is not None and zone_state.zone not in {"OVERSOLD", "OVERBOUGHT"}:
-        _log_decision(inst_id, tf, action="skip", reason="zone_expired_or_neutral", zone=zone_state.zone)
-        return {"ok": True, "skipped": "zone_expired_or_neutral", "zone": zone_state.zone}
-    if not state.can_trade(key, SETTINGS.cooldown_seconds):
-        _log_decision(inst_id, tf, action="skip", reason="cooldown")
-        return {"ok": True, "skipped": "cooldown"}
+    if payload_side is None:
+        if zone_state is None and not (allow_no_zone or SETTINGS.rsi_allow_no_zone):
+            _log_decision(inst_id, tf, action="skip", reason="no_zone_state")
+            return {"ok": True, "skipped": "no_zone_state"}
+        if zone_state is not None and zone_state.zone not in {"OVERSOLD", "OVERBOUGHT"}:
+            _log_decision(inst_id, tf, action="skip", reason="zone_expired_or_neutral", zone=zone_state.zone)
+            return {"ok": True, "skipped": "zone_expired_or_neutral", "zone": zone_state.zone}
+        if not state.can_trade(key, SETTINGS.cooldown_seconds):
+            _log_decision(inst_id, tf, action="skip", reason="cooldown")
+            return {"ok": True, "skipped": "cooldown"}
 
-    side = "buy"
-    pos_side = "long"
-    if zone_state is not None:
+    side = payload_side or "buy"
+    pos_side = "long" if side == "buy" else "short"
+    if payload_side is not None:
+        zone_state = SimpleNamespace(
+            zone="OVERSOLD" if side == "buy" else "OVERBOUGHT",
+            close=close_f,
+        )
+    elif zone_state is not None:
         if zone_state.zone == "OVERSOLD":
             side = "buy"
             pos_side = "long"
@@ -409,11 +608,48 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             )
             entry_price = last_px
 
+    rsi_result = None
+    rsi_from_payload = False
+    payload_rsi = _parse_float(payload.rsi)
+    payload_long = _parse_float(payload.rsi_long)
+    payload_short = _parse_float(payload.rsi_short)
+    if payload_rsi is not None and payload_long is not None and payload_short is not None:
+        rsi_result = RsiThresholds(
+            rsi=payload_rsi,
+            long_threshold=payload_long,
+            short_threshold=payload_short,
+        )
+        rsi_from_payload = True
+        if SETTINGS.rsi_debug:
+            _log_decision(
+                inst_id,
+                tf,
+                action="rsi_from_tv",
+                rsi=round(payload_rsi, 6),
+                long=round(payload_long, 6),
+                short=round(payload_short, 6),
+            )
+
     rsi_candles = candles
     if not SETTINGS.rsi_use_live_candle and len(rsi_candles) > 1:
         rsi_candles = rsi_candles[:-1]
-    rsi_result = None
-    if SETTINGS.rsi_filter_enabled or SETTINGS.rsi_debug:
+    if (SETTINGS.rsi_filter_enabled or SETTINGS.rsi_debug) and rsi_result is None:
+        tf_key = tf.strip().lower()
+        symbol_key = inst_id.strip().upper()
+        rsi_max_data = rsi_max_data_symbol_overrides.get(
+            (symbol_key, tf_key),
+            rsi_max_data_symbol_overrides.get(
+                (symbol_key, None),
+                rsi_max_data_overrides.get(tf_key, SETTINGS.rsi_max_data),
+            ),
+        )
+        rsi_low_pct, rsi_high_pct = rsi_pct_symbol_overrides.get(
+            (symbol_key, tf_key),
+            rsi_pct_symbol_overrides.get(
+                (symbol_key, None),
+                rsi_pct_overrides.get(tf_key, (SETTINGS.rsi_pct_low, SETTINGS.rsi_pct_high)),
+            ),
+        )
         closes = [c.c for c in rsi_candles]
         if SETTINGS.rsi_threshold_mode == "percentile":
             rsi_result = compute_rsi_thresholds_percentile(
@@ -422,7 +658,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 smooth=SETTINGS.rsi_smooth,
                 smooth_period=SETTINGS.rsi_smooth_period,
                 ma_type=SETTINGS.rsi_ma_type,
-                max_data=SETTINGS.rsi_max_data,
+                max_data=rsi_max_data,
+                low_pct=rsi_low_pct,
+                high_pct=rsi_high_pct,
             )
         else:
             rsi_result = compute_rsi_thresholds(
@@ -431,24 +669,26 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 smooth=SETTINGS.rsi_smooth,
                 smooth_period=SETTINGS.rsi_smooth_period,
                 ma_type=SETTINGS.rsi_ma_type,
-                max_data=SETTINGS.rsi_max_data,
+                max_data=rsi_max_data,
                 max_iter=SETTINGS.rsi_max_iter,
             )
         if rsi_result is None:
             _log_decision(inst_id, tf, action="skip", reason="no_rsi")
             return {"ok": True, "skipped": "no_rsi"}
-        if SETTINGS.rsi_debug:
+        if SETTINGS.rsi_debug and not rsi_from_payload:
             last_ts = rsi_candles[-1].ts_ms if rsi_candles else None
             last_close = rsi_candles[-1].c if rsi_candles else None
             rsi_samples = max(0, len(rsi_candles) - SETTINGS.rsi_length)
-            used_samples = min(SETTINGS.rsi_max_data, rsi_samples)
+            used_samples = min(rsi_max_data, rsi_samples)
             alt = compute_rsi_thresholds_percentile(
                 closes,
                 rsi_length=SETTINGS.rsi_length,
                 smooth=SETTINGS.rsi_smooth,
                 smooth_period=SETTINGS.rsi_smooth_period,
                 ma_type=SETTINGS.rsi_ma_type,
-                max_data=SETTINGS.rsi_max_data,
+                max_data=rsi_max_data,
+                low_pct=rsi_low_pct,
+                high_pct=rsi_high_pct,
             )
             _log_decision(
                 inst_id,
@@ -463,11 +703,14 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 candles=len(rsi_candles),
                 rsi_samples=rsi_samples,
                 used_samples=used_samples,
+                pct_low=rsi_low_pct,
+                pct_high=rsi_high_pct,
+                max_data=rsi_max_data,
                 last_close=last_close,
                 last_ts=last_ts,
                 live=SETTINGS.rsi_use_live_candle,
             )
-    if SETTINGS.rsi_filter_enabled:
+    if SETTINGS.rsi_filter_enabled and not skip_rsi_filter:
         if rsi_result is None:
             _log_decision(inst_id, tf, action="skip", reason="no_rsi")
             return {"ok": True, "skipped": "no_rsi"}
@@ -671,18 +914,35 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     r_value = abs(float(entry_price) - float(sl))
 
     # 2. 计算仓位大小
+    # NOTE: Fixed ORDER_SZ mode creates inconsistent risk across symbols.
+    # E.g., 1 BTC contract ≈ $100k vs 1 DOGE contract ≈ $0.10
+    # Use RISK_PER_TRADE_USDT for consistent risk management.
     if SETTINGS.risk_per_trade_usdt and SETTINGS.risk_per_trade_usdt > 0:
         import math
 
         inst_info = exchange.get_instrument_info(inst_id=inst_id)
         ct_val = 1.0
+        lot_step = None
+        min_order = None
         if inst_info and inst_info.get("ctVal"):
             ct_val = float(inst_info.get("ctVal"))
             logger.info("tv_webhook contract_info inst_id=%s ct_val=%s", inst_id, ct_val)
+        if inst_info:
+            if inst_info.get("lotStep"):
+                lot_step = float(inst_info.get("lotStep"))
+            if inst_info.get("lotSz"):
+                min_order = float(inst_info.get("lotSz"))
 
         calculated_sz_coins = SETTINGS.risk_per_trade_usdt / r_value
         calculated_sz_contracts = calculated_sz_coins / ct_val
         order_sz_contracts = max(1, int(math.floor(calculated_sz_contracts)))
+        if SETTINGS.exchange == "extended":
+            step = lot_step or 1.0
+            min_sz = min_order or 1.0
+            if step > 0:
+                order_sz_contracts = int(math.floor(order_sz_contracts / step) * step)
+            if order_sz_contracts < min_sz:
+                order_sz_contracts = int(min_sz)
         order_sz = str(order_sz_contracts)
         actual_coins = order_sz_contracts * ct_val
 
@@ -700,7 +960,10 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         logger.info("tv_webhook fixed_sizing sz=%s", order_sz)
 
     if SETTINGS.exchange == "extended":
-        sl_px = f"{sl:.8f}".rstrip("0").rstrip(".") if sl is not None else None
+        # Get instrument info for price precision
+        inst_info = exchange.get_instrument_info(inst_id=inst_id)
+        tick_size = inst_info.get("tickSz") if inst_info else None
+        sl_px = _round_price_to_tick(sl, tick_size) if sl is not None else None
 
         ts = int(time.time())
         rnd = random.randint(100, 999)
@@ -744,6 +1007,49 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         # Place multi-level take-profit reduce-only limit orders.
         tp_orders: list[dict[str, str]] = []
         if SETTINGS.tp_enabled and r_value > 0:
+            allow_tp = True
+            actual_pos_sz = Decimal(str(order_sz))
+            if SETTINGS.exchange == "extended":
+                # Verify position exists before placing TP orders
+                max_retries = 3
+                for retry in range(max_retries):
+                    pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                    if pos:
+                        pos_sz = Decimal(str(pos.get("pos", "0"))) if pos else Decimal("0")
+                        if pos_sz > 0:
+                            actual_pos_sz = pos_sz
+                            break
+                    if retry < max_retries - 1:
+                        await asyncio.sleep(0.5)
+                else:
+                    # Position not found after retries
+                    allow_tp = False
+                    logger.warning(
+                        "extended tp skipped instId=%s posSide=%s reason=no_position_after_retries",
+                        inst_id, pos_side
+                    )
+                    notify_info(
+                        f"extended tp skipped instId={inst_id} posSide={pos_side} reason=no_position"
+                    )
+            if not allow_tp:
+                # Don't return here - continue to mark traded
+                state.mark_traded(key)
+                state.clear_zone(key)
+                _log_decision(inst_id, tf, action="order_placed_no_tp", side=side, posSide=pos_side, zone=zone_state.zone)
+                return {
+                    "ok": True,
+                    "type": "DIV",
+                    "zone": zone_state.zone,
+                    "side": side,
+                    "posSide": pos_side,
+                    "entry": float(entry_price),
+                    "sl": sl,
+                    "tp": None,
+                    "order_sz": order_sz,
+                    "r_value": r_value,
+                    "order": resp,
+                    "warning": "tp_skipped_no_position",
+                }
             inst_info = exchange.get_instrument_info(inst_id=inst_id)
             step = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else Decimal("1")
             total_sz_dec = Decimal(str(order_sz))
@@ -753,11 +1059,32 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     return value
                 return (value / step_value).to_integral_value(rounding=ROUND_DOWN) * step_value
 
-            tp1_sz = _floor_to_step(total_sz_dec * Decimal(str(SETTINGS.tp1_pct)), step)
-            tp2_sz = _floor_to_step(total_sz_dec * Decimal(str(SETTINGS.tp2_pct)), step)
-            tp3_sz = _floor_to_step(total_sz_dec * Decimal(str(SETTINGS.tp3_pct)), step)
+            # Validate TP percentages don't exceed 100%
+            total_tp_pct = SETTINGS.tp1_pct + SETTINGS.tp2_pct + SETTINGS.tp3_pct
+            if total_tp_pct > 1.0:
+                logger.warning(
+                    "extended tp_pct_exceeds_100 total=%.2f%% adjusting proportionally",
+                    total_tp_pct * 100
+                )
+                # Scale down proportionally
+                scale_factor = 1.0 / total_tp_pct
+                tp1_pct_adjusted = SETTINGS.tp1_pct * scale_factor
+                tp2_pct_adjusted = SETTINGS.tp2_pct * scale_factor
+                tp3_pct_adjusted = SETTINGS.tp3_pct * scale_factor
+            else:
+                tp1_pct_adjusted = SETTINGS.tp1_pct
+                tp2_pct_adjusted = SETTINGS.tp2_pct
+                tp3_pct_adjusted = SETTINGS.tp3_pct
+
+            tp1_sz = _floor_to_step(total_sz_dec * Decimal(str(tp1_pct_adjusted)), step)
+            tp2_sz = _floor_to_step(total_sz_dec * Decimal(str(tp2_pct_adjusted)), step)
+            tp3_sz = _floor_to_step(total_sz_dec * Decimal(str(tp3_pct_adjusted)), step)
             remaining = total_sz_dec - tp1_sz - tp2_sz - tp3_sz
             if remaining < 0:
+                logger.error(
+                    "extended tp_size_negative remaining=%s total=%s tp1=%s tp2=%s tp3=%s",
+                    remaining, total_sz_dec, tp1_sz, tp2_sz, tp3_sz
+                )
                 remaining = Decimal("0")
 
             tp_sizes = [
@@ -778,7 +1105,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 )
                 if tp_price is None:
                     continue
-                tp_px = f"{tp_price:.8f}".rstrip("0").rstrip(".")
+                tp_px = _round_price_to_tick(tp_price, tick_size)
                 tp_resp = exchange.place_order(
                     inst_id=inst_id,
                     td_mode=SETTINGS.okx_td_mode,
@@ -853,20 +1180,35 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             f"okx entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
         )
 
-    # 4. 等待成交并获取实际成交价
-    await asyncio.sleep(0.5)
-
+    # 4. 等待成交并获取实际成交价（带重试机制）
     filled_price = None
-    ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
-    if ord_info and ord_info.get("avgPx"):
-        filled_price = float(ord_info.get("avgPx"))
-        logger.info("tv_webhook order_filled cl_ord_id=%s filled_price=%.4f", cl_ord_id, filled_price)
-        notify_info(
-            f"okx entry filled instId={inst_id} side={side} px={filled_price:.6f} sz={order_sz}"
-        )
-    else:
+    max_retries = 5
+    for retry in range(max_retries):
+        await asyncio.sleep(0.3 * (retry + 1))  # Progressive backoff: 0.3s, 0.6s, 0.9s, 1.2s, 1.5s
+        try:
+            ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
+            if ord_info and ord_info.get("avgPx"):
+                filled_price = float(ord_info.get("avgPx"))
+                logger.info("tv_webhook order_filled cl_ord_id=%s filled_price=%.4f retry=%d",
+                           cl_ord_id, filled_price, retry)
+                notify_info(
+                    f"okx entry filled instId={inst_id} side={side} px={filled_price:.6f} sz={order_sz}"
+                )
+                break
+            # Check order state
+            state_val = ord_info.get("state", "").lower() if ord_info else ""
+            if state_val in {"filled", "partially_filled"}:
+                # Order is filled but avgPx might be processing
+                if retry < max_retries - 1:
+                    continue
+        except Exception as e:
+            logger.warning("tv_webhook order_query_failed retry=%d err=%s", retry, str(e))
+            if retry < max_retries - 1:
+                continue
+
+    if filled_price is None:
         filled_price = float(entry_price)
-        logger.warning("tv_webhook no_filled_price using_estimated price=%.4f", filled_price)
+        logger.warning("tv_webhook no_filled_price_after_retries using_estimated price=%.4f", filled_price)
 
     # 5. 基于实际成交价重新计算止损价
     if ord_info and ord_info.get("avgPx"):
@@ -907,6 +1249,12 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     # 6. 下单独的止损单
     sl_side = "sell" if side == "buy" else "buy"
+    sl_order_success = False
+    sl_failure_reason = ""
+
+    # Get instrument info for price precision
+    inst_info = exchange.get_instrument_info(inst_id=inst_id)
+    tick_size = inst_info.get("tickSz") if inst_info else None
 
     try:
         sl_resp = exchange.place_algo_order(
@@ -916,23 +1264,105 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             pos_side=pos_side,
             ord_type="conditional",
             sz=order_sz,
-            sl_trigger_px=f"{sl:.8f}".rstrip("0").rstrip("."),
+            sl_trigger_px=_round_price_to_tick(sl, tick_size),
             sl_ord_px="-1",
         )
         logger.info("tv_webhook sl_order_placed sl_price=%.4f resp=%s", sl, sl_resp)
         if str(sl_resp.get("code", "")) not in {"0", "success"}:
+            sl_failure_reason = f"code={sl_resp.get('code')} msg={sl_resp.get('msg')}"
             notify_error(
                 f"okx sl failed instId={inst_id} side={sl_side} sz={order_sz} resp={sl_resp}"
             )
         else:
+            sl_order_success = True
             data = sl_resp.get("data") or []
             if data:
                 algo_id = data[0].get("algoId") or ""
                 if algo_id:
                     fill_tracker.register_algo_label(algo_id=algo_id, label="sl")
     except Exception as e:
+        sl_failure_reason = f"exception={str(e)}"
         logger.error("tv_webhook sl_order_failed error=%s", str(e))
         notify_error(f"okx sl exception instId={inst_id} err={e}")
+
+    # Record metrics
+    metrics = get_metrics()
+    metrics.record_sl_attempt(success=sl_order_success, inst_id=inst_id, reason=sl_failure_reason)
+
+    # Try backup stop-loss strategy if enabled
+    if not sl_order_success and SETTINGS.backup_sl_enabled:
+        logger.info("tv_webhook trying_backup_sl instId=%s method=limit_order", inst_id)
+        try:
+            backup_sl_resp = exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=sl_side,
+                pos_side=pos_side,
+                ord_type="limit",
+                sz=order_sz,
+                px=_round_price_to_tick(sl, tick_size),
+                cl_ord_id=f"{cl_ord_id}_slb"[:32],
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=True,
+            )
+            if str(backup_sl_resp.get("code", "")) in {"0", "success"}:
+                sl_order_success = True
+                logger.info("tv_webhook backup_sl_success instId=%s resp=%s", inst_id, backup_sl_resp)
+                notify_info(f"okx backup SL placed (limit order) for {inst_id} at {sl}")
+                data = backup_sl_resp.get("data") or []
+                if data:
+                    ord_id = data[0].get("ordId") or ""
+                    if ord_id:
+                        fill_tracker.register_order_label(key=ord_id, label="sl_backup")
+        except Exception as backup_err:
+            logger.error("tv_webhook backup_sl_failed instId=%s err=%s", inst_id, str(backup_err))
+
+    # Emergency close if stop-loss order failed
+    if not sl_order_success:
+        logger.error("tv_webhook emergency_close instId=%s posSide=%s sz=%s reason=sl_order_failed",
+                     inst_id, pos_side, order_sz)
+
+        # Check if we should alert based on failure rate
+        if metrics.should_alert(threshold=0.05, min_attempts=10):
+            notify_error(
+                f"⚠️ HIGH SL FAILURE RATE: {metrics.sl_failure_rate:.1%} "
+                f"({metrics.sl_orders_failed}/{metrics.sl_orders_attempted} attempts)"
+            )
+
+        try:
+            emergency_resp = exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=sl_side,
+                pos_side=pos_side,
+                ord_type="market",
+                sz=order_sz,
+                px=None,
+                cl_ord_id=f"{cl_ord_id}_emergency"[:32],
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=True,
+            )
+            metrics.record_emergency_close(success=True, inst_id=inst_id)
+            notify_error(
+                f"okx emergency close executed instId={inst_id} due to SL failure resp={emergency_resp}"
+            )
+            # Skip marking traded and registering plan since position was closed
+            return {
+                "ok": False,
+                "error": "stop_loss_failed_position_closed",
+                "instId": inst_id,
+                "emergency_close": emergency_resp,
+            }
+        except Exception as close_err:
+            metrics.record_emergency_close(success=False, inst_id=inst_id)
+            logger.critical("tv_webhook emergency_close_failed instId=%s err=%s", inst_id, str(close_err))
+            notify_error(
+                f"CRITICAL: Emergency close failed for {inst_id}! Manual intervention required. Error: {close_err}"
+            )
+            # Continue anyway to at least mark the trade
+            pass
 
     # 7. 标记交易和清除zone
     state.mark_traded(key)
