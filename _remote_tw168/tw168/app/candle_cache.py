@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -9,6 +10,8 @@ from typing import Iterable
 import websockets
 
 from app.risk import Candle
+
+logger = logging.getLogger("uvicorn.error")
 
 
 @dataclass
@@ -157,6 +160,7 @@ async def _okx_candles_loop(
                             )
                             await cache.upsert_candle(source="okx", inst_id=inst_id, tf=tf, candle=candle)
             except Exception:
+                logger.exception("okx candle ws stream error")
                 await asyncio.sleep(3)
 
     await asyncio.gather(*[asyncio.create_task(_run_chunk(chunk)) for chunk in chunks])
@@ -226,6 +230,7 @@ async def _okx_candles_loop_dynamic(
                         )
                         await cache.upsert_candle(source="okx", inst_id=inst_id, tf=tf, candle=candle)
         except Exception:
+            logger.exception("okx candle ws dynamic error")
             await asyncio.sleep(3)
         finally:
             if sender_task is not None:
@@ -269,6 +274,7 @@ async def _extended_candles_loop(
                             candle=candle,
                         )
         except Exception:
+            logger.exception("extended candle ws error")
             await asyncio.sleep(3)
 
 
@@ -335,17 +341,25 @@ class CandleWsManager:
             await self._ensure_extended(inst_id=inst_id, tf=tf_norm)
 
     async def _ensure_okx(self, *, inst_id: str, tf: str) -> None:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
         if tf not in _OKX_CHANNEL_MAP:
             return
         key = (inst_id, tf)
         if key in self._okx_subscribed:
             return
         if self.okx_max_subs > 0 and len(self._okx_subscribed) >= self.okx_max_subs:
+            logger.warning(
+                "OKX WebSocket subscription limit reached: %d/%d, skipping %s:%s",
+                len(self._okx_subscribed), self.okx_max_subs, inst_id, tf
+            )
             return
         self._okx_subscribed.add(key)
         await self._okx_queue.put(key)
 
     async def _ensure_extended(self, *, inst_id: str, tf: str) -> None:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
         if not self.extended_stream_url:
             return
         if tf not in _EXTENDED_INTERVAL_MAP:
@@ -355,6 +369,10 @@ class CandleWsManager:
         if key in self._extended_tasks:
             return
         if self.extended_max_subs > 0 and len(self._extended_tasks) >= self.extended_max_subs:
+            logger.warning(
+                "Extended WebSocket subscription limit reached: %d/%d, skipping %s:%s",
+                len(self._extended_tasks), self.extended_max_subs, inst_id, tf
+            )
             return
         task = asyncio.create_task(
             _extended_candles_loop(

@@ -288,6 +288,31 @@ def _key(inst_id: str, tf: str) -> str:
     return f"{inst_id}:{tf}"
 
 
+def _format_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    text = format(normalized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _normalize_qty(qty: Decimal, *, step: Decimal | None, min_sz: Decimal | None) -> Decimal:
+    if step and step > 0:
+        qty = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+    else:
+        qty = qty.to_integral_value(rounding=ROUND_DOWN)
+    if min_sz and qty < min_sz:
+        qty = min_sz
+    return qty
+
+
+def _build_dedupe_key(payload: "TvPayload", *, inst_id: str, tf: str, close_f: float | None) -> str:
+    close_part = f"{close_f:.8f}" if close_f is not None else ""
+    side_part = (payload.side or "").strip().lower()
+    zone_part = (payload.zone or "").strip().upper()
+    return f"{payload.type}:{inst_id}:{tf}:{payload.t or ''}:{side_part}:{zone_part}:{close_part}"
+
+
 def _log_payload(payload: TvPayload) -> None:
     logger.info(
         "tv_webhook received type=%s instId=%s tf=%s zone=%s t=%s close=%s rsi=%s long=%s short=%s",
@@ -343,6 +368,37 @@ def _parse_side(value: str | None) -> str | None:
     if val in {"buy", "sell"}:
         return val
     return None
+
+
+def _calculate_order_size(*, inst_id: str, r_value: float) -> tuple[str, dict[str, object]]:
+    order_sz = SETTINGS.order_sz
+    meta: dict[str, object] = {}
+    if not (SETTINGS.risk_per_trade_usdt and SETTINGS.risk_per_trade_usdt > 0 and r_value > 0):
+        return order_sz, meta
+
+    inst_info = exchange.get_instrument_info(inst_id=inst_id)
+    ct_val = float(inst_info.get("ctVal")) if inst_info and inst_info.get("ctVal") else 1.0
+    lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+    min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+    risk_usdt = Decimal(str(SETTINGS.risk_per_trade_usdt))
+    r_value_dec = Decimal(str(r_value))
+    ct_val_dec = Decimal(str(ct_val))
+    calculated_sz_coins = risk_usdt / r_value_dec
+    calculated_sz_contracts = calculated_sz_coins / ct_val_dec
+    qty = _normalize_qty(calculated_sz_contracts, step=lot_step, min_sz=min_order)
+    if qty <= 0:
+        qty = min_order or Decimal("1")
+
+    order_sz = _format_decimal(qty)
+    meta = {
+        "ct_val": ct_val,
+        "lot_step": str(lot_step) if lot_step is not None else None,
+        "min_order": str(min_order) if min_order is not None else None,
+        "calculated_sz_coins": float(calculated_sz_coins),
+        "actual_coins": float(qty * ct_val_dec),
+    }
+    return order_sz, meta
 
 
 def _round_price_to_tick(price: float, tick_size: str | None) -> str:
@@ -442,9 +498,19 @@ def metrics_endpoint() -> dict:
 
 @app.post("/webhook/tradingview")
 async def webhook_tradingview(req: Request) -> dict:
+    raw_body = await req.body()
+    logger.info(
+        "tv_webhook request content_type=%s len=%s",
+        req.headers.get("content-type"),
+        len(raw_body),
+    )
     try:
-        data = await req.json()
+        import json
+
+        data = json.loads(raw_body.decode("utf-8"))
     except Exception as e:  # noqa: BLE001
+        snippet = raw_body[:500].decode("utf-8", errors="replace")
+        logger.warning("tv_webhook invalid_json err=%s body=%s", e, snippet)
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
 
     payload = TvPayload.model_validate(data)
@@ -467,11 +533,6 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     _log_payload(payload)
 
-    dedupe_key = f"{payload.type}:{inst_id}:{tf}:{payload.t or ''}"
-    if state.seen(dedupe_key, ttl_seconds=SETTINGS.dedupe_ttl_seconds):
-        _log_decision(inst_id, tf, action="skip", reason="deduped", dedupe_key=dedupe_key)
-        return {"ok": True, "deduped": True}
-
     close_f: float | None = None
     if payload.close is not None and payload.close != "":
         try:
@@ -480,6 +541,11 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             close_f = None
     payload_side = _parse_side(payload.side)
     skip_rsi_filter = payload_side is not None
+
+    dedupe_key = _build_dedupe_key(payload, inst_id=inst_id, tf=tf, close_f=close_f)
+    if state.seen(dedupe_key, ttl_seconds=SETTINGS.dedupe_ttl_seconds):
+        _log_decision(inst_id, tf, action="skip", reason="deduped", dedupe_key=dedupe_key)
+        return {"ok": True, "deduped": True}
 
     if candle_ws_manager is not None and SETTINGS.candle_ws_enabled:
         try:
@@ -869,15 +935,17 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if not SETTINGS.trading_enabled:
         r_value = abs(float(entry_price) - float(sl))
-        order_sz = SETTINGS.order_sz
-        if SETTINGS.risk_per_trade_usdt and SETTINGS.risk_per_trade_usdt > 0 and r_value > 0:
-            inst_info = exchange.get_instrument_info(inst_id=inst_id)
-            ct_val = 1.0
-            if inst_info and inst_info.get("ctVal"):
-                ct_val = float(inst_info.get("ctVal"))
-            calculated_sz_coins = SETTINGS.risk_per_trade_usdt / r_value
-            calculated_sz_contracts = calculated_sz_coins / ct_val
-            order_sz = str(max(1, int(calculated_sz_contracts)))
+        order_sz, size_meta = _calculate_order_size(inst_id=inst_id, r_value=r_value)
+        if size_meta:
+            logger.info(
+                "tv_webhook risk_based_sizing risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
+                SETTINGS.risk_per_trade_usdt,
+                r_value,
+                size_meta.get("calculated_sz_coins"),
+                size_meta.get("ct_val"),
+                order_sz,
+                size_meta.get("actual_coins"),
+            )
         _log_decision(
             inst_id,
             tf,
@@ -917,46 +985,18 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # NOTE: Fixed ORDER_SZ mode creates inconsistent risk across symbols.
     # E.g., 1 BTC contract ≈ $100k vs 1 DOGE contract ≈ $0.10
     # Use RISK_PER_TRADE_USDT for consistent risk management.
-    if SETTINGS.risk_per_trade_usdt and SETTINGS.risk_per_trade_usdt > 0:
-        import math
-
-        inst_info = exchange.get_instrument_info(inst_id=inst_id)
-        ct_val = 1.0
-        lot_step = None
-        min_order = None
-        if inst_info and inst_info.get("ctVal"):
-            ct_val = float(inst_info.get("ctVal"))
-            logger.info("tv_webhook contract_info inst_id=%s ct_val=%s", inst_id, ct_val)
-        if inst_info:
-            if inst_info.get("lotStep"):
-                lot_step = float(inst_info.get("lotStep"))
-            if inst_info.get("lotSz"):
-                min_order = float(inst_info.get("lotSz"))
-
-        calculated_sz_coins = SETTINGS.risk_per_trade_usdt / r_value
-        calculated_sz_contracts = calculated_sz_coins / ct_val
-        order_sz_contracts = max(1, int(math.floor(calculated_sz_contracts)))
-        if SETTINGS.exchange == "extended":
-            step = lot_step or 1.0
-            min_sz = min_order or 1.0
-            if step > 0:
-                order_sz_contracts = int(math.floor(order_sz_contracts / step) * step)
-            if order_sz_contracts < min_sz:
-                order_sz_contracts = int(min_sz)
-        order_sz = str(order_sz_contracts)
-        actual_coins = order_sz_contracts * ct_val
-
+    order_sz, size_meta = _calculate_order_size(inst_id=inst_id, r_value=r_value)
+    if size_meta:
         logger.info(
             "tv_webhook risk_based_sizing risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
             SETTINGS.risk_per_trade_usdt,
             r_value,
-            calculated_sz_coins,
-            ct_val,
+            size_meta.get("calculated_sz_coins"),
+            size_meta.get("ct_val"),
             order_sz,
-            actual_coins,
+            size_meta.get("actual_coins"),
         )
     else:
-        order_sz = SETTINGS.order_sz
         logger.info("tv_webhook fixed_sizing sz=%s", order_sz)
 
     if SETTINGS.exchange == "extended":
