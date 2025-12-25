@@ -69,6 +69,12 @@ On `DIV`, the service trades based on the latest `ZONE`:
 - `OVERSOLD` → open long
 - `OVERBOUGHT` → open short
 
+You can also send `side` to force direction and skip zone/RSI gating:
+
+```json
+{"secret":"CHANGE_ME","type":"DIV","instId":"ETH-USDT-SWAP","tf":"1m","t":"{{time}}","close":"{{close}}","side":"buy"}
+```
+
 ## Notes
 
 - This is a test harness; use OKX demo/sandbox first.
@@ -76,3 +82,4 @@ On `DIV`, the service trades based on the latest `ZONE`:
 - Stop-loss method is configurable via `.env` (`STOP_METHOD=lookback|pivot`, `STOP_LOOKBACK_BARS`, `ATR_*`).
 - Optional pattern filters: `PATTERN_LONG=w_bottom` and/or `PATTERN_SHORT=hs_top` (pivot-based approximation).
 - Take-profit ladder is configured via `.env` (`TP1_R/TP1_PCT`, `TP2_R/TP2_PCT`, `TP3_R/TP3_PCT`, `TRAIL_START_R`, `TRAIL_BACK_R`).
+- Extended market orders use the current reference price (bid/ask/mark) for IOC to avoid invalid limit values.
