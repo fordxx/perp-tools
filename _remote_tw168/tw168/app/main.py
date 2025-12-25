@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from decimal import Decimal, ROUND_DOWN
@@ -45,6 +46,10 @@ rsi_pct_overrides: dict[str, tuple[float, float]] = {}
 rsi_max_data_overrides: dict[str, int] = {}
 rsi_pct_symbol_overrides: dict[tuple[str, str | None], tuple[float, float]] = {}
 rsi_max_data_symbol_overrides: dict[tuple[str, str | None], int] = {}
+last_webhook_ts: float | None = None
+last_webhook_count = 0
+STARTUP_TS = time.time()
+_health_task: asyncio.Task | None = None
 
 # Initialize exchange client based on configuration
 if SETTINGS.exchange == "extended":
@@ -456,6 +461,21 @@ async def _startup() -> None:
                 for tf in tfs:
                     await candle_ws_manager.ensure_subscription(inst_id=inst_id, tf=tf)
     _start_telegram_control()
+    if SETTINGS.health_log_seconds > 0:
+        async def _health_loop() -> None:
+            while True:
+                await asyncio.sleep(SETTINGS.health_log_seconds)
+                now = time.time()
+                last_seen = last_webhook_ts
+                age = None if last_seen is None else int(now - last_seen)
+                logger.info(
+                    "health_check uptime_s=%s last_webhook_age_s=%s webhook_count=%s",
+                    int(now - STARTUP_TS),
+                    age,
+                    last_webhook_count,
+                )
+        global _health_task
+        _health_task = asyncio.create_task(_health_loop())
 
 
 @app.on_event("shutdown")
@@ -475,6 +495,8 @@ async def _shutdown() -> None:
             tg_control.stop()
         except Exception as e:
             logger.error("Error stopping tg_control: %s", str(e))
+    if _health_task is not None:
+        _health_task.cancel()
     if SETTINGS.exchange == "extended":
         try:
             close_fn = getattr(exchange, "close", None)
@@ -514,6 +536,9 @@ async def webhook_tradingview(req: Request) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
 
     payload = TvPayload.model_validate(data)
+    global last_webhook_ts, last_webhook_count
+    last_webhook_ts = time.time()
+    last_webhook_count += 1
     return await _process_payload(payload)
 
 

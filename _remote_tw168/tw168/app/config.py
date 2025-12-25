@@ -124,6 +124,7 @@ class Settings:
     zone_ttl_seconds: int = _getenv_int("ZONE_TTL_SECONDS", 900)
     cooldown_seconds: int = _getenv_int("COOLDOWN_SECONDS", 120)
     dedupe_ttl_seconds: int = _getenv_int("DEDUPE_TTL_SECONDS", 1800)
+    health_log_seconds: int = _getenv_int("HEALTH_LOG_SECONDS", 60)
 
     enable_long: bool = _getenv_bool("ENABLE_LONG", True)
     enable_short: bool = _getenv_bool("ENABLE_SHORT", True)
