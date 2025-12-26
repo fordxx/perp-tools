@@ -419,6 +419,13 @@ class ExtendedClient:
             )
 
         try:
+            tp_sl_type = None
+            if tp_param or sl_param:
+                # Prefer position-level SL for entry orders to avoid premature expiry.
+                if sl_param and not reduce_only:
+                    tp_sl_type = OrderTpslType.POSITION
+                else:
+                    tp_sl_type = OrderTpslType.ORDER
             response = self._run_async(
                 self._trading_client.place_order(
                     market_name=symbol,
@@ -428,7 +435,7 @@ class ExtendedClient:
                     post_only=False,
                     time_in_force=time_in_force,
                     reduce_only=reduce_only,
-                    tp_sl_type=OrderTpslType.ORDER if (tp_param or sl_param) else None,
+                    tp_sl_type=tp_sl_type,
                     take_profit=tp_param,
                     stop_loss=sl_param,
                 )
