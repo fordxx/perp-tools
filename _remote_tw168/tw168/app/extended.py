@@ -474,7 +474,7 @@ class ExtendedClient:
                 trigger_price=sl_price,
                 trigger_price_type=OrderTriggerPriceType.LAST,
                 price=sl_price,
-                price_type=OrderPriceType.LIMIT,
+                price_type=OrderPriceType.MARKET,
             )
 
         try:

@@ -474,9 +474,11 @@ def _place_extended_sl_order(
     total_sz: Decimal,
     tick_size: str | None,
     cl_ord_id: str,
+    last_price: float | None,
 ) -> dict[str, str] | None:
     sl_px = _round_price_to_tick(sl, tick_size)
     side = "sell" if pos_side == "long" else "buy"
+    order_px = _round_price_to_tick(last_price, tick_size) if last_price is not None else sl_px
     resp = exchange.place_order(
         inst_id=inst_id,
         td_mode=SETTINGS.okx_td_mode,
@@ -484,7 +486,7 @@ def _place_extended_sl_order(
         pos_side=pos_side,
         ord_type="limit",
         sz=str(total_sz),
-        px=sl_px,
+        px=order_px,
         cl_ord_id=cl_ord_id,
         sl_trigger_px=sl_px,
         tp_trigger_px=None,
@@ -752,6 +754,7 @@ async def _refresh_extended_protection() -> None:
                             total_sz=size,
                             tick_size=tick_size,
                             cl_ord_id=cl_ord_id,
+                            last_price=last_price,
                         )
                         if sl_order:
                             notify_info(
