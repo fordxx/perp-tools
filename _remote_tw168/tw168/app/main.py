@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
 import time
 from decimal import Decimal, ROUND_DOWN
 from types import SimpleNamespace
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -29,6 +31,7 @@ from app.state import InMemoryState
 from app.telegram_control import TelegramControl
 from app.trade_manager import TradeManager, TradePlan
 from app.ws_fills import WsFillManager
+from app.emergency_handler import get_emergency_handler
 
 
 app = FastAPI(title="tv-webhook")
@@ -53,6 +56,16 @@ _health_task: asyncio.Task | None = None
 _refresh_task: asyncio.Task | None = None
 _last_refresh_by_key: dict[str, float] = {}
 
+# Concurrency limiter for order placement (max 3 concurrent orders)
+_order_semaphore = asyncio.Semaphore(3)
+
+
+async def _place_order_with_limit(exchange_obj: Any, *args: Any, **kwargs: Any) -> Any:
+    """Place order with concurrency limiting."""
+    async with _order_semaphore:
+        return exchange_obj.place_order(*args, **kwargs)
+
+
 # Initialize exchange client based on configuration
 if SETTINGS.exchange == "extended":
     from app.extended import ExtendedClient
@@ -64,6 +77,15 @@ if SETTINGS.exchange == "extended":
         extended_stream_url=exchange.stream_url,
         extended_api_key=exchange.api_key or "",
     )
+elif SETTINGS.exchange == "paradex":
+    import os
+
+    from app.paradex import ParadexClient
+
+    env = os.getenv("PARADEX_ENV", "prod").lower()
+    use_testnet = env not in {"prod", "mainnet"}
+    exchange = ParadexClient(use_testnet=use_testnet)
+    exchange.connect()
 else:
     from app.okx import OKXClient, OKXCredentials
 
@@ -86,7 +108,38 @@ else:
         okx_passphrase=SETTINGS.okx_api_passphrase,
     )
 
-def _parse_symbol_tfs(raw: str) -> dict[str, list[str]]:
+
+def _configure_logging() -> None:
+    """Configure log rotation and format for production use."""
+    # Create rotating file handler (50MB files, keep 5 backups)
+    handler = logging.handlers.RotatingFileHandler(
+        "tw168.log",
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=5,
+        encoding="utf-8"
+    )
+
+    # Set format
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+
+    # Add handler to uvicorn logger
+    uvicorn_logger = logging.getLogger("uvicorn.error")
+    uvicorn_logger.addHandler(handler)
+
+    # Set level based on environment
+    if SETTINGS.trading_enabled:
+        uvicorn_logger.setLevel(logging.INFO)
+    else:
+        uvicorn_logger.setLevel(logging.DEBUG)
+
+    logger.info("Log rotation configured: 50MB/file, 5 backups, level=%s", uvicorn_logger.level)
+
+
+def _parse_symbol_tfs(raw: str, *, default_tfs: list[str]) -> dict[str, list[str]]:
     import re
 
     out: dict[str, list[str]] = {}
@@ -94,18 +147,24 @@ def _parse_symbol_tfs(raw: str) -> dict[str, list[str]]:
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
-        if ":" in line:
-            inst_id, tf_raw = line.split(":", 1)
-        else:
-            parts = line.split()
-            if not parts:
+        for item in line.split(","):
+            item = item.strip()
+            if not item:
                 continue
-            inst_id = parts[0]
-            tf_raw = " ".join(parts[1:])
-        inst_id = inst_id.strip()
-        tfs = [t.strip().lower() for t in re.split(r"[,\s|]+", tf_raw) if t.strip()]
-        if inst_id and tfs:
-            out[inst_id] = tfs
+            if ":" in item:
+                inst_id, tf_raw = item.split(":", 1)
+            else:
+                parts = item.split()
+                if not parts:
+                    continue
+                inst_id = parts[0]
+                tf_raw = " ".join(parts[1:])
+            inst_id = inst_id.strip()
+            tfs = [t.strip().lower() for t in re.split(r"[,\s|]+", tf_raw) if t.strip()]
+            if inst_id and not tfs:
+                tfs = list(default_tfs)
+            if inst_id and tfs:
+                out[inst_id] = tfs
     return out
 
 
@@ -219,23 +278,30 @@ def _parse_symbol_int_overrides(raw: str) -> dict[tuple[str, str | None], int]:
     return out
 
 
+allowed_symbols: set[str] = set(SETTINGS.symbol_allowlist)
+
 if SETTINGS.candle_ws_enabled:
     okx_inst_ids: list[str] = []
     extended_inst_ids: list[str] = []
+    default_tfs = [tf.lower() for tf in SETTINGS.candle_ws_tfs] or ["1h"]
     if SETTINGS.candle_ws_symbol_tfs_file:
         try:
             with open(SETTINGS.candle_ws_symbol_tfs_file, "r", encoding="ascii") as f:
-                candle_ws_symbol_tfs = _parse_symbol_tfs(f.read())
+                candle_ws_symbol_tfs = _parse_symbol_tfs(f.read(), default_tfs=default_tfs)
         except Exception:
             candle_ws_symbol_tfs = {}
     elif SETTINGS.candle_ws_symbol_tfs:
-        candle_ws_symbol_tfs = _parse_symbol_tfs(SETTINGS.candle_ws_symbol_tfs)
-    if not candle_ws_symbol_tfs:
-        if "*" in SETTINGS.symbol_allowlist:
-            logger.warning("CANDLE_WS enabled with SYMBOL_ALLOWLIST='*'; skipping WS subscriptions")
-        else:
-            okx_inst_ids = list(SETTINGS.symbol_allowlist)
-            extended_inst_ids = list(SETTINGS.symbol_allowlist)
+        candle_ws_symbol_tfs = _parse_symbol_tfs(SETTINGS.candle_ws_symbol_tfs, default_tfs=default_tfs)
+
+    if candle_ws_symbol_tfs:
+        allowed_symbols = set(candle_ws_symbol_tfs.keys())
+    elif "*" in SETTINGS.symbol_allowlist:
+        logger.warning("CANDLE_WS enabled with SYMBOL_ALLOWLIST='*'; skipping WS subscriptions")
+    else:
+        okx_inst_ids = list(SETTINGS.symbol_allowlist)
+        extended_inst_ids = list(SETTINGS.symbol_allowlist)
+        for inst_id in SETTINGS.symbol_allowlist:
+            candle_ws_symbol_tfs.setdefault(inst_id, default_tfs)
 
     extended_stream_url = ""
     try:
@@ -260,7 +326,7 @@ if SETTINGS.candle_ws_enabled:
         extended_enabled=SETTINGS.candle_ws_extended_enabled,
         okx_inst_ids=okx_inst_ids,
         extended_inst_ids=extended_inst_ids,
-        tfs=[tf.lower() for tf in SETTINGS.candle_ws_tfs],
+        tfs=[] if candle_ws_symbol_tfs else default_tfs,
         extended_stream_url=extended_stream_url,
         okx_max_subs=SETTINGS.candle_ws_okx_max_subs,
         extended_max_subs=SETTINGS.candle_ws_extended_max_subs,
@@ -660,10 +726,97 @@ async def _refresh_extended_protection() -> None:
         return
     while True:
         await asyncio.sleep(SETTINGS.extended_refresh_seconds)
+
+
+async def _refresh_paradex_protection() -> None:
+    if SETTINGS.exchange != "paradex":
+        return
+    while True:
+        await asyncio.sleep(SETTINGS.extended_refresh_seconds)
+        if not SETTINGS.trading_enabled or not SETTINGS.extended_refresh_enabled:
+            continue
+        for inst_id in allowed_symbols:
+            if inst_id == "*":
+                continue
+            pos = exchange.get_position(inst_id=inst_id, pos_side="long")
+            if not pos:
+                pos = exchange.get_position(inst_id=inst_id, pos_side="short")
+            if not pos:
+                continue
+            size = Decimal(str(pos.get("pos", "0")))
+            if size <= 0:
+                continue
+            entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
+            if entry_info is None:
+                continue
+            last_price = exchange.get_last_price(inst_id=inst_id)
+            if last_price is None:
+                continue
+
+            trail_sl = _compute_trailing_sl(
+                side=entry_info.side,
+                entry_price=entry_info.entry_price,
+                sl_price=entry_info.stop_loss,
+                last_price=last_price,
+                trail_start_r=SETTINGS.trail_start_r,
+            )
+            if trail_sl is None:
+                continue
+
+            inst_info = exchange.get_instrument_info(inst_id=inst_id)
+            tick_size = inst_info.get("tickSz") if inst_info else None
+            desired_sl = float(_round_price_to_tick(trail_sl, tick_size))
+
+            orders = exchange.get_open_orders(inst_id=inst_id)
+            sl_orders = [o for o in orders if str(o.get("type", "")).upper().startswith("STOP_LOSS")]
+            current_sl = None
+            for order in sl_orders:
+                trigger = _extract_order_price(order.get("trigger_price")) or _extract_order_price(order.get("price"))
+                if trigger is None:
+                    continue
+                if current_sl is None:
+                    current_sl = trigger
+                else:
+                    if entry_info.side == "buy":
+                        current_sl = max(current_sl, trigger)
+                    else:
+                        current_sl = min(current_sl, trigger)
+
+            if current_sl is not None:
+                if entry_info.side == "buy" and desired_sl <= current_sl:
+                    continue
+                if entry_info.side == "sell" and desired_sl >= current_sl:
+                    continue
+
+            # Cancel old SL orders (if any) then place new SL.
+            for order in sl_orders:
+                ord_id = order.get("ordId")
+                if ord_id:
+                    exchange.cancel_order(order_id=str(ord_id))
+
+            sl_side = "sell" if entry_info.side == "buy" else "buy"
+            resp = exchange.place_order(
+                inst_id=inst_id,
+                side=sl_side,
+                ord_type="stop_loss_market",
+                sz=str(size),
+                px=None,
+                cl_ord_id=f"trail{int(time.time())}"[:32],
+                reduce_only=True,
+                trigger_px=_round_price_to_tick(desired_sl, tick_size),
+            )
+            if str(resp.get("code", "")) not in {"0", "success"}:
+                notify_error(
+                    f"paradex sl refresh failed instId={inst_id} side={sl_side} sl={desired_sl} sz={size} resp={resp}"
+                )
+            else:
+                notify_info(
+                    f"paradex sl refresh placed instId={inst_id} side={sl_side} sl={desired_sl}"
+                )
         if not SETTINGS.trading_enabled or not SETTINGS.extended_refresh_enabled:
             continue
         now = time.time()
-        for inst_id in SETTINGS.symbol_allowlist:
+        for inst_id in allowed_symbols:
             if inst_id == "*":
                 continue
             for pos_side in ("long", "short"):
@@ -854,6 +1007,9 @@ async def _refresh_extended_protection() -> None:
 
 @app.on_event("startup")
 async def _startup() -> None:
+    # Configure log rotation
+    _configure_logging()
+
     if SETTINGS.trading_enabled and manager is not None:
         manager.start()
     if SETTINGS.trading_enabled and ws_manager is not None:
@@ -886,6 +1042,8 @@ async def _startup() -> None:
     global _refresh_task
     if SETTINGS.exchange == "extended" and SETTINGS.extended_refresh_enabled:
         _refresh_task = asyncio.create_task(_refresh_extended_protection())
+    if SETTINGS.exchange == "paradex" and SETTINGS.extended_refresh_enabled:
+        _refresh_task = asyncio.create_task(_refresh_paradex_protection())
 
 
 @app.on_event("shutdown")
@@ -930,6 +1088,47 @@ def metrics_endpoint() -> dict:
     return metrics.get_summary()
 
 
+@app.get("/emergency")
+async def emergency_status() -> dict:
+    """Get emergency positions status."""
+    emergency_handler = get_emergency_handler()
+    positions = await emergency_handler.get_emergency_positions()
+
+    return {
+        "count": len(positions),
+        "positions": [
+            {
+                "inst_id": pos.inst_id,
+                "pos_side": pos.pos_side,
+                "size": pos.size,
+                "entry_price": pos.entry_price,
+                "stop_loss": pos.stop_loss,
+                "failure_reason": pos.failure_reason,
+                "age_seconds": int(time.time() - pos.timestamp),
+                "retry_count": pos.retry_count,
+                "max_retries": pos.max_retries,
+            }
+            for pos in positions
+        ],
+    }
+
+
+@app.get("/rate_limits")
+def rate_limits_endpoint() -> dict:
+    """Get rate limiter statistics."""
+    from app.rate_limiter import get_rate_limiter_stats
+
+    return get_rate_limiter_stats()
+
+
+@app.get("/websocket/stats")
+def websocket_stats_endpoint() -> dict:
+    """Get WebSocket subscription statistics."""
+    if candle_ws_manager:
+        return candle_ws_manager.get_stats()
+    return {"error": "WebSocket manager not initialized"}
+
+
 @app.post("/webhook/tradingview")
 async def webhook_tradingview(req: Request) -> dict:
     raw_body = await req.body()
@@ -942,10 +1141,15 @@ async def webhook_tradingview(req: Request) -> dict:
         import json
 
         data = json.loads(raw_body.decode("utf-8"))
-    except Exception as e:  # noqa: BLE001
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         snippet = raw_body[:500].decode("utf-8", errors="replace")
         logger.warning("tv_webhook invalid_json err=%s body=%s", e, snippet)
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+    except Exception as e:
+        # Catch any other unexpected errors
+        snippet = raw_body[:200].decode("utf-8", errors="replace")
+        logger.error("tv_webhook unexpected_error err=%s body_snippet=%s", e, snippet, exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error") from e
 
     payload = TvPayload.model_validate(data)
     global last_webhook_ts, last_webhook_count
@@ -961,7 +1165,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     if payload.secret != SETTINGS.tv_webhook_secret:
         _log_decision(inst_id, payload.tf, action="reject", reason="bad_secret")
         raise HTTPException(status_code=401, detail="Bad secret")
-    if "*" not in SETTINGS.symbol_allowlist and inst_id not in SETTINGS.symbol_allowlist:
+    if "*" not in SETTINGS.symbol_allowlist and inst_id not in allowed_symbols:
         _log_decision(inst_id, payload.tf, action="reject", reason="symbol_not_allowed")
         raise HTTPException(status_code=403, detail="Symbol not allowed")
 
@@ -1436,6 +1640,122 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     else:
         logger.info("tv_webhook fixed_sizing sz=%s", order_sz)
 
+    if SETTINGS.exchange == "paradex":
+        inst_info = exchange.get_instrument_info(inst_id=inst_id)
+        tick_size = inst_info.get("tickSz") if inst_info else None
+        sl_px = _round_price_to_tick(sl, tick_size) if sl is not None else None
+
+        ts = int(time.time())
+        rnd = random.randint(100, 999)
+        cl_ord_id = f"tv{ts}{rnd}{side[:1]}"[:32]
+        entry_px = None
+        if SETTINGS.order_type == "limit":
+            entry_px = _round_price_to_tick(entry_price, tick_size)
+
+        resp = exchange.place_order(
+            inst_id=inst_id,
+            side=side,
+            ord_type=SETTINGS.order_type,
+            sz=order_sz,
+            px=entry_px,
+            cl_ord_id=cl_ord_id[:32],
+            reduce_only=False,
+            trigger_px=None,
+        )
+        if str(resp.get("code", "")) not in {"0", "success"}:
+            notify_error(
+                f"paradex entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
+            )
+            _log_decision(inst_id, tf, action="order_rejected", side=side, posSide=pos_side)
+            return {"ok": False, "error": "entry_rejected", "order": resp}
+
+        notify_info(
+            f"paradex entry accepted instId={inst_id} side={side} sz={order_sz}"
+        )
+
+        actual_pos_sz = Decimal(str(order_sz))
+        if SETTINGS.tp_enabled and r_value > 0:
+            pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+            if pos and pos.get("pos"):
+                actual_pos_sz = Decimal(str(pos.get("pos")))
+
+        if sl_px is not None:
+            sl_side = "sell" if side == "buy" else "buy"
+            sl_resp = exchange.place_order(
+                inst_id=inst_id,
+                side=sl_side,
+                ord_type="stop_loss_market",
+                sz=str(actual_pos_sz),
+                px=None,
+                cl_ord_id=f"{cl_ord_id}sl"[:32],
+                reduce_only=True,
+                trigger_px=sl_px,
+            )
+            if str(sl_resp.get("code", "")) not in {"0", "success"}:
+                notify_error(
+                    f"paradex sl failed instId={inst_id} side={sl_side} sz={actual_pos_sz} resp={sl_resp}"
+                )
+            else:
+                notify_info(
+                    f"paradex sl placed instId={inst_id} side={sl_side} sl={sl_px}"
+                )
+
+        tp_orders: list[dict[str, str]] = []
+        if SETTINGS.tp_enabled and r_value > 0:
+            tp_orders = _build_tp_targets(
+                inst_id=inst_id,
+                side=side,
+                entry_price=float(entry_price),
+                sl=float(sl),
+                total_sz=actual_pos_sz,
+                tick_size=tick_size,
+            )
+            for target in tp_orders:
+                tp_resp = exchange.place_order(
+                    inst_id=inst_id,
+                    side="sell" if side == "buy" else "buy",
+                    ord_type="take_profit_limit",
+                    sz=target["size"],
+                    px=target["price"],
+                    cl_ord_id=f"{cl_ord_id}{target['tag']}"[:32],
+                    reduce_only=True,
+                    trigger_px=target["price"],
+                )
+                if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                    notify_error(
+                        f"paradex tp failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+                    )
+            if tp_orders:
+                notify_info(
+                    f"paradex tp orders placed instId={inst_id} count={len(tp_orders)}"
+                )
+
+        fill_tracker.register_entry(
+            inst_id=inst_id,
+            side=side,
+            entry_price=float(entry_price),
+            stop_loss=float(sl),
+        )
+
+        state.mark_traded(key)
+        state.clear_zone(key)
+        _log_decision(inst_id, tf, action="order_placed", side=side, posSide=pos_side, zone=zone_state.zone)
+
+        return {
+            "ok": True,
+            "type": "DIV",
+            "zone": zone_state.zone,
+            "side": side,
+            "posSide": pos_side,
+            "entry": float(entry_price),
+            "sl": sl,
+            "tp": tp,
+            "order_sz": order_sz,
+            "r_value": r_value,
+            "order": resp,
+            "tp_orders": tp_orders,
+        }
+
     if SETTINGS.exchange == "extended":
         # Get instrument info for price precision
         inst_info = exchange.get_instrument_info(inst_id=inst_id)
@@ -1460,7 +1780,20 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 tp_trigger_px=None,
                 reduce_only=False,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (ConnectionError, TimeoutError) as exc:
+            logger.error("extended entry network_error instId=%s err=%s", inst_id, exc, exc_info=True)
+            notify_error(
+                f"extended entry network failure instId={inst_id} side={side} sz={order_sz} err={exc}"
+            )
+            raise HTTPException(status_code=503, detail=f"Exchange network error: {exc}") from exc
+        except ValueError as exc:
+            logger.error("extended entry invalid_params instId=%s err=%s", inst_id, exc, exc_info=True)
+            notify_error(
+                f"extended entry invalid params instId={inst_id} side={side} sz={order_sz} err={exc}"
+            )
+            raise HTTPException(status_code=400, detail=f"Invalid order parameters: {exc}") from exc
+        except Exception as exc:
+            logger.error("extended entry unexpected_error instId=%s err=%s", inst_id, exc, exc_info=True)
             notify_error(
                 f"extended entry failed instId={inst_id} side={side} sz={order_sz} err={exc}"
             )
@@ -1699,7 +2032,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     metrics.record_sl_attempt(success=sl_order_success, inst_id=inst_id, reason=sl_failure_reason)
 
     # Try backup stop-loss strategy if enabled
+    backup_sl_attempted = False
     if not sl_order_success and SETTINGS.backup_sl_enabled:
+        backup_sl_attempted = True
         logger.info("tv_webhook trying_backup_sl instId=%s method=limit_order", inst_id)
         try:
             backup_sl_resp = exchange.place_order(
@@ -1725,11 +2060,11 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     if ord_id:
                         fill_tracker.register_order_label(key=ord_id, label="sl_backup")
         except Exception as backup_err:
-            logger.error("tv_webhook backup_sl_failed instId=%s err=%s", inst_id, str(backup_err))
+            logger.error("tv_webhook backup_sl_failed instId=%s err=%s", inst_id, str(backup_err), exc_info=True)
 
-    # Emergency close if stop-loss order failed
+    # Emergency handling if stop-loss order failed
     if not sl_order_success:
-        logger.error("tv_webhook emergency_close instId=%s posSide=%s sz=%s reason=sl_order_failed",
+        logger.error("tv_webhook sl_critical_failure instId=%s posSide=%s sz=%s reason=sl_order_failed",
                      inst_id, pos_side, order_sz)
 
         # Check if we should alert based on failure rate
@@ -1739,8 +2074,27 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 f"({metrics.sl_orders_failed}/{metrics.sl_orders_attempted} attempts)"
             )
 
+        # Register with emergency handler for monitoring
+        emergency_handler = get_emergency_handler()
+        await emergency_handler.register_emergency(
+            inst_id=inst_id,
+            pos_side=pos_side,
+            size=order_sz,
+            entry_price=filled_price,
+            stop_loss=float(sl),
+            cl_ord_id=cl_ord_id,
+            failure_reason=f"SL order failed (backup_attempted={backup_sl_attempted}): {sl_failure_reason}",
+        )
+
+        # Attempt emergency market close
+        emergency_close_success = False
+        emergency_close_resp = None
         try:
-            emergency_resp = exchange.place_order(
+            logger.critical(
+                "tv_webhook attempting_emergency_close instId=%s posSide=%s sz=%s",
+                inst_id, pos_side, order_sz
+            )
+            emergency_close_resp = exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=sl_side,
@@ -1748,30 +2102,63 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 ord_type="market",
                 sz=order_sz,
                 px=None,
-                cl_ord_id=f"{cl_ord_id}_emergency"[:32],
+                cl_ord_id=f"{cl_ord_id}_emerg"[:32],
                 sl_trigger_px=None,
                 tp_trigger_px=None,
                 reduce_only=True,
             )
-            metrics.record_emergency_close(success=True, inst_id=inst_id)
-            notify_error(
-                f"okx emergency close executed instId={inst_id} due to SL failure resp={emergency_resp}"
-            )
-            # Skip marking traded and registering plan since position was closed
-            return {
-                "ok": False,
-                "error": "stop_loss_failed_position_closed",
-                "instId": inst_id,
-                "emergency_close": emergency_resp,
-            }
+
+            if str(emergency_close_resp.get("code", "")) in {"0", "success"}:
+                emergency_close_success = True
+                metrics.record_emergency_close(success=True, inst_id=inst_id)
+                logger.info("tv_webhook emergency_close_success instId=%s resp=%s", inst_id, emergency_close_resp)
+                notify_error(
+                    f"⚠️ Emergency close executed: {inst_id}\n"
+                    f"Side: {pos_side}\n"
+                    f"Size: {order_sz}\n"
+                    f"Reason: SL order failed\n"
+                    f"Response: {emergency_close_resp.get('code')}"
+                )
+                # Clear from emergency handler if close successful
+                await emergency_handler.clear_emergency(inst_id, pos_side)
+                # Skip marking traded and registering plan since position was closed
+                return {
+                    "ok": False,
+                    "error": "stop_loss_failed_position_closed",
+                    "instId": inst_id,
+                    "emergency_close": emergency_close_resp,
+                }
+            else:
+                logger.error("tv_webhook emergency_close_rejected instId=%s resp=%s", inst_id, emergency_close_resp)
+                metrics.record_emergency_close(success=False, inst_id=inst_id)
+
         except Exception as close_err:
             metrics.record_emergency_close(success=False, inst_id=inst_id)
-            logger.critical("tv_webhook emergency_close_failed instId=%s err=%s", inst_id, str(close_err))
-            notify_error(
-                f"CRITICAL: Emergency close failed for {inst_id}! Manual intervention required. Error: {close_err}"
+            logger.critical(
+                "tv_webhook emergency_close_exception instId=%s err=%s",
+                inst_id, str(close_err),
+                exc_info=True
             )
-            # Continue anyway to at least mark the trade
-            pass
+
+        # If emergency close also failed, send critical alerts
+        if not emergency_close_success:
+            notify_error(
+                f"🚨 CRITICAL ALERT 🚨\n"
+                f"Position opened WITHOUT PROTECTION\n"
+                f"Symbol: {inst_id}\n"
+                f"Side: {pos_side}\n"
+                f"Size: {order_sz}\n"
+                f"Entry: {filled_price}\n"
+                f"Intended SL: {sl}\n"
+                f"SL Failure: {sl_failure_reason}\n"
+                f"Backup SL: {'attempted' if backup_sl_attempted else 'disabled'}\n"
+                f"Emergency Close: FAILED\n"
+                f"⚠️ IMMEDIATE MANUAL INTERVENTION REQUIRED\n"
+                f"⚠️ Position is being monitored by emergency handler"
+            )
+
+            # Even though we failed, continue to mark the trade so we can track it
+            # The emergency handler will monitor this position
 
     # 7. 标记交易和清除zone
     state.mark_traded(key)

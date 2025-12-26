@@ -56,11 +56,23 @@ async def _okx_ws_loop(
     inst_type: str = "SWAP",
     stop_event: asyncio.Event,
 ) -> None:
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+
     dedupe = _Dedupe()
     url = "wss://ws.okx.com:8443/ws/v5/private"
+    retry_delay = 1.0
+    max_retry_delay = 60.0
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+
     while not stop_event.is_set():
         try:
-            async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=10, close_timeout=5) as ws:
+                # Connection successful, reset retry parameters
+                retry_delay = 1.0
+                consecutive_errors = 0
+
                 ts = str(_now())
                 login = {
                     "op": "login",
@@ -78,10 +90,14 @@ async def _okx_ws_loop(
                 await ws.send(
                     json.dumps({"op": "subscribe", "args": [{"channel": "orders-algo", "instType": inst_type}]})
                 )
+                logger.info("OKX fill ws connected and subscribed")
 
                 async for raw in ws:
                     msg = json.loads(raw)
                     if msg.get("event"):
+                        event_type = msg.get("event")
+                        if event_type == "error":
+                            logger.error("OKX fill ws event error: %s", msg)
                         continue
                     arg = msg.get("arg") or {}
                     channel = arg.get("channel", "")
@@ -130,8 +146,38 @@ async def _okx_ws_loop(
                             notify_info(
                                 f"okx {label} triggered instId={inst_id} state={state} trigger_px={trigger_px} sz={sz}"
                             )
-        except Exception:
-            await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            logger.info("OKX fill ws task cancelled")
+            raise
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.WebSocketException) as e:
+            consecutive_errors += 1
+            logger.warning(
+                "OKX fill ws connection error (consecutive: %d/%d): %s",
+                consecutive_errors, max_consecutive_errors, str(e)
+            )
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("OKX fill ws max consecutive errors reached, stopping reconnection attempts")
+                break
+        except (ConnectionError, TimeoutError) as e:
+            consecutive_errors += 1
+            logger.warning(
+                "OKX fill ws network error (consecutive: %d/%d): %s",
+                consecutive_errors, max_consecutive_errors, str(e)
+            )
+        except json.JSONDecodeError as e:
+            logger.error("OKX fill ws received invalid JSON: %s", str(e))
+            # Don't increment consecutive_errors for JSON errors
+        except Exception as e:
+            consecutive_errors += 1
+            logger.exception("OKX fill ws unexpected error (consecutive: %d/%d)", consecutive_errors, max_consecutive_errors)
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("OKX fill ws max consecutive errors reached, stopping")
+                break
+
+        if not stop_event.is_set():
+            logger.info("OKX fill ws reconnecting in %.1fs", retry_delay)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
 
 
 async def _extended_ws_loop(
@@ -141,14 +187,27 @@ async def _extended_ws_loop(
     fill_tracker: FillTracker,
     stop_event: asyncio.Event,
 ) -> None:
+    import logging
+    logger = logging.getLogger("uvicorn.error")
+
     from x10.perpetual.stream_client import PerpetualStreamClient
     from x10.utils.http import StreamDataType
 
     dedupe = _Dedupe()
     client = PerpetualStreamClient(api_url=stream_url)
+    retry_delay = 1.0
+    max_retry_delay = 60.0
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+
     while not stop_event.is_set():
         try:
             async with client.subscribe_to_account_updates(api_key=api_key) as stream:
+                # Connection successful, reset retry parameters
+                retry_delay = 1.0
+                consecutive_errors = 0
+                logger.info("Extended fill ws connected and subscribed")
+
                 async for msg in stream:
                     if msg.type != StreamDataType.TRADE or not msg.data or not msg.data.trades:
                         continue
@@ -174,8 +233,29 @@ async def _extended_ws_loop(
                             notify_info(
                                 f"extended trade filled instId={inst_id} side={side} px={price} sz={qty}"
                             )
-        except Exception:
-            await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            logger.info("Extended fill ws task cancelled")
+            raise
+        except (ConnectionError, TimeoutError) as e:
+            consecutive_errors += 1
+            logger.warning(
+                "Extended fill ws network error (consecutive: %d/%d): %s",
+                consecutive_errors, max_consecutive_errors, str(e)
+            )
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("Extended fill ws max consecutive errors reached, stopping reconnection attempts")
+                break
+        except Exception as e:
+            consecutive_errors += 1
+            logger.exception("Extended fill ws unexpected error (consecutive: %d/%d)", consecutive_errors, max_consecutive_errors)
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("Extended fill ws max consecutive errors reached, stopping")
+                break
+
+        if not stop_event.is_set():
+            logger.info("Extended fill ws reconnecting in %.1fs", retry_delay)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
 
 
 @dataclass

@@ -89,6 +89,9 @@ def _validate_settings(settings: "Settings") -> None:
         if settings.exchange == "okx":
             if not all([settings.okx_api_key, settings.okx_api_secret, settings.okx_api_passphrase]):
                 errors.append("OKX credentials incomplete (API_KEY, API_SECRET, API_PASSPHRASE required)")
+        if settings.exchange == "paradex":
+            if not all([os.getenv("PARADEX_L2_PRIVATE_KEY"), os.getenv("PARADEX_ACCOUNT_ADDRESS")]):
+                errors.append("Paradex credentials incomplete (PARADEX_L2_PRIVATE_KEY, PARADEX_ACCOUNT_ADDRESS required)")
         # Extended validation would need env vars check
 
     # Print warnings
@@ -112,7 +115,7 @@ class Settings:
     okx_api_secret: str = _getenv("OKX_API_SECRET", "")
     okx_api_passphrase: str = _getenv("OKX_API_PASSPHRASE", "")
     okx_td_mode: str = _getenv("OKX_TD_MODE", "cross")
-    exchange: str = _getenv("EXCHANGE", "okx").lower()  # okx or extended
+    exchange: str = _getenv("EXCHANGE", "okx").lower()  # okx | extended | paradex
     trading_enabled: bool = _getenv_bool("TRADING_ENABLED", False)
 
     symbol_allowlist: set[str] = frozenset(
@@ -194,7 +197,7 @@ class Settings:
     candle_ws_enabled: bool = _getenv_bool("CANDLE_WS_ENABLED", True)
     candle_ws_okx_enabled: bool = _getenv_bool("CANDLE_WS_OKX_ENABLED", True)
     candle_ws_extended_enabled: bool = _getenv_bool("CANDLE_WS_EXTENDED_ENABLED", True)
-    candle_ws_tfs: tuple[str, ...] = tuple(_getenv_list("CANDLE_WS_TFS", "1m"))
+    candle_ws_tfs: tuple[str, ...] = tuple(_getenv_list("CANDLE_WS_TFS", "1h"))
     candle_cache_ttl_seconds: int = _getenv_int("CANDLE_CACHE_TTL_SECONDS", 30)
     candle_cache_max_bars: int = _getenv_int("CANDLE_CACHE_MAX_BARS", 4000)
     candle_ws_okx_max_subs: int = _getenv_int("CANDLE_WS_OKX_MAX_SUBS", 200)
