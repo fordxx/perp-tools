@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, Optional
 
@@ -458,7 +458,7 @@ class ExtendedClient:
             expire_time = None
             if time_in_force == TimeInForce.GTT:
                 expire_hours = float(os.getenv("EXTENDED_ORDER_EXPIRE_HOURS", "168"))
-                expire_time = datetime.utcnow() + timedelta(hours=expire_hours)
+                expire_time = datetime.now(timezone.utc) + timedelta(hours=expire_hours)
             response = self._run_async(
                 self._trading_client.place_order(
                     market_name=symbol,
