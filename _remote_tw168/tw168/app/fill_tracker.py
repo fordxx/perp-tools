@@ -34,6 +34,15 @@ class FillTracker:
     def register_algo_label(self, *, algo_id: str, label: str) -> None:
         self._algo_labels[algo_id] = (label, time.time())
 
+    def get_entry_info(self, *, inst_id: str) -> Optional[EntryInfo]:
+        info = self._entries.get(inst_id)
+        if info is None:
+            return None
+        if time.time() - info.ts > self._ttl_seconds:
+            self._entries.pop(inst_id, None)
+            return None
+        return info
+
     def get_order_label(self, *, key: str) -> Optional[str]:
         value = self._order_labels.get(key)
         if not value:

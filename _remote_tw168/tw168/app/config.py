@@ -168,7 +168,7 @@ class Settings:
     tp3_pct: float = _getenv_float("TP3_PCT", 0.10)
     tp4_r: float = _getenv_float("TP4_R", 3.5)
     tp4_pct: float = _getenv_float("TP4_PCT", 0.05)
-    trail_start_r: float = _getenv_float("TRAIL_START_R", 2.0)
+    trail_start_r: float = _getenv_float("TRAIL_START_R", 0.8)
     trail_back_r: float = _getenv_float("TRAIL_BACK_R", 0.75)
     manager_poll_seconds: float = _getenv_float("MANAGER_POLL_SECONDS", 2.0)
 
@@ -203,6 +203,10 @@ class Settings:
     candle_ws_symbol_tfs: str = _getenv("CANDLE_WS_SYMBOL_TFS", "")
     candle_ws_symbol_tfs_file: str | None = _getenv_optional("CANDLE_WS_SYMBOL_TFS_FILE")
     candle_ws_symbol_tfs_strict: bool = _getenv_bool("CANDLE_WS_SYMBOL_TFS_STRICT", False)
+    extended_refresh_seconds: int = _getenv_int("EXTENDED_REFRESH_SECONDS", 300)
+    extended_refresh_enabled: bool = _getenv_bool("EXTENDED_REFRESH_ENABLED", True)
+    extended_refresh_sl_enabled: bool = _getenv_bool("EXTENDED_REFRESH_SL_ENABLED", True)
+    extended_refresh_tp_enabled: bool = _getenv_bool("EXTENDED_REFRESH_TP_ENABLED", True)
 
 
 SETTINGS = Settings()

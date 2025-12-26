@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, Optional
 
@@ -336,11 +337,45 @@ class ExtendedClient:
                     "posSide": pos_side,
                     "pos": str(size_val),
                     "market": symbol,
+                    "open_price": getattr(pos, "open_price", None),
+                    "sl_price": getattr(pos, "sl_price", None),
+                    "tp_price": getattr(pos, "tp_price", None),
                     "raw": pos,
                 }
         except Exception:
             return None
         return None
+
+    def get_open_orders(self, *, inst_id: str) -> list[dict[str, Any]]:
+        if not self._trading_client:
+            return []
+        symbol = inst_id.replace("-USDT-SWAP", "-USD")
+        try:
+            response = self._run_async(
+                self._trading_client.account.get_open_orders(market_names=[symbol])
+            )
+            data = response.data or []
+            out: list[dict[str, Any]] = []
+            for order in data:
+                if getattr(order, "market", None) != symbol:
+                    continue
+                out.append(
+                    {
+                        "id": getattr(order, "id", None),
+                        "external_id": getattr(order, "external_id", None),
+                        "side": getattr(order, "side", None),
+                        "type": getattr(order, "type", None),
+                        "status": getattr(order, "status", None),
+                        "reduce_only": getattr(order, "reduce_only", None),
+                        "price": getattr(order, "price", None),
+                        "tp_sl_type": getattr(order, "tp_sl_type", None),
+                        "take_profit": getattr(order, "take_profit", None),
+                        "stop_loss": getattr(order, "stop_loss", None),
+                    }
+                )
+            return out
+        except Exception:
+            return []
 
     def place_order(
         self,
@@ -419,13 +454,11 @@ class ExtendedClient:
             )
 
         try:
-            tp_sl_type = None
-            if tp_param or sl_param:
-                # Prefer position-level SL for entry orders to avoid premature expiry.
-                if sl_param and not reduce_only:
-                    tp_sl_type = OrderTpslType.POSITION
-                else:
-                    tp_sl_type = OrderTpslType.ORDER
+            tp_sl_type = OrderTpslType.ORDER if (tp_param or sl_param) else None
+            expire_time = None
+            if time_in_force == TimeInForce.GTT:
+                expire_hours = float(os.getenv("EXTENDED_ORDER_EXPIRE_HOURS", "168"))
+                expire_time = datetime.utcnow() + timedelta(hours=expire_hours)
             response = self._run_async(
                 self._trading_client.place_order(
                     market_name=symbol,
@@ -434,6 +467,7 @@ class ExtendedClient:
                     side=order_side,
                     post_only=False,
                     time_in_force=time_in_force,
+                    expire_time=expire_time,
                     reduce_only=reduce_only,
                     tp_sl_type=tp_sl_type,
                     take_profit=tp_param,

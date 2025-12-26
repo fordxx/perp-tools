@@ -50,6 +50,8 @@ last_webhook_ts: float | None = None
 last_webhook_count = 0
 STARTUP_TS = time.time()
 _health_task: asyncio.Task | None = None
+_refresh_task: asyncio.Task | None = None
+_last_refresh_by_key: dict[str, float] = {}
 
 # Initialize exchange client based on configuration
 if SETTINGS.exchange == "extended":
@@ -406,6 +408,188 @@ def _calculate_order_size(*, inst_id: str, r_value: float) -> tuple[str, dict[st
     return order_sz, meta
 
 
+def _place_extended_tp_orders(
+    *,
+    inst_id: str,
+    side: str,
+    pos_side: str,
+    entry_price: float,
+    sl: float,
+    total_sz: Decimal,
+    tick_size: str | None,
+    cl_ord_id: str,
+) -> list[dict[str, str]]:
+    tp_targets = _build_tp_targets(
+        inst_id=inst_id,
+        side=side,
+        entry_price=entry_price,
+        sl=sl,
+        total_sz=total_sz,
+        tick_size=tick_size,
+    )
+    tp_orders: list[dict[str, str]] = []
+    for target in tp_targets:
+        tp_resp = exchange.place_order(
+            inst_id=inst_id,
+            td_mode=SETTINGS.okx_td_mode,
+            side="sell" if side == "buy" else "buy",
+            pos_side=pos_side,
+            ord_type="limit",
+            sz=target["size"],
+            px=target["price"],
+            cl_ord_id=f"{cl_ord_id}_{target['tag']}"[:32],
+            sl_trigger_px=None,
+            tp_trigger_px=None,
+            reduce_only=True,
+        )
+        if str(tp_resp.get("code", "")) not in {"0", "success"}:
+            notify_error(
+                f"extended tp failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+            )
+        else:
+            data = tp_resp.get("data") or []
+            if data:
+                ord_id = data[0].get("ordId") or ""
+                if ord_id:
+                    fill_tracker.register_order_label(
+                        key=str(ord_id),
+                        label=target["tag"],
+                    )
+        tp_orders.append(
+            {
+                "tag": target["tag"],
+                "price": target["price"],
+                "size": target["size"],
+                "resp": str(tp_resp),
+            }
+        )
+    return tp_orders
+
+
+def _place_extended_sl_order(
+    *,
+    inst_id: str,
+    pos_side: str,
+    sl: float,
+    total_sz: Decimal,
+    tick_size: str | None,
+    cl_ord_id: str,
+) -> dict[str, str] | None:
+    sl_px = _round_price_to_tick(sl, tick_size)
+    side = "sell" if pos_side == "long" else "buy"
+    resp = exchange.place_order(
+        inst_id=inst_id,
+        td_mode=SETTINGS.okx_td_mode,
+        side=side,
+        pos_side=pos_side,
+        ord_type="limit",
+        sz=str(total_sz),
+        px=sl_px,
+        cl_ord_id=cl_ord_id,
+        sl_trigger_px=sl_px,
+        tp_trigger_px=None,
+        reduce_only=True,
+    )
+    if str(resp.get("code", "")) not in {"0", "success"}:
+        notify_error(
+            f"extended sl refresh failed instId={inst_id} posSide={pos_side} sl={sl_px} sz={total_sz} resp={resp}"
+        )
+        return None
+    return {"sl": sl_px, "size": str(total_sz), "resp": str(resp)}
+
+
+def _build_tp_targets(
+    *,
+    inst_id: str,
+    side: str,
+    entry_price: float,
+    sl: float,
+    total_sz: Decimal,
+    tick_size: str | None,
+) -> list[dict[str, str]]:
+    inst_info = exchange.get_instrument_info(inst_id=inst_id)
+    step = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else Decimal("1")
+
+    def _floor_to_step(value: Decimal, step_value: Decimal) -> Decimal:
+        if step_value <= 0:
+            return value
+        return (value / step_value).to_integral_value(rounding=ROUND_DOWN) * step_value
+
+    total_tp_pct = SETTINGS.tp1_pct + SETTINGS.tp2_pct + SETTINGS.tp3_pct
+    if total_tp_pct > 1.0:
+        logger.warning(
+            "extended tp_pct_exceeds_100 total=%.2f%% adjusting proportionally",
+            total_tp_pct * 100,
+        )
+        scale_factor = 1.0 / total_tp_pct
+        tp1_pct_adjusted = SETTINGS.tp1_pct * scale_factor
+        tp2_pct_adjusted = SETTINGS.tp2_pct * scale_factor
+        tp3_pct_adjusted = SETTINGS.tp3_pct * scale_factor
+    else:
+        tp1_pct_adjusted = SETTINGS.tp1_pct
+        tp2_pct_adjusted = SETTINGS.tp2_pct
+        tp3_pct_adjusted = SETTINGS.tp3_pct
+
+    tp1_sz = _floor_to_step(total_sz * Decimal(str(tp1_pct_adjusted)), step)
+    tp2_sz = _floor_to_step(total_sz * Decimal(str(tp2_pct_adjusted)), step)
+    tp3_sz = _floor_to_step(total_sz * Decimal(str(tp3_pct_adjusted)), step)
+    remaining = total_sz - tp1_sz - tp2_sz - tp3_sz
+    if remaining < 0:
+        logger.error(
+            "extended tp_size_negative remaining=%s total=%s tp1=%s tp2=%s tp3=%s",
+            remaining, total_sz, tp1_sz, tp2_sz, tp3_sz
+        )
+        remaining = Decimal("0")
+
+    tp_sizes = [
+        (SETTINGS.tp1_r, tp1_sz, "tp1"),
+        (SETTINGS.tp2_r, tp2_sz, "tp2"),
+        (SETTINGS.tp3_r, tp3_sz, "tp3"),
+        (SETTINGS.tp4_r, remaining, "tp4"),
+    ]
+    targets: list[dict[str, str]] = []
+    for rr, sz_dec, tag in tp_sizes:
+        if sz_dec <= 0:
+            continue
+        tp_price = take_profit_price(
+            side=side,
+            entry_price=entry_price,
+            stop_loss=sl,
+            rr=rr,
+        )
+        if tp_price is None:
+            continue
+        tp_px = _round_price_to_tick(tp_price, tick_size)
+        targets.append({"tag": tag, "price": tp_px, "size": str(sz_dec)})
+    return targets
+
+
+def _compute_trailing_sl(
+    *,
+    side: str,
+    entry_price: float,
+    sl_price: float,
+    last_price: float,
+    trail_start_r: float,
+) -> float | None:
+    r_value = abs(entry_price - sl_price)
+    if r_value <= 0:
+        return None
+    profit = (last_price - entry_price) if side == "buy" else (entry_price - last_price)
+    profit_r = profit / r_value
+    if profit_r < trail_start_r:
+        return None
+    if profit_r >= 3.0:
+        offset_r = 1.0
+    elif profit_r >= 2.0:
+        offset_r = 0.5
+    elif profit_r >= 1.0:
+        offset_r = 0.1
+    else:
+        offset_r = 0.0
+    return entry_price + (offset_r * r_value) if side == "buy" else entry_price - (offset_r * r_value)
+
+
 def _round_price_to_tick(price: float, tick_size: str | None) -> str:
     """Round price to exchange tick size and format as string."""
     if not tick_size or tick_size == "":
@@ -445,6 +629,192 @@ def _start_telegram_control() -> None:
     tg_control.start()
 
 
+async def _refresh_extended_protection() -> None:
+    if SETTINGS.exchange != "extended":
+        return
+    while True:
+        await asyncio.sleep(SETTINGS.extended_refresh_seconds)
+        if not SETTINGS.trading_enabled or not SETTINGS.extended_refresh_enabled:
+            continue
+        now = time.time()
+        for inst_id in SETTINGS.symbol_allowlist:
+            if inst_id == "*":
+                continue
+            for pos_side in ("long", "short"):
+                key = f"{inst_id}:{pos_side}"
+                last_ts = _last_refresh_by_key.get(key, 0.0)
+                if (now - last_ts) < SETTINGS.extended_refresh_seconds:
+                    continue
+                pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                if not pos:
+                    continue
+                try:
+                    size = Decimal(str(pos.get("pos", "0")))
+                except Exception:
+                    size = Decimal("0")
+                if size <= 0:
+                    continue
+                _last_refresh_by_key[key] = now
+
+                entry_price = pos.get("open_price")
+                sl_price = pos.get("sl_price")
+                entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
+                if entry_price is None and entry_info is not None:
+                    entry_price = entry_info.entry_price
+                if sl_price is None and entry_info is not None:
+                    sl_price = entry_info.stop_loss
+                side = "buy" if pos_side == "long" else "sell"
+                tick_size = None
+                inst_info = exchange.get_instrument_info(inst_id=inst_id)
+                if inst_info:
+                    tick_size = inst_info.get("tickSz")
+
+                orders = exchange.get_open_orders(inst_id=inst_id)
+                opposite_side = "SELL" if pos_side == "long" else "BUY"
+                sl_order_exists = False
+                for order in orders:
+                    if not order.get("reduce_only"):
+                        continue
+                    if str(order.get("side", "")).upper() != opposite_side:
+                        continue
+                    if order.get("stop_loss"):
+                        sl_order_exists = True
+                        break
+
+                if SETTINGS.extended_refresh_sl_enabled:
+                    if not sl_price:
+                        logger.warning(
+                            "extended sl missing instId=%s posSide=%s size=%s", inst_id, pos_side, size
+                        )
+                        notify_info(
+                            f"extended sl missing instId={inst_id} posSide={pos_side} size={size}"
+                        )
+                    elif not sl_order_exists:
+                        last_price = exchange.get_last_price(inst_id=inst_id)
+                        target_sl = None
+                        try:
+                            if entry_price is not None and last_price is not None:
+                                target_sl = _compute_trailing_sl(
+                                    side=side,
+                                    entry_price=float(entry_price),
+                                    sl_price=float(sl_price),
+                                    last_price=float(last_price),
+                                    trail_start_r=SETTINGS.trail_start_r,
+                                )
+                        except Exception:
+                            target_sl = None
+                        sl_to_place = float(sl_price)
+                        if target_sl is not None:
+                            if side == "buy":
+                                sl_to_place = max(sl_to_place, target_sl)
+                            else:
+                                sl_to_place = min(sl_to_place, target_sl)
+                        gap = float(tick_size) if tick_size else 0.0
+                        if last_price is not None:
+                            if side == "buy" and sl_to_place >= float(last_price) - gap:
+                                continue
+                            if side == "sell" and sl_to_place <= float(last_price) + gap:
+                                continue
+                        ts = int(time.time())
+                        cl_ord_id = f"tv_refresh_sl_{ts}{pos_side[:1]}"[:32]
+                        sl_order = _place_extended_sl_order(
+                            inst_id=inst_id,
+                            pos_side=pos_side,
+                            sl=sl_to_place,
+                            total_sz=size,
+                            tick_size=tick_size,
+                            cl_ord_id=cl_ord_id,
+                        )
+                        if sl_order:
+                            notify_info(
+                                f"extended sl refresh placed instId={inst_id} posSide={pos_side} sl={sl_order['sl']}"
+                            )
+
+                if SETTINGS.extended_refresh_tp_enabled:
+                    if entry_price is None or sl_price is None:
+                        logger.warning(
+                            "extended tp refresh skipped instId=%s posSide=%s reason=missing_entry_or_sl",
+                            inst_id, pos_side
+                        )
+                        continue
+                    tp_targets = _build_tp_targets(
+                        inst_id=inst_id,
+                        side=side,
+                        entry_price=float(entry_price),
+                        sl=float(sl_price),
+                        total_sz=size,
+                        tick_size=tick_size,
+                    )
+                    if not tp_targets:
+                        continue
+
+                    existing_prices: list[Decimal] = []
+                    tick_val = Decimal(str(tick_size)) if tick_size else None
+                    for order in orders:
+                        if not order.get("reduce_only"):
+                            continue
+                        if str(order.get("type", "")).upper() not in {"ORDERTYPE.LIMIT", "LIMIT"}:
+                            continue
+                        if str(order.get("side", "")).upper() != opposite_side:
+                            continue
+                        price = order.get("price")
+                        if price is None:
+                            continue
+                        try:
+                            existing_prices.append(Decimal(str(price)))
+                        except Exception:
+                            continue
+
+                    def _price_match(target: Decimal) -> bool:
+                        if not existing_prices:
+                            return False
+                        if tick_val is None or tick_val <= 0:
+                            return any(abs(target - p) <= Decimal("0.00000001") for p in existing_prices)
+                        return any(abs(target - p) <= tick_val for p in existing_prices)
+
+                    missing = []
+                    for target in tp_targets:
+                        try:
+                            target_price = Decimal(str(target["price"]))
+                        except Exception:
+                            continue
+                        if _price_match(target_price):
+                            continue
+                        missing.append(target)
+
+                    if not missing:
+                        continue
+
+                    ts = int(time.time())
+                    cl_ord_id = f"tv_refresh_{ts}{pos_side[:1]}"[:32]
+                    placed = 0
+                    for target in missing:
+                        tp_resp = exchange.place_order(
+                            inst_id=inst_id,
+                            td_mode=SETTINGS.okx_td_mode,
+                            side="sell" if side == "buy" else "buy",
+                            pos_side=pos_side,
+                            ord_type="limit",
+                            sz=target["size"],
+                            px=target["price"],
+                            cl_ord_id=f"{cl_ord_id}_{target['tag']}"[:32],
+                            sl_trigger_px=None,
+                            tp_trigger_px=None,
+                            reduce_only=True,
+                        )
+                        if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                            notify_error(
+                                f"extended tp refresh failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+                            )
+                            continue
+                        placed += 1
+
+                    if placed:
+                        notify_info(
+                            f"extended tp refresh placed instId={inst_id} posSide={pos_side} count={placed}"
+                        )
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     if SETTINGS.trading_enabled and manager is not None:
@@ -476,6 +846,9 @@ async def _startup() -> None:
                 )
         global _health_task
         _health_task = asyncio.create_task(_health_loop())
+    global _refresh_task
+    if SETTINGS.exchange == "extended" and SETTINGS.extended_refresh_enabled:
+        _refresh_task = asyncio.create_task(_refresh_extended_protection())
 
 
 @app.on_event("shutdown")
@@ -497,6 +870,8 @@ async def _shutdown() -> None:
             logger.error("Error stopping tg_control: %s", str(e))
     if _health_task is not None:
         _health_task.cancel()
+    if _refresh_task is not None:
+        _refresh_task.cancel()
     if SETTINGS.exchange == "extended":
         try:
             close_fn = getattr(exchange, "close", None)
@@ -1120,89 +1495,16 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     "order": resp,
                     "warning": "tp_skipped_no_position",
                 }
-            inst_info = exchange.get_instrument_info(inst_id=inst_id)
-            step = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else Decimal("1")
-            total_sz_dec = Decimal(str(order_sz))
-
-            def _floor_to_step(value: Decimal, step_value: Decimal) -> Decimal:
-                if step_value <= 0:
-                    return value
-                return (value / step_value).to_integral_value(rounding=ROUND_DOWN) * step_value
-
-            # Validate TP percentages don't exceed 100%
-            total_tp_pct = SETTINGS.tp1_pct + SETTINGS.tp2_pct + SETTINGS.tp3_pct
-            if total_tp_pct > 1.0:
-                logger.warning(
-                    "extended tp_pct_exceeds_100 total=%.2f%% adjusting proportionally",
-                    total_tp_pct * 100
-                )
-                # Scale down proportionally
-                scale_factor = 1.0 / total_tp_pct
-                tp1_pct_adjusted = SETTINGS.tp1_pct * scale_factor
-                tp2_pct_adjusted = SETTINGS.tp2_pct * scale_factor
-                tp3_pct_adjusted = SETTINGS.tp3_pct * scale_factor
-            else:
-                tp1_pct_adjusted = SETTINGS.tp1_pct
-                tp2_pct_adjusted = SETTINGS.tp2_pct
-                tp3_pct_adjusted = SETTINGS.tp3_pct
-
-            tp1_sz = _floor_to_step(total_sz_dec * Decimal(str(tp1_pct_adjusted)), step)
-            tp2_sz = _floor_to_step(total_sz_dec * Decimal(str(tp2_pct_adjusted)), step)
-            tp3_sz = _floor_to_step(total_sz_dec * Decimal(str(tp3_pct_adjusted)), step)
-            remaining = total_sz_dec - tp1_sz - tp2_sz - tp3_sz
-            if remaining < 0:
-                logger.error(
-                    "extended tp_size_negative remaining=%s total=%s tp1=%s tp2=%s tp3=%s",
-                    remaining, total_sz_dec, tp1_sz, tp2_sz, tp3_sz
-                )
-                remaining = Decimal("0")
-
-            tp_sizes = [
-                (SETTINGS.tp1_r, tp1_sz, "tp1"),
-                (SETTINGS.tp2_r, tp2_sz, "tp2"),
-                (SETTINGS.tp3_r, tp3_sz, "tp3"),
-                (SETTINGS.tp4_r, remaining, "tp4"),
-            ]
-
-            for rr, sz_dec, tag in tp_sizes:
-                if sz_dec <= 0:
-                    continue
-                tp_price = take_profit_price(
-                    side=side,
-                    entry_price=float(entry_price),
-                    stop_loss=float(sl),
-                    rr=rr,
-                )
-                if tp_price is None:
-                    continue
-                tp_px = _round_price_to_tick(tp_price, tick_size)
-                tp_resp = exchange.place_order(
-                    inst_id=inst_id,
-                    td_mode=SETTINGS.okx_td_mode,
-                    side="sell" if side == "buy" else "buy",
-                    pos_side=pos_side,
-                    ord_type="limit",
-                    sz=str(sz_dec),
-                    px=tp_px,
-                    cl_ord_id=f"{cl_ord_id}_{tag}"[:32],
-                    sl_trigger_px=None,
-                    tp_trigger_px=None,
-                    reduce_only=True,
-                )
-                if str(tp_resp.get("code", "")) not in {"0", "success"}:
-                    notify_error(
-                        f"extended tp failed instId={inst_id} tag={tag} price={tp_px} sz={sz_dec} resp={tp_resp}"
-                    )
-                else:
-                    data = tp_resp.get("data") or []
-                    if data:
-                        ord_id = data[0].get("ordId") or ""
-                        if ord_id:
-                            fill_tracker.register_order_label(
-                                key=str(ord_id),
-                                label=tag,
-                            )
-                tp_orders.append({"tag": tag, "price": tp_px, "size": str(sz_dec), "resp": str(tp_resp)})
+            tp_orders = _place_extended_tp_orders(
+                inst_id=inst_id,
+                side=side,
+                pos_side=pos_side,
+                entry_price=float(entry_price),
+                sl=float(sl),
+                total_sz=actual_pos_sz,
+                tick_size=tick_size,
+                cl_ord_id=cl_ord_id,
+            )
             if tp_orders:
                 notify_info(
                     f"extended tp orders placed instId={inst_id} count={len(tp_orders)}"
