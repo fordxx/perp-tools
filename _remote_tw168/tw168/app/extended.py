@@ -332,14 +332,38 @@ class ExtendedClient:
                     size_val = Decimal("0")
                 if size_val <= 0:
                     continue
+                sl_price = None
+                tp_price = None
+                for key in ("sl_price", "stop_loss_price", "stop_loss", "sl"):
+                    raw = getattr(pos, key, None)
+                    if raw is None:
+                        continue
+                    if isinstance(raw, (int, float, Decimal, str)):
+                        sl_price = raw
+                        break
+                    raw_price = getattr(raw, "trigger_price", None) or getattr(raw, "price", None)
+                    if raw_price is not None:
+                        sl_price = raw_price
+                        break
+                for key in ("tp_price", "take_profit_price", "take_profit", "tp"):
+                    raw = getattr(pos, key, None)
+                    if raw is None:
+                        continue
+                    if isinstance(raw, (int, float, Decimal, str)):
+                        tp_price = raw
+                        break
+                    raw_price = getattr(raw, "trigger_price", None) or getattr(raw, "price", None)
+                    if raw_price is not None:
+                        tp_price = raw_price
+                        break
                 return {
                     "instId": inst_id,
                     "posSide": pos_side,
                     "pos": str(size_val),
                     "market": symbol,
                     "open_price": getattr(pos, "open_price", None),
-                    "sl_price": getattr(pos, "sl_price", None),
-                    "tp_price": getattr(pos, "tp_price", None),
+                    "sl_price": sl_price,
+                    "tp_price": tp_price,
                     "raw": pos,
                 }
         except Exception:
