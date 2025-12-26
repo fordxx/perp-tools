@@ -590,6 +590,30 @@ def _compute_trailing_sl(
     return entry_price + (offset_r * r_value) if side == "buy" else entry_price - (offset_r * r_value)
 
 
+def _extract_order_price(value: object | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ("trigger_price", "price"):
+            if key in value and value[key] is not None:
+                try:
+                    return float(value[key])
+                except Exception:
+                    continue
+        return None
+    for attr in ("trigger_price", "price"):
+        try:
+            raw = getattr(value, attr)
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                return float(raw)
+            except Exception:
+                continue
+    return None
+
+
 def _round_price_to_tick(price: float, tick_size: str | None) -> str:
     """Round price to exchange tick size and format as string."""
     if not tick_size or tick_size == "":
@@ -677,8 +701,12 @@ async def _refresh_extended_protection() -> None:
                         continue
                     if str(order.get("side", "")).upper() != opposite_side:
                         continue
-                    if order.get("stop_loss"):
+                    stop_loss = order.get("stop_loss")
+                    if stop_loss:
                         sl_order_exists = True
+                        sl_from_order = _extract_order_price(stop_loss)
+                        if sl_from_order is not None and sl_price is None:
+                            sl_price = sl_from_order
                         break
 
                 if SETTINGS.extended_refresh_sl_enabled:
