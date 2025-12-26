@@ -1058,16 +1058,21 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             notify_error(
                 f"extended entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
             )
-        else:
+            _log_decision(inst_id, tf, action="order_rejected", side=side, posSide=pos_side)
+            return {"ok": False, "error": "entry_rejected", "order": resp}
+        notify_info(
+            f"extended entry accepted instId={inst_id} side={side} sz={order_sz}"
+        )
+        if sl_px is not None:
             notify_info(
-                f"extended entry accepted instId={inst_id} side={side} sz={order_sz}"
+                f"extended sl attached instId={inst_id} side={side} sl={sl_px}"
             )
-            fill_tracker.register_entry(
-                inst_id=inst_id,
-                side=side,
-                entry_price=float(entry_price),
-                stop_loss=float(sl),
-            )
+        fill_tracker.register_entry(
+            inst_id=inst_id,
+            side=side,
+            entry_price=float(entry_price),
+            stop_loss=float(sl),
+        )
 
         # Place multi-level take-profit reduce-only limit orders.
         tp_orders: list[dict[str, str]] = []
