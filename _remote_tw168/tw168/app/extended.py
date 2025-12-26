@@ -401,6 +401,39 @@ class ExtendedClient:
         except Exception:
             return []
 
+    def get_last_stop_loss(self, *, inst_id: str, pos_side: str) -> Decimal | None:
+        if not self._trading_client:
+            return None
+        symbol = inst_id.replace("-USDT-SWAP", "-USD")
+        side = "BUY" if pos_side.lower() == "long" else "SELL"
+        try:
+            response = self._run_async(
+                self._trading_client.account.get_orders_history(market_names=[symbol])
+            )
+            data = response.data or []
+            candidates = []
+            for order in data:
+                if getattr(order, "market", None) != symbol:
+                    continue
+                if getattr(order, "side", None) != side:
+                    continue
+                if getattr(order, "reduce_only", None):
+                    continue
+                stop_loss = getattr(order, "stop_loss", None)
+                if not stop_loss:
+                    continue
+                trigger_price = getattr(stop_loss, "trigger_price", None) or getattr(stop_loss, "price", None)
+                if trigger_price is None:
+                    continue
+                updated = getattr(order, "updated_time", None) or 0
+                candidates.append((updated, Decimal(str(trigger_price))))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            return candidates[0][1]
+        except Exception:
+            return None
+
     def place_order(
         self,
         *,

@@ -698,6 +698,7 @@ async def _refresh_extended_protection() -> None:
                 orders = exchange.get_open_orders(inst_id=inst_id)
                 opposite_side = "SELL" if pos_side == "long" else "BUY"
                 sl_order_exists = False
+                sl_attached = False
                 for order in orders:
                     if not order.get("reduce_only"):
                         continue
@@ -710,6 +711,11 @@ async def _refresh_extended_protection() -> None:
                         if sl_from_order is not None and sl_price is None:
                             sl_price = sl_from_order
                         break
+                if sl_price is None:
+                    sl_from_history = exchange.get_last_stop_loss(inst_id=inst_id, pos_side=pos_side)
+                    if sl_from_history is not None:
+                        sl_price = float(sl_from_history)
+                        sl_attached = True
 
                 if SETTINGS.extended_refresh_sl_enabled:
                     if not sl_price:
@@ -719,7 +725,7 @@ async def _refresh_extended_protection() -> None:
                         notify_info(
                             f"extended sl missing instId={inst_id} posSide={pos_side} size={size}"
                         )
-                    elif not sl_order_exists:
+                    elif not sl_order_exists and not sl_attached:
                         last_price = exchange.get_last_price(inst_id=inst_id)
                         target_sl = None
                         try:
