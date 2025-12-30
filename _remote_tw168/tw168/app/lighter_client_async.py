@@ -323,8 +323,10 @@ class LighterClient:
             is_ask = (side == "sell")
             
             # Order parameters
-            order_type = self._signer_client.ORDER_TYPE_LIMIT if is_limit else self._signer_client.ORDER_TYPE_MARKET
-            time_in_force = self._signer_client.ORDER_TIME_IN_FORCE_GOOD_TIL_TIME if is_limit else self._signer_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL
+            # Order types: 1 = MARKET, 2 = LIMIT
+            order_type = 2 if is_limit else 1
+            # Time in force: 1 = GOOD_TIL_TIME (GTT), 4 = IMMEDIATE_OR_CANCEL (IOC)
+            time_in_force = 1 if is_limit else 4
             
             # Generate unique client order index
             client_order_index = int(time.time() * 1000) % 1000000

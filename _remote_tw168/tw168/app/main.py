@@ -652,7 +652,7 @@ async def _place_extended_tp_orders(
     )
     tp_orders: list[dict[str, str]] = []
     for target in tp_targets:
-        tp_resp = exchange.place_order(
+        tp_resp = await exchange.place_order(
             inst_id=inst_id,
             td_mode=SETTINGS.okx_td_mode,
             side="sell" if side == "buy" else "buy",
@@ -689,7 +689,7 @@ async def _place_extended_tp_orders(
     return tp_orders
 
 
-def _place_extended_sl_order(
+async def _place_extended_sl_order(
     *,
     inst_id: str,
     pos_side: str,
@@ -702,7 +702,7 @@ def _place_extended_sl_order(
     sl_px = _round_price_to_tick(sl, tick_size)
     side = "sell" if pos_side == "long" else "buy"
     order_px = _round_price_to_tick(last_price, tick_size) if last_price is not None else sl_px
-    resp = exchange.place_order(
+    resp = await exchange.place_order(
         inst_id=inst_id,
         td_mode=SETTINGS.okx_td_mode,
         side=side,
@@ -895,9 +895,9 @@ async def _refresh_paradex_protection() -> None:
         for inst_id in allowed_symbols:
             if inst_id == "*":
                 continue
-            pos = exchange.get_position(inst_id=inst_id, pos_side="long")
+            pos = await exchange.get_position(inst_id=inst_id, pos_side="long")
             if not pos:
-                pos = exchange.get_position(inst_id=inst_id, pos_side="short")
+                pos = await exchange.get_position(inst_id=inst_id, pos_side="short")
             if not pos:
                 continue
             size = Decimal(str(pos.get("pos", "0")))
@@ -906,7 +906,7 @@ async def _refresh_paradex_protection() -> None:
             entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
             if entry_info is None:
                 continue
-            last_price = exchange.get_last_price(inst_id=inst_id)
+            last_price = await exchange.get_last_price(inst_id=inst_id)
             if last_price is None:
                 continue
 
@@ -924,7 +924,7 @@ async def _refresh_paradex_protection() -> None:
             tick_size = inst_info.get("tickSz") if inst_info else None
             desired_sl = float(_round_price_to_tick(trail_sl, tick_size))
 
-            orders = exchange.get_open_orders(inst_id=inst_id)
+            orders = await exchange.get_open_orders(inst_id=inst_id)
             sl_orders = [o for o in orders if str(o.get("type", "")).upper().startswith("STOP_LOSS")]
             current_sl = None
             for order in sl_orders:
@@ -949,10 +949,10 @@ async def _refresh_paradex_protection() -> None:
             for order in sl_orders:
                 ord_id = order.get("ordId")
                 if ord_id:
-                    exchange.cancel_order(order_id=str(ord_id))
+                    await exchange.cancel_order(order_id=str(ord_id))
 
             sl_side = "sell" if entry_info.side == "buy" else "buy"
-            resp = exchange.place_order(
+            resp = await exchange.place_order(
                 inst_id=inst_id,
                 side=sl_side,
                 ord_type="stop_loss_market",
@@ -981,7 +981,7 @@ async def _refresh_paradex_protection() -> None:
                 last_ts = _last_refresh_by_key.get(key, 0.0)
                 if (now - last_ts) < SETTINGS.extended_refresh_seconds:
                     continue
-                pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
                 if not pos or float(pos.get("pos", "0") or "0") == 0.0:
                     state.clear_entry(inst_id)
                     continue
@@ -1006,7 +1006,7 @@ async def _refresh_paradex_protection() -> None:
                 if inst_info:
                     tick_size = inst_info.get("tickSz")
 
-                orders = exchange.get_open_orders(inst_id=inst_id)
+                orders = await exchange.get_open_orders(inst_id=inst_id)
                 opposite_side = "SELL" if pos_side == "long" else "BUY"
                 sl_order_exists = False
                 sl_attached = False
@@ -1037,7 +1037,7 @@ async def _refresh_paradex_protection() -> None:
                             f"extended sl missing instId={inst_id} posSide={pos_side} size={size}"
                         )
                     elif not sl_order_exists and not sl_attached:
-                        last_price = exchange.get_last_price(inst_id=inst_id)
+                        last_price = await exchange.get_last_price(inst_id=inst_id)
                         target_sl = None
                         try:
                             if entry_price is not None and last_price is not None:
@@ -1064,7 +1064,7 @@ async def _refresh_paradex_protection() -> None:
                                 continue
                         ts = int(time.time())
                         cl_ord_id = f"tv_refresh_sl_{ts}{pos_side[:1]}"[:32]
-                        sl_order = _place_extended_sl_order(
+                        sl_order = await _place_extended_sl_order(
                             inst_id=inst_id,
                             pos_side=pos_side,
                             sl=sl_to_place,
@@ -1137,7 +1137,7 @@ async def _refresh_paradex_protection() -> None:
                     cl_ord_id = f"tv_refresh_{ts}{pos_side[:1]}"[:32]
                     placed = 0
                     for target in missing:
-                        tp_resp = exchange.place_order(
+                        tp_resp = await exchange.place_order(
                             inst_id=inst_id,
                             td_mode=SETTINGS.okx_td_mode,
                             side="sell" if side == "buy" else "buy",
@@ -1176,7 +1176,7 @@ async def _refresh_lighter_protection() -> None:
                 continue
             for pos_side in ("long", "short"):
                 key = f"{inst_id}:{pos_side}"
-                pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
                 if not pos:
                     continue
                 try:
@@ -1221,7 +1221,7 @@ async def _refresh_lighter_protection() -> None:
                     if protect:
                         for order_id in (protect.get("sl", []) + protect.get("tp", [])):
                             try:
-                                exchange.cancel_order(inst_id=inst_id, order_id=order_id)
+                                await exchange.cancel_order(inst_id=inst_id, order_id=order_id)
                             except Exception:
                                 pass
                         protect["sl"] = []
@@ -1229,7 +1229,7 @@ async def _refresh_lighter_protection() -> None:
 
                 if SETTINGS.lighter_refresh_sl_enabled:
                     sl_px = _round_price_to_tick(entry_info.stop_loss, tick_size)
-                    sl_resp = exchange.place_algo_order(
+                    sl_resp = await exchange.place_algo_order(
                         inst_id=inst_id,
                         td_mode=SETTINGS.okx_td_mode,
                         side=sl_side,
@@ -1254,7 +1254,7 @@ async def _refresh_lighter_protection() -> None:
                         tick_size=tick_size,
                     )
                     for target in tp_targets:
-                        tp_resp = exchange.place_algo_order(
+                        tp_resp = await exchange.place_algo_order(
                             inst_id=inst_id,
                             td_mode=SETTINGS.okx_td_mode,
                             side=sl_side,
@@ -1498,9 +1498,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         return {"ok": True, "type": "ZONE", "zone": zone}
 
     if payload.type.upper() == "CLOSE":
-        pos = exchange.get_position(inst_id=inst_id, pos_side="long")
+        pos = await exchange.get_position(inst_id=inst_id, pos_side="long")
         if not pos:
-            pos = exchange.get_position(inst_id=inst_id, pos_side="short")
+            pos = await exchange.get_position(inst_id=inst_id, pos_side="short")
         if not pos or float(pos.get("pos", "0") or "0") == 0:
             _log_decision(inst_id, tf, action="close_skip", reason="no_position")
             return {"ok": True, "type": "CLOSE", "skipped": "no_position"}
@@ -1520,7 +1520,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 logger.warning("lighter close cancel_all_orders_failed instId=%s err=%s", inst_id, e)
         await _cancel_pending_ladder_orders(key, inst_id, exchange)
 
-        resp = exchange.place_order(
+        resp = await exchange.place_order(
             inst_id=inst_id,
             td_mode=SETTINGS.okx_td_mode,
             side=close_side,
@@ -1620,7 +1620,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if not SETTINGS.trading_enabled:
         try:
-            last_px = exchange.get_last_price(inst_id=inst_id)
+            last_px = await exchange.get_last_price(inst_id=inst_id)
         except Exception:
             last_px = None
         if last_px is not None:
@@ -1973,7 +1973,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # 2.5 检查仓位冲突（避免重复开仓）
     check_conflict = SETTINGS.exchange != "lighter" or SETTINGS.lighter_block_duplicate_positions
     if check_conflict:
-        existing_pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+        existing_pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
         if existing_pos and float(existing_pos.get("pos", "0") or "0") != 0:
             existing_sz = float(existing_pos.get("pos", "0") or "0")
             existing_avg_px = float(existing_pos.get("avgPx", "0") or "0")
@@ -2023,7 +2023,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         if SETTINGS.order_type == "limit":
             entry_px = _round_price_to_tick(entry_price, tick_size)
 
-        resp = exchange.place_order(
+        resp = await exchange.place_order(
             inst_id=inst_id,
             side=side,
             ord_type=SETTINGS.order_type,
@@ -2046,13 +2046,13 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
         actual_pos_sz = Decimal(str(order_sz))
         if SETTINGS.tp_enabled and r_value > 0:
-            pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+            pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
             if pos and pos.get("pos"):
                 actual_pos_sz = Decimal(str(pos.get("pos")))
 
         if sl_px is not None:
             sl_side = "sell" if side == "buy" else "buy"
-            sl_resp = exchange.place_order(
+            sl_resp = await exchange.place_order(
                 inst_id=inst_id,
                 side=sl_side,
                 ord_type="stop_loss_market",
@@ -2082,7 +2082,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 tick_size=tick_size,
             )
             for target in tp_orders:
-                tp_resp = exchange.place_order(
+                tp_resp = await exchange.place_order(
                     inst_id=inst_id,
                     side="sell" if side == "buy" else "buy",
                     ord_type="take_profit_limit",
@@ -2138,7 +2138,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         cl_ord_id = f"tv{ts}{rnd}{side[:1]}"[:32]
 
         try:
-            resp = exchange.place_order(
+            resp = await exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=side,
@@ -2199,7 +2199,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 # Verify position exists before placing TP orders
                 max_retries = 3
                 for retry in range(max_retries):
-                    pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                    pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
                     if pos:
                         pos_sz = Decimal(str(pos.get("pos", "0"))) if pos else Decimal("0")
                         if pos_sz > 0:
@@ -2308,7 +2308,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         market_filled_price = None
 
         if market_sz > 0:
-            market_resp = exchange.place_order(
+            market_resp = await exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=side,
@@ -2332,7 +2332,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 # Wait briefly for market order to fill
                 await asyncio.sleep(0.5)
                 try:
-                    market_ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=market_cl_ord_id)
+                    market_ord_info = await exchange.get_order(inst_id=inst_id, cl_ord_id=market_cl_ord_id)
                     if market_ord_info and market_ord_info.get("avgPx"):
                         market_filled_price = float(market_ord_info.get("avgPx"))
                         market_filled_sz = float(market_ord_info.get("accFillSz", "0") or "0")
@@ -2374,7 +2374,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             limit_cl_ord_id = f"tv{ts}{rnd}{side[:1]}{label}"[:32]
             px_rounded = _round_price_to_tick(px, tick_size)
 
-            resp = exchange.place_order(
+            resp = await exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=side,
@@ -2425,7 +2425,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         # Single market order (original logic)
         cl_ord_id = f"tv{ts}{rnd}{side[:1]}"[:32]
 
-        resp = exchange.place_order(
+        resp = await exchange.place_order(
             inst_id=inst_id,
             td_mode=SETTINGS.okx_td_mode,
             side=side,
@@ -2481,7 +2481,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
             for _ in range(3):
                 try:
-                    pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                    pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
                     if pos and float(pos.get("pos", "0") or "0") > 0:
                         total_filled_sz = float(pos.get("pos", "0") or "0")
                         avg_px = pos.get("avgPx")
@@ -2536,7 +2536,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
                 for ladder_ord in ladder_orders:
                     try:
-                        ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                        ord_info = await exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
                         if ord_info:
                             order_state = ord_info.get("state", "").lower()
                             avg_px = ord_info.get("avgPx")
@@ -2592,9 +2592,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                                 if ladder_ord["level"] == "MARKET":
                                     continue  # Skip market order (already filled)
                                 try:
-                                    ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                    ord_info = await exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
                                     if ord_info and ord_info.get("state", "").lower() in {"live", "partially_filled"}:
-                                        cancel_resp = exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                        cancel_resp = await exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
                                         if str(cancel_resp.get("code", "")) in {"0", "success"}:
                                             logger.info("tv_webhook canceled_ladder_order level=%s", ladder_ord["level"])
                                         else:
@@ -2619,7 +2619,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                         # Cancel all ladder orders
                         for ladder_ord in ladder_orders:
                             try:
-                                cancel_resp = exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                cancel_resp = await exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
                                 if str(cancel_resp.get("code", "")) in {"0", "success"}:
                                     logger.info("tv_webhook canceled_unfilled_ladder level=%s", ladder_ord["level"])
                             except Exception as e:
@@ -2655,7 +2655,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         for retry in range(max_retries):
             await asyncio.sleep(0.3 * (retry + 1))  # Progressive backoff
             try:
-                ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
+                ord_info = await exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
                 if ord_info and ord_info.get("avgPx"):
                     filled_price = float(ord_info.get("avgPx"))
                     total_filled_sz = float(ord_info.get("accFillSz", order_sz))
@@ -2761,7 +2761,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # Check current market price before placing SL order
     # If price has already moved past SL, close immediately instead
     try:
-        current_price = exchange.get_last_price(inst_id=inst_id) or 0.0
+        current_price = await exchange.get_last_price(inst_id=inst_id) or 0.0
 
         if current_price > 0:
             # For long: SL should be below current price
@@ -2794,7 +2794,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     f"数量: {sl_order_sz}"
                 )
                 # Try to close position immediately
-                close_resp = exchange.place_order(
+                close_resp = await exchange.place_order(
                     inst_id=inst_id,
                     td_mode=SETTINGS.okx_td_mode,
                     side=sl_side,
@@ -2825,7 +2825,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         logger.warning("tv_webhook market_price_check_failed err=%s continuing_with_sl", str(e))
 
     try:
-        sl_resp = exchange.place_algo_order(
+        sl_resp = await exchange.place_algo_order(
             inst_id=inst_id,
             td_mode=SETTINGS.okx_td_mode,
             side=sl_side,
@@ -2863,7 +2863,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         backup_sl_attempted = True
         logger.info("tv_webhook trying_backup_sl instId=%s method=limit_order", inst_id)
         try:
-            backup_sl_resp = exchange.place_order(
+            backup_sl_resp = await exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=sl_side,
@@ -2925,7 +2925,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 "tv_webhook attempting_emergency_close instId=%s posSide=%s sz=%s",
                 inst_id, pos_side, emergency_sz
             )
-            emergency_close_resp = exchange.place_order(
+            emergency_close_resp = await exchange.place_order(
                 inst_id=inst_id,
                 td_mode=SETTINGS.okx_td_mode,
                 side=sl_side,
@@ -3018,7 +3018,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 tick_size=tick_size,
             )
             for target in tp_orders:
-                tp_resp = exchange.place_algo_order(
+                tp_resp = await exchange.place_algo_order(
                     inst_id=inst_id,
                     td_mode=SETTINGS.okx_td_mode,
                     side="sell" if side == "buy" else "buy",
