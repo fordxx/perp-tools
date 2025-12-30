@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -263,7 +264,9 @@ class LighterClient:
         # Convert EIGEN-USDT-SWAP -> EIGEN-USDT-SWAP (keep OKX format)
         try:
             logger.info("fetch_candles: using OKX fallback for %s %s", inst_id, tf)
-            candles = fetch_candles_paged(
+            # Use asyncio.to_thread for sync function
+            candles = await asyncio.to_thread(
+                fetch_candles_paged,
                 base_url="https://www.okx.com",
                 inst_id=inst_id,
                 bar=tf,
