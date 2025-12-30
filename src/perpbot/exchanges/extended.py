@@ -21,8 +21,16 @@ from perpbot.exchanges.base import ExchangeClient
 from x10.perpetual.accounts import AccountStreamDataModel, StarkPerpetualAccount
 from x10.perpetual.configuration import EndpointConfig, MAINNET_CONFIG, TESTNET_CONFIG
 from x10.perpetual.markets import MarketModel, MarketStatsModel
+from x10.perpetual.order_object import OrderTpslTriggerParam
 from x10.perpetual.orderbooks import OrderbookUpdateModel
-from x10.perpetual.orders import OrderSide, PlacedOrderModel, TimeInForce
+from x10.perpetual.orders import (
+    OrderPriceType,
+    OrderSide,
+    OrderTpslType,
+    OrderTriggerPriceType,
+    PlacedOrderModel,
+    TimeInForce,
+)
 from x10.perpetual.positions import PositionModel, PositionSide
 from x10.perpetual.stream_client import PerpetualStreamClient
 from x10.perpetual.trading_client import PerpetualTradingClient
@@ -240,13 +248,27 @@ class ExtendedClient(ExchangeClient):
         result = self._execute_order(request)
         return self._order_from_result(result, request)
 
+    def place_open_order_with_tpsl(
+        self,
+        request: OrderRequest,
+        *,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+    ) -> Order:
+        result = self._execute_order_with_tpsl(
+            request,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+        )
+        return self._order_from_result(result, request)
+
     def place_close_order(self, position: Position, current_price: float) -> Order:
         closing_side = "sell" if position.order.side == "buy" else "buy"
         request = OrderRequest(
             symbol=position.order.symbol,
             side=closing_side,
             size=position.order.size,
-            limit_price=current_price,
+            limit_price=None,
         )
         result = self._execute_order(request)
         return self._order_from_result(result, request)
@@ -548,7 +570,8 @@ class ExtendedClient(ExchangeClient):
             )
 
             placed: Optional[PlacedOrderModel] = response.data
-            order_id = str(placed.external_id if placed and placed.external_id else placed.id if placed else "unknown")
+            order_id = str(placed.id if placed and placed.id else placed.external_id if placed else "unknown")
+            external_id = str(placed.external_id) if placed and placed.external_id else None
 
             fill_price = float(price)
             notional = float(price * quantity)
@@ -556,6 +579,7 @@ class ExtendedClient(ExchangeClient):
             self._last_response = {
                 "status": "ok",
                 "order_id": order_id,
+                "external_id": external_id,
                 "details": placed,
             }
             self._last_order_error = None
@@ -580,6 +604,196 @@ class ExtendedClient(ExchangeClient):
             self._last_response = {"status": "error", "error": str(exc)}
             self._last_order_error = str(exc)
             TradingLogger.error("Order submission failed: %s", exc)
+
+            safe_notional = float(price * quantity)
+            return ExecutionOrderResult(
+                order_id="error",
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                order_type="maker",
+                notional=safe_notional,
+                fill_price=float(price),
+                status=ExecutionOrderStatus.FAILED,
+                actual_fee=0.0,
+                is_fallback=False,
+                execution_time_ms=0.0,
+                error=str(exc),
+            )
+
+    def _execute_order_with_tpsl(
+        self,
+        request: OrderRequest,
+        *,
+        stop_loss_price: Optional[float] = None,
+        take_profit_price: Optional[float] = None,
+    ) -> ExecutionOrderResult:
+        if not self._trading_client:
+            raise RuntimeError("Trading client not ready")
+
+        market_name = normalize_symbol(request.symbol)
+        market = self._get_market(market_name)
+
+        raw_quantity = Decimal(str(request.size))
+        quantity = self._round_quantity(raw_quantity, market)
+
+        side = OrderSide.BUY if request.side == "buy" else OrderSide.SELL
+        is_limit_request = request.limit_price is not None
+        time_in_force = TimeInForce.GTT if is_limit_request else TimeInForce.IOC
+
+        if quantity <= 0:
+            raise ValueError("Rounded quantity must be positive")
+
+        price_candidate: Decimal
+        if is_limit_request:
+            price_candidate = Decimal(str(request.limit_price))
+        else:
+            quote = self._quote_from_cache(request.symbol)
+            best_price = 0.0
+            if quote:
+                best_price = quote.ask if side == OrderSide.BUY else quote.bid
+            if not best_price or best_price <= 0:
+                stats = self._load_market_stats(request.symbol)
+                stats_price = None
+                if stats:
+                    stats_price = stats.ask_price if side == OrderSide.BUY else stats.bid_price
+                best_price = float(stats_price) if stats_price is not None else 0.0
+            if not best_price or best_price <= 0:
+                raise RuntimeError("Unable to determine market price for IOC order")
+            price_candidate = Decimal(str(best_price))
+        price = price_candidate
+        round_price_fn = getattr(market.trading_config, "round_price", None)
+        if callable(round_price_fn):
+            try:
+                price = round_price_fn(price_candidate)  # type: ignore[assignment]
+            except Exception:
+                price = price_candidate
+
+        expire_dt: Optional[datetime] = None
+        expire_ts: Optional[int] = None
+        if time_in_force == TimeInForce.GTT:
+            expire_dt = utc_now() + timedelta(minutes=5)
+            expire_ts = int(expire_dt.timestamp())
+
+        post_only = is_limit_request
+
+        tp_param: Optional[OrderTpslTriggerParam] = None
+        if take_profit_price is not None:
+            tp_candidate = Decimal(str(take_profit_price))
+            tp_price = tp_candidate
+            if callable(round_price_fn):
+                try:
+                    tp_price = round_price_fn(tp_candidate)  # type: ignore[assignment]
+                except Exception:
+                    tp_price = tp_candidate
+            tp_param = OrderTpslTriggerParam(
+                trigger_price=tp_price,
+                trigger_price_type=OrderTriggerPriceType.LAST,
+                price=tp_price,
+                price_type=OrderPriceType.LIMIT,
+            )
+
+        sl_param: Optional[OrderTpslTriggerParam] = None
+        if stop_loss_price is not None:
+            sl_candidate = Decimal(str(stop_loss_price))
+            sl_price = sl_candidate
+            if callable(round_price_fn):
+                try:
+                    sl_price = round_price_fn(sl_candidate)  # type: ignore[assignment]
+                except Exception:
+                    sl_price = sl_candidate
+            sl_param = OrderTpslTriggerParam(
+                trigger_price=sl_price,
+                trigger_price_type=OrderTriggerPriceType.LAST,
+                price=sl_price,
+                price_type=OrderPriceType.LIMIT,
+            )
+
+        payload: Dict[str, Any] = {
+            "market": market_name,
+            "side": side.value,
+            "qty": self._format_decimal_for_api(quantity),
+            "price": self._format_decimal_for_api(price),
+            "type": "LIMIT",
+            "time_in_force": time_in_force.value,
+            "post_only": post_only,
+            "tp_sl_type": OrderTpslType.ORDER.value if (tp_param or sl_param) else None,
+            "take_profit": {
+                "trigger_price": self._format_decimal_for_api(tp_param.trigger_price),
+                "trigger_price_type": tp_param.trigger_price_type.value,
+                "price": self._format_decimal_for_api(tp_param.price),
+                "price_type": tp_param.price_type.value,
+            } if tp_param else None,
+            "stop_loss": {
+                "trigger_price": self._format_decimal_for_api(sl_param.trigger_price),
+                "trigger_price_type": sl_param.trigger_price_type.value,
+                "price": self._format_decimal_for_api(sl_param.price),
+                "price_type": sl_param.price_type.value,
+            } if sl_param else None,
+        }
+        if expire_ts is not None:
+            payload["expire_time"] = expire_ts
+
+        self._last_payload = payload
+
+        try:
+            response = self._run_async(
+                self._trading_client.place_order(
+                    market_name=market_name,
+                    amount_of_synthetic=quantity,
+                    price=price,
+                    side=side,
+                    post_only=post_only,
+                    time_in_force=time_in_force,
+                    expire_time=expire_dt,
+                    reduce_only=request.reduce_only,
+                    tp_sl_type=OrderTpslType.ORDER if (tp_param or sl_param) else None,
+                    take_profit=tp_param,
+                    stop_loss=sl_param,
+                )
+            )
+
+            placed: Optional[PlacedOrderModel] = response.data
+            order_id = str(placed.id if placed and placed.id else placed.external_id if placed else "unknown")
+            external_id = str(placed.external_id) if placed and placed.external_id else None
+
+            fill_price = float(price)
+            notional = float(price * quantity)
+
+            self._last_response = {
+                "status": "ok",
+                "order_id": order_id,
+                "external_id": external_id,
+                "details": placed,
+            }
+            self._last_order_error = None
+
+            TradingLogger.info(
+                "Placed %s order with TPSL %s @ %s qty=%s",
+                request.side,
+                order_id,
+                price,
+                quantity,
+            )
+
+            return ExecutionOrderResult(
+                order_id=order_id,
+                exchange=self.name,
+                symbol=request.symbol,
+                side=request.side,
+                order_type="maker",
+                notional=notional,
+                fill_price=fill_price,
+                status=ExecutionOrderStatus.SUBMITTED,
+                actual_fee=0.0,
+                is_fallback=False,
+                execution_time_ms=0.0,
+            )
+
+        except Exception as exc:
+            self._last_response = {"status": "error", "error": str(exc)}
+            self._last_order_error = str(exc)
+            TradingLogger.error("Order submission with TPSL failed: %s", exc)
 
             safe_notional = float(price * quantity)
             return ExecutionOrderResult(
@@ -655,10 +869,21 @@ class ExtendedClient(ExchangeClient):
     async def _cancel_order_async(self, order_id: str) -> None:
         if not self._trading_client:
             raise RuntimeError("Trading client not initialized")
+        first_error: Optional[Exception] = None
+        if order_id.isdigit():
+            try:
+                await self._trading_client.orders.cancel_order(int(order_id))
+                return
+            except Exception as exc:  # noqa: BLE001
+                first_error = exc
         try:
-            await self._trading_client.orders.cancel_order(int(order_id))
-        except ValueError:
             await self._trading_client.orders.cancel_order_by_external_id(order_id)
+        except Exception as exc:  # noqa: BLE001
+            if first_error is not None:
+                raise RuntimeError(
+                    f"cancel_order failed: {first_error}; cancel_order_by_external_id failed: {exc}"
+                ) from exc
+            raise
 
     # ----- stream workers ---------------------------------------------------------
 

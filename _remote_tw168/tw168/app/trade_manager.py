@@ -50,6 +50,7 @@ class TradePlan:
     tp3_done: bool = False
     tp4_done: bool = False
     trail_active: bool = False
+    sl_moved_to_breakeven: bool = False  # Track if SL moved to breakeven at TP1
     closed_sz: Decimal = Decimal("0")
 
     @property
@@ -84,12 +85,13 @@ class TradeManager:
             self._plans.pop(key, None)
 
     async def _run_forever(self) -> None:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
         while True:
             try:
                 await self._tick()
-            except Exception:
-                # Keep loop alive; errors will surface via logs in real deployments.
-                pass
+            except Exception as e:
+                logger.error("TradeManager tick failed: %s", str(e), exc_info=True)
             await asyncio.sleep(self.settings.manager_poll_seconds)
 
     async def _tick(self) -> None:
@@ -100,26 +102,32 @@ class TradeManager:
 
     async def _process_plan(self, key: str, plan: TradePlan) -> None:
         # If position is gone (stopped out or manually closed), clear plan.
-        pos = self.okx.get_position(inst_id=plan.inst_id, pos_side=plan.pos_side)
+        pos = await asyncio.to_thread(
+            self.okx.get_position,
+            inst_id=plan.inst_id,
+            pos_side=plan.pos_side,
+        )
         if pos is None or float(pos.get("pos", "0") or "0") == 0.0:
             await self.clear_plan(key)
             return
 
         if not plan.filled:
-            ord_state = self.okx.get_order(inst_id=plan.inst_id, cl_ord_id=plan.cl_ord_id)
-            if ord_state is None:
-                # Might be too old; still manage based on position.
+            # For ladder orders, entry_price is already the weighted average from main.py
+            # Just check if position exists to confirm filled status
+            pos_sz = float(pos.get("pos", "0") or "0")
+            if pos_sz > 0:
+                # Position exists, mark as filled
+                # entry_price and r_value are already set correctly in the plan
                 plan.filled = True
             else:
-                state = (ord_state.get("state") or "").lower()
-                if state in {"filled", "partially_filled"}:
-                    avg_px = ord_state.get("avgPx")
-                    if avg_px:
-                        plan.entry_price = float(avg_px)
-                        plan.r_value = abs(plan.entry_price - plan.stop_loss)
-                    plan.filled = True
+                # Position not found yet, might still be filling
+                # Keep checking on next tick
+                pass
 
-        last = self.okx.get_last_price(inst_id=plan.inst_id)
+        last = await asyncio.to_thread(
+            self.okx.get_last_price,
+            inst_id=plan.inst_id,
+        )
         if last is None or plan.r_value <= 0:
             return
 
@@ -150,6 +158,11 @@ class TradeManager:
             await self._close_reduce_only(plan, sz=sz, reason="tp1")
             plan.tp1_done = True
             plan.closed_sz += sz
+
+            # Move stop loss to breakeven after TP1
+            if not plan.sl_moved_to_breakeven and plan.remaining_sz > 0:
+                await self._move_sl_to_breakeven(plan)
+                plan.sl_moved_to_breakeven = True
 
         if (not plan.tp2_done) and profit_r >= self.settings.tp2_r and tp2_sz > 0:
             sz = tp2_sz if tp2_sz <= plan.remaining_sz else plan.remaining_sz
@@ -187,26 +200,166 @@ class TradeManager:
             return
         # Closing side is opposite of entry side in hedge mode for same posSide.
         close_side: Side = "sell" if plan.pos_side == "long" else "buy"
-        cl_ord_id = f"{plan.cl_ord_id}_{reason}"
-        # Fire-and-forget market reduce-only order.
-        self.okx.place_order(
-            inst_id=plan.inst_id,
-            td_mode=plan.td_mode,
-            side=close_side,
-            pos_side=plan.pos_side,
-            ord_type="market",
-            sz=_fmt_decimal(sz),
-            px=None,
-            cl_ord_id=cl_ord_id[:32],
-            sl_trigger_px=None,
-            tp_trigger_px=None,
-            reduce_only=True,
-        )
-        if self.fill_tracker is not None:
-            self.fill_tracker.register_order_label(
-                key=cl_ord_id[:32],
-                label=reason,
+        # OKX clOrdId: alphanumeric + hyphen, max 32 chars (no underscore allowed)
+        cl_ord_id = f"{plan.cl_ord_id}-{reason}"
+
+        # Place market reduce-only order with error handling
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+
+        try:
+            resp = await asyncio.to_thread(
+                self.okx.place_order,
+                inst_id=plan.inst_id,
+                td_mode=plan.td_mode,
+                side=close_side,
+                pos_side=plan.pos_side,
+                ord_type="market",
+                sz=_fmt_decimal(sz),
+                px=None,
+                cl_ord_id=cl_ord_id[:32],
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=True,
             )
-        notify_info(
-            f"okx tp triggered instId={plan.inst_id} reason={reason} sz={_fmt_decimal(sz)}"
-        )
+
+            # Check if order was successful
+            if str(resp.get("code", "")) not in {"0", "success"}:
+                logger.error(
+                    "TradeManager tp_order_failed instId=%s reason=%s sz=%s resp=%s",
+                    plan.inst_id, reason, _fmt_decimal(sz), resp
+                )
+                from app.notify import notify_error
+                notify_error(
+                    f"⚠️ 止盈订单失败\n"
+                    f"交易对: {plan.inst_id}\n"
+                    f"原因: {reason}\n"
+                    f"数量: {_fmt_decimal(sz)}\n"
+                    f"响应: {resp.get('msg', '未知错误')}"
+                )
+            else:
+                if self.fill_tracker is not None:
+                    self.fill_tracker.register_order_label(
+                        key=cl_ord_id[:32],
+                        label=reason,
+                    )
+                notify_info(
+                    f"✅ 止盈触发\n"
+                    f"交易对: {plan.inst_id}\n"
+                    f"级别: {reason}\n"
+                    f"平仓数量: {_fmt_decimal(sz)}"
+                )
+        except Exception as e:
+            logger.error(
+                "TradeManager tp_order_exception instId=%s reason=%s sz=%s err=%s",
+                plan.inst_id, reason, _fmt_decimal(sz), str(e),
+                exc_info=True
+            )
+            from app.notify import notify_error
+            notify_error(
+                f"⚠️ 止盈订单异常\n"
+                f"交易对: {plan.inst_id}\n"
+                f"原因: {reason}\n"
+                f"数量: {_fmt_decimal(sz)}\n"
+                f"错误: {str(e)}"
+            )
+
+    async def _move_sl_to_breakeven(self, plan: TradePlan) -> None:
+        """Move stop loss to breakeven (entry price) after TP1"""
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+
+        try:
+            # Get current algo orders to find and cancel existing SL
+            algo_orders = await asyncio.to_thread(
+                self.okx.get_algo_orders,
+                inst_id=plan.inst_id,
+                ord_type="conditional"
+            )
+
+            # Find and cancel existing SL order
+            sl_cancelled = False
+            if algo_orders:
+                for order in algo_orders:
+                    # Check if it's a SL for this position
+                    if (order.get("posSide") == plan.pos_side and
+                        order.get("state", "").lower() == "live"):
+                        algo_id = order.get("algoId")
+                        if algo_id:
+                            cancel_resp = await asyncio.to_thread(
+                                self.okx.cancel_algo_order,
+                                inst_id=plan.inst_id,
+                                algo_id=algo_id
+                            )
+                            if str(cancel_resp.get("code", "")) in {"0", "success"}:
+                                logger.info("TradeManager cancelled_old_sl instId=%s algoId=%s", plan.inst_id, algo_id)
+                                sl_cancelled = True
+                                break
+
+            # Place new SL at breakeven (entry price)
+            sl_side: Side = "sell" if plan.pos_side == "long" else "buy"
+
+            # Get instrument info for price precision
+            inst_info = await asyncio.to_thread(
+                self.okx.get_instrument_info,
+                inst_id=plan.inst_id
+            )
+            tick_size = inst_info.get("tickSz") if inst_info else None
+
+            # Round breakeven price to tick size
+            from decimal import Decimal, ROUND_DOWN
+            if tick_size:
+                tick = Decimal(str(tick_size))
+                breakeven = Decimal(str(plan.entry_price))
+                breakeven_rounded = (breakeven / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+                breakeven_price = str(breakeven_rounded)
+            else:
+                breakeven_price = str(plan.entry_price)
+
+            # Place new SL at breakeven
+            sl_resp = await asyncio.to_thread(
+                self.okx.place_algo_order,
+                inst_id=plan.inst_id,
+                td_mode=plan.td_mode,
+                side=sl_side,
+                pos_side=plan.pos_side,
+                ord_type="conditional",
+                sz=_fmt_decimal(plan.remaining_sz),
+                sl_trigger_px=breakeven_price,
+                sl_ord_px="-1"
+            )
+
+            if str(sl_resp.get("code", "")) in {"0", "success"}:
+                logger.info("TradeManager moved_sl_to_breakeven instId=%s entry=%.6f remaining_sz=%s",
+                           plan.inst_id, plan.entry_price, _fmt_decimal(plan.remaining_sz))
+                from app.notify import notify_info
+                notify_info(
+                    f"✅ 止损已推至保本\n"
+                    f"交易对: {plan.inst_id}\n"
+                    f"保本价: {plan.entry_price}\n"
+                    f"保护数量: {_fmt_decimal(plan.remaining_sz)}\n"
+                    f"触发原因: TP1 (1.5R) 已达成"
+                )
+                # Update plan's stop loss to reflect new breakeven level
+                plan.stop_loss = plan.entry_price
+            else:
+                logger.error("TradeManager move_sl_failed instId=%s resp=%s", plan.inst_id, sl_resp)
+                from app.notify import notify_error
+                notify_error(
+                    f"⚠️ 推止损至保本失败\n"
+                    f"交易对: {plan.inst_id}\n"
+                    f"响应: {sl_resp.get('msg', '未知错误')}"
+                )
+
+        except Exception as e:
+            logger.error(
+                "TradeManager move_sl_exception instId=%s err=%s",
+                plan.inst_id, str(e),
+                exc_info=True
+            )
+            from app.notify import notify_error
+            notify_error(
+                f"⚠️ 推止损至保本异常\n"
+                f"交易对: {plan.inst_id}\n"
+                f"错误: {str(e)}"
+            )

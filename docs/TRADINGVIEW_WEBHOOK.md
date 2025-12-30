@@ -39,6 +39,7 @@ PYTHONPATH=src .venv/bin/python -m perpbot.integrations.tradingview.standalone -
 - `PERPBOT_TV_HEDGE_MODE=true`：**双向持仓模式**（OKX 需开启账户 hedge mode）
 - `PERPBOT_TV_PLACE_STOP_LOSS=true`：**自动下止损单**（成交后立即挂条件单）
 - `PERPBOT_TV_ORDER_SIZE=1`：默认下单数量（可在 YAML 里按交易所覆盖）
+- `PERPBOT_EXTENDED_TPSL=true`：**Extended 入场单附带 TP/SL**（默认启用）
 
 ### 可选
 - `PERPBOT_TV_CONFIG_PATH=config/tradingview/example.yaml`：YAML profile

@@ -55,6 +55,12 @@ def _validate_settings(settings: "Settings") -> None:
     errors = []
     warnings = []
 
+    if settings.tv_webhook_secret == "CHANGE_ME":
+        if settings.trading_enabled:
+            errors.append("TV_WEBHOOK_SECRET is default (CHANGE_ME); set a real secret before trading")
+        else:
+            warnings.append("TV_WEBHOOK_SECRET is default (CHANGE_ME); set a real secret before trading")
+
     # Validate TP percentages
     total_tp_pct = settings.tp1_pct + settings.tp2_pct + settings.tp3_pct + settings.tp4_pct
     if abs(total_tp_pct - 1.0) > 0.01:
@@ -83,6 +89,22 @@ def _validate_settings(settings: "Settings") -> None:
             f"Trading enabled with RISK_PER_TRADE_USDT=0, using fixed ORDER_SZ={settings.order_sz}. "
             "This may create inconsistent risk across different symbols!"
         )
+
+    # Validate ladder orders
+    if settings.ladder_enabled:
+        total_ladder_pct = settings.ladder_market_pct + settings.ladder_level1_pct + settings.ladder_level2_pct + settings.ladder_level3_pct
+        if abs(total_ladder_pct - 1.0) > 0.01:
+            warnings.append(
+                f"Ladder order percentages sum to {total_ladder_pct:.2%} (expected 100%). "
+                f"Market={settings.ladder_market_pct:.1%} L1={settings.ladder_level1_pct:.1%} "
+                f"L2={settings.ladder_level2_pct:.1%} L3={settings.ladder_level3_pct:.1%}"
+            )
+        if not (settings.ladder_level1_bps < settings.ladder_level2_bps < settings.ladder_level3_bps):
+            warnings.append(
+                f"Ladder levels should be ascending: "
+                f"Level1={settings.ladder_level1_bps}bps Level2={settings.ladder_level2_bps}bps "
+                f"Level3={settings.ladder_level3_bps}bps"
+            )
 
     # Validate exchange credentials
     if settings.trading_enabled:
@@ -136,6 +158,30 @@ class Settings:
     limit_slippage_bps: float = _getenv_float("LIMIT_SLIPPAGE_BPS", 5.0)
     order_sz: str = _getenv("ORDER_SZ", "1")
     risk_per_trade_usdt: float = _getenv_float("RISK_PER_TRADE_USDT", 0.0)
+    risk_per_trade_by_tf: str = _getenv("RISK_PER_TRADE_BY_TF", "15m:100,30m:300,1h:300,4h:300")  # Risk in USDT by timeframe
+
+    # Ladder orders (70% market + 30% limit in 2 levels)
+    ladder_enabled: bool = _getenv_bool("LADDER_ENABLED", False)
+    ladder_market_pct: float = _getenv_float("LADDER_MARKET_PCT", 0.70)   # 70% market order
+    ladder_level1_bps: float = _getenv_float("LADDER_LEVEL1_BPS", 3.0)    # L1: -3bps from signal
+    ladder_level1_pct: float = _getenv_float("LADDER_LEVEL1_PCT", 0.20)   # L1: 20% of position
+    ladder_level2_bps: float = _getenv_float("LADDER_LEVEL2_BPS", 8.0)    # L2: -8bps from signal
+    ladder_level2_pct: float = _getenv_float("LADDER_LEVEL2_PCT", 0.10)   # L2: 10% of position
+    ladder_level3_bps: float = _getenv_float("LADDER_LEVEL3_BPS", 15.0)   # Not used
+    ladder_level3_pct: float = _getenv_float("LADDER_LEVEL3_PCT", 0.0)    # Not used
+
+    # Wait time configuration (by timeframe) - Shorter wait since 70% market fills immediately
+    # 基础等待时间（无成交时的等待）
+    ladder_wait_candles_by_tf: str = _getenv("LADDER_WAIT_CANDLES_BY_TF", "1m:0.5,3m:0.5,5m:0.5,15m:0.3,30m:0.3,1h:0.2,4h:0.2")
+    # 最大等待时间（有部分成交时的延长等待）
+    ladder_max_wait_candles_by_tf: str = _getenv("LADDER_MAX_WAIT_CANDLES_BY_TF", "1m:1,3m:1,5m:1,15m:0.8,30m:0.8,1h:0.5,4h:0.5")
+    # 价格远离阈值（可以稍微放宽）
+    ladder_price_distance_by_tf: str = _getenv("LADDER_PRICE_DISTANCE_BY_TF", "1m:0.5,3m:0.5,5m:0.5,15m:0.6,30m:0.7,1h:0.8,4h:1.0")
+
+    # Default values (if timeframe not configured)
+    ladder_wait_candles: float = _getenv_float("LADDER_WAIT_CANDLES", 0.5)
+    ladder_max_wait_candles: float = _getenv_float("LADDER_MAX_WAIT_CANDLES", 1.0)
+    ladder_price_distance_pct: float = _getenv_float("LADDER_PRICE_DISTANCE_PCT", 0.5)
 
     # TODO: Add global risk controls
     # max_total_exposure_usdt: float = 0.0  # Maximum total position value
@@ -149,6 +195,7 @@ class Settings:
     min_stop_distance_bps: float = _getenv_float("MIN_STOP_DISTANCE_BPS", 0.0)
     stop_method: str = _getenv("STOP_METHOD", "lookback").lower()  # lookback | pivot
     stop_lookback_bars: int = _getenv_int("STOP_LOOKBACK_BARS", 50)
+    stop_lookback_by_tf: str = _getenv("STOP_LOOKBACK_BY_TF", "")  # e.g., "5m:25,15m:30,1h:40"
     backup_sl_enabled: bool = _getenv_bool("BACKUP_SL_ENABLED", False)  # Try limit order SL as backup
 
     # Optional pattern filters (approximate, pivot-based)
@@ -211,6 +258,132 @@ class Settings:
     extended_refresh_sl_enabled: bool = _getenv_bool("EXTENDED_REFRESH_SL_ENABLED", True)
     extended_refresh_tp_enabled: bool = _getenv_bool("EXTENDED_REFRESH_TP_ENABLED", True)
 
+    # Lighter protection refresh
+    lighter_refresh_seconds: int = _getenv_int("LIGHTER_REFRESH_SECONDS", 60)
+    lighter_refresh_enabled: bool = _getenv_bool("LIGHTER_REFRESH_ENABLED", True)
+    lighter_refresh_sl_enabled: bool = _getenv_bool("LIGHTER_REFRESH_SL_ENABLED", True)
+    lighter_refresh_tp_enabled: bool = _getenv_bool("LIGHTER_REFRESH_TP_ENABLED", True)
+    lighter_entry_ttl_seconds: int = _getenv_int("LIGHTER_ENTRY_TTL_SECONDS", 21600)
+    lighter_block_duplicate_positions: bool = _getenv_bool("LIGHTER_BLOCK_DUPLICATE_POSITIONS", False)
+
 
 SETTINGS = Settings()
 _validate_settings(SETTINGS)
+
+
+# Parse STOP_LOOKBACK_BY_TF into a dictionary for quick lookup
+def _parse_lookback_by_tf(config_str: str) -> dict[str, int]:
+    """Parse STOP_LOOKBACK_BY_TF config string into a dict.
+
+    Example: "5m:25,15m:30,1h:40" -> {"5m": 25, "15m": 30, "1h": 40}
+    """
+    result = {}
+    if not config_str:
+        return result
+
+    for pair in config_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        if len(parts) == 2:
+            tf = parts[0].strip()
+            try:
+                bars = int(parts[1].strip())
+                result[tf] = bars
+            except ValueError:
+                pass  # Invalid format, skip
+    return result
+
+
+LOOKBACK_BY_TF = _parse_lookback_by_tf(SETTINGS.stop_lookback_by_tf)
+
+
+def get_lookback_bars(tf: str) -> int:
+    """Get LOOKBACK_BARS for a specific timeframe, fallback to default."""
+    return LOOKBACK_BY_TF.get(tf, SETTINGS.stop_lookback_bars)
+
+
+# Parse ladder wait candles by timeframe
+def _parse_float_by_tf(config_str: str) -> dict[str, float]:
+    """Parse config string like '1m:3,5m:2,1h:1' into dict."""
+    result = {}
+    if not config_str:
+        return result
+    for pair in config_str.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = pair.split(":")
+        if len(parts) == 2:
+            tf = parts[0].strip()
+            try:
+                value = float(parts[1].strip())
+                result[tf] = value
+            except ValueError:
+                pass
+    return result
+
+
+LADDER_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_wait_candles_by_tf)
+LADDER_MAX_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_max_wait_candles_by_tf)
+LADDER_PRICE_DISTANCE_BY_TF = _parse_float_by_tf(SETTINGS.ladder_price_distance_by_tf)
+
+
+def get_ladder_wait_candles(tf: str) -> float:
+    """Get base wait candles for a specific timeframe."""
+    return LADDER_WAIT_CANDLES_BY_TF.get(tf, SETTINGS.ladder_wait_candles)
+
+
+def get_ladder_max_wait_candles(tf: str) -> float:
+    """Get max wait candles for a specific timeframe."""
+    return LADDER_MAX_WAIT_CANDLES_BY_TF.get(tf, SETTINGS.ladder_max_wait_candles)
+
+
+def get_ladder_price_distance(tf: str) -> float:
+    """Get price distance threshold (%) for a specific timeframe."""
+    return LADDER_PRICE_DISTANCE_BY_TF.get(tf, SETTINGS.ladder_price_distance_pct)
+
+
+def tf_to_seconds(tf: str) -> int:
+    """Convert timeframe string to seconds.
+
+    Examples:
+        1m  -> 60
+        3m  -> 180
+        5m  -> 300
+        15m -> 900
+        30m -> 1800
+        1h  -> 3600
+        4h  -> 14400
+        1d  -> 86400
+    """
+    tf = tf.lower().strip()
+
+    # Extract number and unit
+    import re
+    match = re.match(r'^(\d+)([mhd])$', tf)
+    if not match:
+        # Unknown format, default to 5m
+        return 300
+
+    num = int(match.group(1))
+    unit = match.group(2)
+
+    if unit == 'm':
+        return num * 60
+    elif unit == 'h':
+        return num * 3600
+    elif unit == 'd':
+        return num * 86400
+    else:
+        return 300  # default 5m
+
+
+# Parse RISK_PER_TRADE_BY_TF into a dictionary for quick lookup
+RISK_BY_TF = _parse_float_by_tf(SETTINGS.risk_per_trade_by_tf)
+
+
+def get_risk_per_trade(tf: str) -> float:
+    """Get risk amount (USDT) for a specific timeframe, fallback to default."""
+    return RISK_BY_TF.get(tf, SETTINGS.risk_per_trade_usdt)

@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import SETTINGS
+from app.config import SETTINGS, get_lookback_bars, get_ladder_wait_candles, get_ladder_max_wait_candles, get_ladder_price_distance, tf_to_seconds
 from app.charting import plot_kline
 from app.candle_cache import CandleCache, CandleWsManager
 from app.fill_tracker import FillTracker
@@ -55,6 +55,7 @@ STARTUP_TS = time.time()
 _health_task: asyncio.Task | None = None
 _refresh_task: asyncio.Task | None = None
 _last_refresh_by_key: dict[str, float] = {}
+_lighter_refresh_size_by_key: dict[str, float] = {}
 
 # Concurrency limiter for order placement (max 3 concurrent orders)
 _order_semaphore = asyncio.Semaphore(3)
@@ -64,6 +65,66 @@ async def _place_order_with_limit(exchange_obj: Any, *args: Any, **kwargs: Any) 
     """Place order with concurrency limiting."""
     async with _order_semaphore:
         return exchange_obj.place_order(*args, **kwargs)
+
+
+async def _cancel_pending_ladder_orders(key: str, inst_id: str, exchange_obj: Any) -> tuple[int, int]:
+    """
+    Cancel all pending ladder orders for a position.
+
+    Args:
+        key: Position key (inst_id:tf)
+        inst_id: Instrument ID (e.g., "EIGEN-USDT-SWAP")
+        exchange_obj: Exchange client instance
+
+    Returns:
+        Tuple of (canceled_count, failed_count)
+    """
+    pending_orders = state.get_pending_orders(key)
+    if not pending_orders:
+        logger.info("cancel_pending_orders key=%s no_pending_orders", key)
+        return (0, 0)
+
+    logger.info("cancel_pending_orders key=%s count=%d", key, len(pending_orders))
+
+    canceled = 0
+    failed = 0
+
+    for order_info in pending_orders:
+        order_id = order_info.get("order_id", "")
+        level = order_info.get("level", "")
+        symbol = order_info.get("symbol", "")
+
+        if not order_id:
+            continue
+
+        try:
+            logger.info("canceling_pending_order key=%s order_id=%s level=%s", key, order_id, level)
+
+            # Try to cancel the order
+            cancel_resp = await exchange_obj.cancel_order(
+                inst_id=inst_id,
+                cl_ord_id=order_id
+            )
+
+            if str(cancel_resp.get("code", "")) in {"0", "success"}:
+                canceled += 1
+                logger.info("canceled_pending_order key=%s order_id=%s level=%s", key, order_id, level)
+            else:
+                # Order might already be filled or canceled
+                logger.warning("cancel_pending_failed key=%s order_id=%s level=%s resp=%s",
+                             key, order_id, level, cancel_resp)
+                failed += 1
+
+        except Exception as e:
+            logger.warning("cancel_pending_error key=%s order_id=%s level=%s err=%s",
+                         key, order_id, level, str(e))
+            failed += 1
+
+    # Clear the pending orders from state
+    state.clear_pending_orders(key)
+
+    logger.info("cancel_pending_complete key=%s canceled=%d failed=%d", key, canceled, failed)
+    return (canceled, failed)
 
 
 # Initialize exchange client based on configuration
@@ -86,6 +147,96 @@ elif SETTINGS.exchange == "paradex":
     use_testnet = env not in {"prod", "mainnet"}
     exchange = ParadexClient(use_testnet=use_testnet)
     exchange.connect()
+elif SETTINGS.exchange == "lighter":
+    import os
+    from app.lighter_adapter import create_lighter_adapter
+
+    env = os.getenv("LIGHTER_ENV", "mainnet").lower()
+    use_testnet = env == "testnet"
+    exchange = create_lighter_adapter(use_testnet=use_testnet)
+    # Note: exchange.connect() will be called in startup event (async)
+    logger.info(f"Lighter adapter created (env={env}, will connect on startup)")
+
+    # Enable WebSocket for real-time monitoring (all trading symbols)
+    # Includes all K-line monitored symbols + important allowlist symbols
+    LIGHTER_WS_SYMBOLS = [
+        # Primary trading pairs (K-line monitored)
+        "ETH-USDT-SWAP",
+        "BTC-USDT-SWAP",
+        "SOL-USDT-SWAP",
+        "LINK-USDT-SWAP",
+        "DOGE-USDT-SWAP",
+        "BNB-USDT-SWAP",
+        "BCH-USDT-SWAP",
+        "TRX-USDT-SWAP",
+        "EIGEN-USDT-SWAP",
+        "ETHFI-USDT-SWAP",
+        "FARTCOIN-USDT-SWAP",
+        "JTO-USDT-SWAP",
+        "PUMP-USDT-SWAP",
+        "TAO-USDT-SWAP",
+        "TON-USDT-SWAP",
+        "TRUMP-USDT-SWAP",
+        # Additional allowlist symbols
+        "XRP-USDT-SWAP",
+        "ONDO-USDT-SWAP",
+        "LTC-USDT-SWAP",
+    ]
+
+    logger.info("🔌 Starting Lighter WebSocket initialization...")
+    try:
+        logger.info("🔌 Enabling Lighter WebSocket for real-time monitoring...")
+        # Enable WebSocket (public channels don't need auth)
+        exchange.enable_websocket(auto_subscribe_account=False)
+        logger.info("✅ Lighter WebSocket client created")
+
+        # Subscribe to orderbook and trades for all symbols
+        ws_subscribed = 0
+        ws_failed = []
+        for okx_symbol in LIGHTER_WS_SYMBOLS:
+            try:
+                # Convert OKX format to Lighter format (ETH-USDT-SWAP -> ETH/USDT)
+                lighter_symbol = okx_symbol.replace("-SWAP", "").replace("-", "/")
+
+                # Orderbook handler
+                def make_orderbook_handler(sym):
+                    def handler(data):
+                        bids = data.get("bids", [])
+                        asks = data.get("asks", [])
+                        if bids and asks:
+                            best_bid = float(bids[0].get("price", 0)) if bids else 0
+                            best_ask = float(asks[0].get("price", 0)) if asks else 0
+                            logger.debug(f"📖 {sym} WS盘口: bid={best_bid:.2f} ask={best_ask:.2f} ({len(bids)}b/{len(asks)}a)")
+                    return handler
+
+                # Trade handler
+                def make_trade_handler(sym):
+                    def handler(data):
+                        trade = data.get("trade", {})
+                        side = trade.get("side", "")
+                        size = trade.get("size", 0)
+                        price = trade.get("price", 0)
+                        if price and size:
+                            logger.debug(f"💹 {sym} WS成交: {side.upper()} {size} @ {price}")
+                    return handler
+
+                exchange.subscribe_orderbook_stream(lighter_symbol, make_orderbook_handler(okx_symbol))
+                exchange.subscribe_trades_stream(lighter_symbol, make_trade_handler(okx_symbol))
+                ws_subscribed += 1
+
+            except Exception as e:
+                logger.error(f"❌ Failed to subscribe WebSocket for {okx_symbol}: {e}")
+                ws_failed.append(okx_symbol)
+
+        logger.info(f"✅ Lighter WebSocket enabled: {ws_subscribed}/{len(LIGHTER_WS_SYMBOLS)} symbols subscribed")
+        if ws_failed:
+            logger.warning(f"⚠️  Failed to subscribe: {', '.join(ws_failed)}")
+
+    except Exception as e:
+        import traceback
+        logger.error(f"❌ Failed to enable Lighter WebSocket: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.info("ℹ️  Continuing without WebSocket (REST API only)")
 else:
     from app.okx import OKXClient, OKXCredentials
 
@@ -443,18 +594,24 @@ def _parse_side(value: str | None) -> str | None:
     return None
 
 
-def _calculate_order_size(*, inst_id: str, r_value: float) -> tuple[str, dict[str, object]]:
+async def _calculate_order_size(*, inst_id: str, r_value: float, tf: str | None = None) -> tuple[str, dict[str, object]]:
+    from app.config import get_risk_per_trade
+
     order_sz = SETTINGS.order_sz
     meta: dict[str, object] = {}
-    if not (SETTINGS.risk_per_trade_usdt and SETTINGS.risk_per_trade_usdt > 0 and r_value > 0):
+
+    # Get timeframe-specific risk if available, otherwise use default
+    risk_amount = get_risk_per_trade(tf) if tf else SETTINGS.risk_per_trade_usdt
+
+    if not (risk_amount and risk_amount > 0 and r_value > 0):
         return order_sz, meta
 
-    inst_info = exchange.get_instrument_info(inst_id=inst_id)
+    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
     ct_val = float(inst_info.get("ctVal")) if inst_info and inst_info.get("ctVal") else 1.0
     lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
     min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
 
-    risk_usdt = Decimal(str(SETTINGS.risk_per_trade_usdt))
+    risk_usdt = Decimal(str(risk_amount))
     r_value_dec = Decimal(str(r_value))
     ct_val_dec = Decimal(str(ct_val))
     calculated_sz_coins = risk_usdt / r_value_dec
@@ -474,7 +631,7 @@ def _calculate_order_size(*, inst_id: str, r_value: float) -> tuple[str, dict[st
     return order_sz, meta
 
 
-def _place_extended_tp_orders(
+async def _place_extended_tp_orders(
     *,
     inst_id: str,
     side: str,
@@ -485,7 +642,7 @@ def _place_extended_tp_orders(
     tick_size: str | None,
     cl_ord_id: str,
 ) -> list[dict[str, str]]:
-    tp_targets = _build_tp_targets(
+    tp_targets = await _build_tp_targets(
         inst_id=inst_id,
         side=side,
         entry_price=entry_price,
@@ -566,7 +723,7 @@ def _place_extended_sl_order(
     return {"sl": sl_px, "size": str(total_sz), "resp": str(resp)}
 
 
-def _build_tp_targets(
+async def _build_tp_targets(
     *,
     inst_id: str,
     side: str,
@@ -575,7 +732,7 @@ def _build_tp_targets(
     total_sz: Decimal,
     tick_size: str | None,
 ) -> list[dict[str, str]]:
-    inst_info = exchange.get_instrument_info(inst_id=inst_id)
+    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
     step = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else Decimal("1")
 
     def _floor_to_step(value: Decimal, step_value: Decimal) -> Decimal:
@@ -763,7 +920,7 @@ async def _refresh_paradex_protection() -> None:
             if trail_sl is None:
                 continue
 
-            inst_info = exchange.get_instrument_info(inst_id=inst_id)
+            inst_info = await exchange.get_instrument_info(inst_id=inst_id)
             tick_size = inst_info.get("tickSz") if inst_info else None
             desired_sl = float(_round_price_to_tick(trail_sl, tick_size))
 
@@ -825,7 +982,8 @@ async def _refresh_paradex_protection() -> None:
                 if (now - last_ts) < SETTINGS.extended_refresh_seconds:
                     continue
                 pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
-                if not pos:
+                if not pos or float(pos.get("pos", "0") or "0") == 0.0:
+                    state.clear_entry(inst_id)
                     continue
                 try:
                     size = Decimal(str(pos.get("pos", "0")))
@@ -844,7 +1002,7 @@ async def _refresh_paradex_protection() -> None:
                     sl_price = entry_info.stop_loss
                 side = "buy" if pos_side == "long" else "sell"
                 tick_size = None
-                inst_info = exchange.get_instrument_info(inst_id=inst_id)
+                inst_info = await exchange.get_instrument_info(inst_id=inst_id)
                 if inst_info:
                     tick_size = inst_info.get("tickSz")
 
@@ -927,7 +1085,7 @@ async def _refresh_paradex_protection() -> None:
                             inst_id, pos_side
                         )
                         continue
-                    tp_targets = _build_tp_targets(
+                    tp_targets = await _build_tp_targets(
                         inst_id=inst_id,
                         side=side,
                         entry_price=float(entry_price),
@@ -1005,10 +1163,132 @@ async def _refresh_paradex_protection() -> None:
                         )
 
 
+async def _refresh_lighter_protection() -> None:
+    if SETTINGS.exchange != "lighter":
+        return
+    while True:
+        await asyncio.sleep(SETTINGS.lighter_refresh_seconds)
+        if not SETTINGS.trading_enabled or not SETTINGS.lighter_refresh_enabled:
+            continue
+        now = time.time()
+        for inst_id in allowed_symbols:
+            if inst_id == "*":
+                continue
+            for pos_side in ("long", "short"):
+                key = f"{inst_id}:{pos_side}"
+                pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                if not pos:
+                    continue
+                try:
+                    size = Decimal(str(pos.get("pos", "0") or "0"))
+                except Exception:
+                    size = Decimal("0")
+                if size <= 0:
+                    continue
+                last_ts = _last_refresh_by_key.get(key, 0.0)
+                last_sz = _lighter_refresh_size_by_key.get(key)
+                if last_sz is not None and abs(last_sz - float(size)) < 1e-9:
+                    if (now - last_ts) < SETTINGS.lighter_refresh_seconds:
+                        continue
+
+                entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
+                if entry_info is None:
+                    entry_state = state.get_entry(inst_id, ttl_seconds=SETTINGS.lighter_entry_ttl_seconds)
+                    if entry_state is None:
+                        continue
+                    entry_info = SimpleNamespace(
+                        side=entry_state.side,
+                        entry_price=entry_state.entry_price,
+                        stop_loss=entry_state.stop_loss,
+                    )
+
+                inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+                tick_size = inst_info.get("tickSz") if inst_info else None
+                lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+                min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+                normalized_sz = _normalize_qty(size, step=lot_step, min_sz=min_order)
+                if normalized_sz <= 0:
+                    continue
+                sl_order_sz = _format_decimal(normalized_sz)
+                side = entry_info.side
+                sl_side = "sell" if side == "buy" else "buy"
+
+                # Cancel previously placed protection orders if tracked
+                store = getattr(exchange, "_okx_compat_state", None)
+                if store:
+                    protect = store.get("protective_by_key", {}).get(key)
+                    if protect:
+                        for order_id in (protect.get("sl", []) + protect.get("tp", [])):
+                            try:
+                                exchange.cancel_order(inst_id=inst_id, order_id=order_id)
+                            except Exception:
+                                pass
+                        protect["sl"] = []
+                        protect["tp"] = []
+
+                if SETTINGS.lighter_refresh_sl_enabled:
+                    sl_px = _round_price_to_tick(entry_info.stop_loss, tick_size)
+                    sl_resp = exchange.place_algo_order(
+                        inst_id=inst_id,
+                        td_mode=SETTINGS.okx_td_mode,
+                        side=sl_side,
+                        pos_side=pos_side,
+                        ord_type="conditional",
+                        sz=sl_order_sz,
+                        sl_trigger_px=sl_px,
+                        sl_ord_px="-1",
+                    )
+                    if str(sl_resp.get("code", "")) not in {"0", "success"}:
+                        notify_error(
+                            f"lighter sl refresh failed instId={inst_id} posSide={pos_side} sl={sl_px} sz={sl_order_sz} resp={sl_resp}"
+                        )
+
+                if SETTINGS.lighter_refresh_tp_enabled and SETTINGS.tp_enabled:
+                    tp_targets = await _build_tp_targets(
+                        inst_id=inst_id,
+                        side=side,
+                        entry_price=entry_info.entry_price,
+                        sl=entry_info.stop_loss,
+                        total_sz=normalized_sz,
+                        tick_size=tick_size,
+                    )
+                    for target in tp_targets:
+                        tp_resp = exchange.place_algo_order(
+                            inst_id=inst_id,
+                            td_mode=SETTINGS.okx_td_mode,
+                            side=sl_side,
+                            pos_side=pos_side,
+                            ord_type="conditional",
+                            sz=target["size"],
+                            tp_trigger_px=target["price"],
+                            tp_ord_px="-1",
+                        )
+                        if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                            notify_error(
+                                f"lighter tp refresh failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+                            )
+
+                _last_refresh_by_key[key] = now
+                _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                logger.info(
+                    "lighter protection refreshed instId=%s posSide=%s size=%s",
+                    inst_id,
+                    pos_side,
+                    sl_order_sz,
+                )
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Configure log rotation
     _configure_logging()
+
+    # Connect Lighter exchange if using Lighter (async)
+    if SETTINGS.exchange == "lighter":
+        logger.info("Connecting to Lighter exchange (async via adapter)...")
+        await exchange.connect()
+        logger.info("✅ Lighter client connected via adapter")
 
     if SETTINGS.trading_enabled and manager is not None:
         manager.start()
@@ -1018,11 +1298,17 @@ async def _startup() -> None:
             enable_extended=SETTINGS.exchange == "extended",
         )
     if SETTINGS.candle_ws_enabled and candle_ws_manager is not None:
+        logger.info(f"Starting candle WebSocket manager (symbols: {len(candle_ws_symbol_tfs) if candle_ws_symbol_tfs else 0})")
         candle_ws_manager.start()
         if candle_ws_symbol_tfs:
+            subscription_count = 0
             for inst_id, tfs in candle_ws_symbol_tfs.items():
                 for tf in tfs:
                     await candle_ws_manager.ensure_subscription(inst_id=inst_id, tf=tf)
+                    subscription_count += 1
+            logger.info(f"Candle WebSocket subscribed to {subscription_count} channels")
+            stats = candle_ws_manager.get_stats()
+            logger.info(f"Candle WebSocket stats: OKX {stats['okx']['subscribed']}/{stats['okx']['max']} ({stats['okx']['utilization']})")
     _start_telegram_control()
     if SETTINGS.health_log_seconds > 0:
         async def _health_loop() -> None:
@@ -1044,6 +1330,8 @@ async def _startup() -> None:
         _refresh_task = asyncio.create_task(_refresh_extended_protection())
     if SETTINGS.exchange == "paradex" and SETTINGS.extended_refresh_enabled:
         _refresh_task = asyncio.create_task(_refresh_paradex_protection())
+    if SETTINGS.exchange == "lighter" and SETTINGS.lighter_refresh_enabled:
+        _refresh_task = asyncio.create_task(_refresh_lighter_protection())
 
 
 @app.on_event("shutdown")
@@ -1209,37 +1497,65 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         _log_decision(inst_id, tf, action="zone_set", zone=zone, close=close_f)
         return {"ok": True, "type": "ZONE", "zone": zone}
 
+    if payload.type.upper() == "CLOSE":
+        pos = exchange.get_position(inst_id=inst_id, pos_side="long")
+        if not pos:
+            pos = exchange.get_position(inst_id=inst_id, pos_side="short")
+        if not pos or float(pos.get("pos", "0") or "0") == 0:
+            _log_decision(inst_id, tf, action="close_skip", reason="no_position")
+            return {"ok": True, "type": "CLOSE", "skipped": "no_position"}
+
+        pos_side = pos.get("posSide", "long")
+        close_side = "sell" if pos_side == "long" else "buy"
+        close_sz = str(pos.get("pos"))
+
+        if SETTINGS.exchange == "lighter":
+            try:
+                symbol = inst_id.replace("-SWAP", "").replace("-", "/")
+                cancel_all_fn = getattr(exchange, "cancel_all_orders_for_symbol", None)
+                if callable(cancel_all_fn):
+                    canceled, failed = cancel_all_fn(symbol)
+                    logger.info("lighter close cancel_all_orders symbol=%s canceled=%d failed=%d", symbol, canceled, failed)
+            except Exception as e:
+                logger.warning("lighter close cancel_all_orders_failed instId=%s err=%s", inst_id, e)
+        await _cancel_pending_ladder_orders(key, inst_id, exchange)
+
+        resp = exchange.place_order(
+            inst_id=inst_id,
+            td_mode=SETTINGS.okx_td_mode,
+            side=close_side,
+            pos_side=pos_side,
+            ord_type="market",
+            sz=close_sz,
+            px=None,
+            reduce_only=True,
+        )
+        _log_decision(inst_id, tf, action="close_order", side=close_side, posSide=pos_side, resp=resp)
+        return {"ok": True, "type": "CLOSE", "order": resp}
+
     if payload.type.upper() != "DIV":
         raise HTTPException(status_code=400, detail="Unknown type")
 
-    zone_state = state.get_zone(key)
+    # DIV signal must specify side (buy/sell)
     if payload_side is None:
-        if zone_state is None and not (allow_no_zone or SETTINGS.rsi_allow_no_zone):
-            _log_decision(inst_id, tf, action="skip", reason="no_zone_state")
-            return {"ok": True, "skipped": "no_zone_state"}
-        if zone_state is not None and zone_state.zone not in {"OVERSOLD", "OVERBOUGHT"}:
-            _log_decision(inst_id, tf, action="skip", reason="zone_expired_or_neutral", zone=zone_state.zone)
-            return {"ok": True, "skipped": "zone_expired_or_neutral", "zone": zone_state.zone}
-        if not state.can_trade(key, SETTINGS.cooldown_seconds):
-            _log_decision(inst_id, tf, action="skip", reason="cooldown")
-            return {"ok": True, "skipped": "cooldown"}
+        _log_decision(inst_id, tf, action="skip", reason="missing_side")
+        raise HTTPException(status_code=400, detail="DIV signal must specify 'side' field (buy or sell)")
 
-    side = payload_side or "buy"
+    # Check cooldown
+    if not state.can_trade(key, SETTINGS.cooldown_seconds):
+        _log_decision(inst_id, tf, action="skip", reason="cooldown")
+        return {"ok": True, "skipped": "cooldown"}
+
+    side = payload_side
     pos_side = "long" if side == "buy" else "short"
-    if payload_side is not None:
-        zone_state = SimpleNamespace(
-            zone="OVERSOLD" if side == "buy" else "OVERBOUGHT",
-            close=close_f,
-        )
-    elif zone_state is not None:
-        if zone_state.zone == "OVERSOLD":
-            side = "buy"
-            pos_side = "long"
-        else:
-            side = "sell"
-            pos_side = "short"
 
-    entry_price = close_f or (zone_state.close if zone_state is not None else None)
+    # Create a simple zone_state for logging purposes
+    zone_state = SimpleNamespace(
+        zone="OVERSOLD" if side == "buy" else "OVERBOUGHT",
+        close=close_f,
+    )
+
+    # Fetch candles first to get real-time price
     desired_limit = max(300, SETTINGS.rsi_max_data + SETTINGS.rsi_length + 2)
     candles: list
     preferred_source = "extended" if SETTINGS.exchange == "extended" else "okx"
@@ -1294,8 +1610,10 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     candles=candles,
                 )
     last_candle_close = candles[-1].c if candles else None
-    if entry_price is None and last_candle_close is not None:
-        entry_price = last_candle_close
+
+    # Priority: use real-time price from candles, fallback to payload close, then zone close
+    entry_price = last_candle_close or close_f or (zone_state.close if zone_state is not None else None)
+
     if entry_price is None:
         _log_decision(inst_id, tf, action="skip", reason="no_entry_price")
         return {"ok": True, "skipped": "no_entry_price"}
@@ -1523,7 +1841,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             side=side,
             entry_price=float(entry_price),
             candles=candles,
-            lookback_bars=SETTINGS.stop_lookback_bars,
+            lookback_bars=get_lookback_bars(tf),
             atr_len=SETTINGS.atr_len,
             atr_buffer_mult=SETTINGS.atr_buffer_mult,
             min_buffer_bps=SETTINGS.min_buffer_bps,
@@ -1537,7 +1855,12 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             sl = min(sl, float(entry_price) - min_dist)
         else:
             sl = max(sl, float(entry_price) + min_dist)
-    if side == "buy" and float(sl) >= float(entry_price):
+    # For ladder orders, allow some tolerance since actual fill price may differ from signal price
+    # Tolerance: 0.5% (50 bps) - enough to account for ladder spread but still catch major errors
+    tolerance_bps = 50 if SETTINGS.ladder_enabled else 0
+    tolerance = float(entry_price) * (tolerance_bps / 10000.0)
+
+    if side == "buy" and float(sl) >= float(entry_price) + tolerance:
         _log_decision(
             inst_id,
             tf,
@@ -1545,6 +1868,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             reason="invalid_stoploss_sl_gte_entry",
             sl=sl,
             entry=float(entry_price),
+            tolerance=tolerance,
         )
         return {
             "ok": True,
@@ -1553,7 +1877,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             "sl": sl,
             "entry": float(entry_price),
         }
-    if side == "sell" and float(sl) <= float(entry_price):
+    if side == "sell" and float(sl) <= float(entry_price) - tolerance:
         _log_decision(
             inst_id,
             tf,
@@ -1561,6 +1885,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             reason="invalid_stoploss_sl_lte_entry",
             sl=sl,
             entry=float(entry_price),
+            tolerance=tolerance,
         )
         return {
             "ok": True,
@@ -1576,11 +1901,13 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if not SETTINGS.trading_enabled:
         r_value = abs(float(entry_price) - float(sl))
-        order_sz, size_meta = _calculate_order_size(inst_id=inst_id, r_value=r_value)
+        order_sz, size_meta = await _calculate_order_size(inst_id=inst_id, r_value=r_value, tf=tf)
         if size_meta:
+            from app.config import get_risk_per_trade
             logger.info(
-                "tv_webhook risk_based_sizing risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
-                SETTINGS.risk_per_trade_usdt,
+                "tv_webhook risk_based_sizing tf=%s risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
+                tf,
+                get_risk_per_trade(tf),
                 r_value,
                 size_meta.get("calculated_sz_coins"),
                 size_meta.get("ct_val"),
@@ -1626,11 +1953,14 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # NOTE: Fixed ORDER_SZ mode creates inconsistent risk across symbols.
     # E.g., 1 BTC contract ≈ $100k vs 1 DOGE contract ≈ $0.10
     # Use RISK_PER_TRADE_USDT for consistent risk management.
-    order_sz, size_meta = _calculate_order_size(inst_id=inst_id, r_value=r_value)
+    # Now supports timeframe-specific risk: 15m=100U, 30m-4h=300U
+    order_sz, size_meta = await _calculate_order_size(inst_id=inst_id, r_value=r_value, tf=tf)
     if size_meta:
+        from app.config import get_risk_per_trade
         logger.info(
-            "tv_webhook risk_based_sizing risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
-            SETTINGS.risk_per_trade_usdt,
+            "tv_webhook risk_based_sizing tf=%s risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
+            tf,
+            get_risk_per_trade(tf),
             r_value,
             size_meta.get("calculated_sz_coins"),
             size_meta.get("ct_val"),
@@ -1640,8 +1970,49 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     else:
         logger.info("tv_webhook fixed_sizing sz=%s", order_sz)
 
+    # 2.5 检查仓位冲突（避免重复开仓）
+    check_conflict = SETTINGS.exchange != "lighter" or SETTINGS.lighter_block_duplicate_positions
+    if check_conflict:
+        existing_pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+        if existing_pos and float(existing_pos.get("pos", "0") or "0") != 0:
+            existing_sz = float(existing_pos.get("pos", "0") or "0")
+            existing_avg_px = float(existing_pos.get("avgPx", "0") or "0")
+            logger.warning(
+                "tv_webhook position_conflict_detected instId=%s posSide=%s existing_sz=%.2f existing_avg_px=%.5f new_sz=%s",
+                inst_id, pos_side, existing_sz, existing_avg_px, order_sz
+            )
+            _log_decision(
+                inst_id,
+                tf,
+                action="skip",
+                reason="position_already_exists",
+                existing_sz=existing_sz,
+                existing_avg_px=existing_avg_px,
+                new_sz=order_sz,
+            )
+            notify_error(
+                f"⚠️ Position conflict detected\n"
+                f"Symbol: {inst_id}\n"
+                f"Direction: {pos_side}\n"
+                f"Existing: {existing_sz:.2f} @ {existing_avg_px:.5f}\n"
+                f"New signal: {order_sz} @ {entry_price}\n"
+                f"Action: Skipped new order to avoid duplicate position"
+            )
+            return {
+                "ok": False,
+                "skipped": "position_conflict",
+                "existing_position": {
+                    "size": existing_sz,
+                    "avgPx": existing_avg_px,
+                },
+                "new_order": {
+                    "size": order_sz,
+                    "entry": float(entry_price),
+                },
+            }
+
     if SETTINGS.exchange == "paradex":
-        inst_info = exchange.get_instrument_info(inst_id=inst_id)
+        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
         tick_size = inst_info.get("tickSz") if inst_info else None
         sl_px = _round_price_to_tick(sl, tick_size) if sl is not None else None
 
@@ -1702,7 +2073,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
         tp_orders: list[dict[str, str]] = []
         if SETTINGS.tp_enabled and r_value > 0:
-            tp_orders = _build_tp_targets(
+            tp_orders = await _build_tp_targets(
                 inst_id=inst_id,
                 side=side,
                 entry_price=float(entry_price),
@@ -1758,7 +2129,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if SETTINGS.exchange == "extended":
         # Get instrument info for price precision
-        inst_info = exchange.get_instrument_info(inst_id=inst_id)
+        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
         tick_size = inst_info.get("tickSz") if inst_info else None
         sl_px = _round_price_to_tick(sl, tick_size) if sl is not None else None
 
@@ -1865,7 +2236,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                     "order": resp,
                     "warning": "tp_skipped_no_position",
                 }
-            tp_orders = _place_extended_tp_orders(
+            tp_orders = await _place_extended_tp_orders(
                 inst_id=inst_id,
                 side=side,
                 pos_side=pos_side,
@@ -1899,57 +2270,414 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             "tp_orders": tp_orders,
         }
 
-    # 3. 下纯市价单（不附加止损）
+    # 3. 下单（市价单或分级挂单）
     ts = int(time.time())
     rnd = random.randint(100, 999)
-    cl_ord_id = f"tv{ts}{rnd}{side[:1]}"[:32]
 
-    resp = exchange.place_order(
-        inst_id=inst_id,
-        td_mode=SETTINGS.okx_td_mode,
-        side=side,
-        pos_side=pos_side,
-        ord_type="market",
-        sz=order_sz,
-        px=None,
-        cl_ord_id=cl_ord_id[:32],
-        sl_trigger_px=None,
-        tp_trigger_px=None,
-        reduce_only=False,
-    )
-    if str(resp.get("code", "")) not in {"0", "success"}:
-        notify_error(
-            f"okx entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
+    # Get instrument info for price precision
+    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+    tick_size = inst_info.get("tickSz") if inst_info else None
+
+    ladder_orders = []  # Track all ladder orders
+    market_sz = None
+
+    if SETTINGS.ladder_enabled:
+        # Ladder orders: 70% market + 30% limit (L1: 20%, L2: 10%)
+        from decimal import Decimal, ROUND_DOWN
+
+        total_sz = Decimal(str(order_sz))
+
+        # Get instrument lot size info for proper normalization
+        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+        lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+        min_order_sz = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+        # Calculate sizes for each order type and normalize to lot size
+        market_sz_raw = total_sz * Decimal(str(SETTINGS.ladder_market_pct))
+        level1_sz_raw = total_sz * Decimal(str(SETTINGS.ladder_level1_pct))
+        level2_sz_raw = total_sz * Decimal(str(SETTINGS.ladder_level2_pct))
+        level3_sz_raw = total_sz * Decimal(str(SETTINGS.ladder_level3_pct))
+
+        market_sz = _normalize_qty(market_sz_raw, step=lot_step, min_sz=min_order_sz) if market_sz_raw > 0 else Decimal("0")
+        level1_sz = _normalize_qty(level1_sz_raw, step=lot_step, min_sz=min_order_sz) if level1_sz_raw > 0 else Decimal("0")
+        level2_sz = _normalize_qty(level2_sz_raw, step=lot_step, min_sz=min_order_sz) if level2_sz_raw > 0 else Decimal("0")
+        level3_sz = _normalize_qty(level3_sz_raw, step=lot_step, min_sz=min_order_sz) if level3_sz_raw > 0 else Decimal("0")
+
+        # 1. Place market order first (70%)
+        market_cl_ord_id = f"tv{ts}{rnd}{side[:1]}M"[:32]
+        market_filled_price = None
+
+        if market_sz > 0:
+            market_resp = exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=side,
+                pos_side=pos_side,
+                ord_type="market",
+                sz=str(market_sz),
+                px=None,
+                cl_ord_id=market_cl_ord_id,
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=False,
+            )
+
+            if str(market_resp.get("code", "")) not in {"0", "success"}:
+                notify_error(
+                    f"okx ladder market order rejected instId={inst_id} side={side} sz={market_sz} resp={market_resp}"
+                )
+            else:
+                logger.info("tv_webhook ladder_market_order_placed sz=%s", market_sz)
+
+                # Wait briefly for market order to fill
+                await asyncio.sleep(0.5)
+                try:
+                    market_ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=market_cl_ord_id)
+                    if market_ord_info and market_ord_info.get("avgPx"):
+                        market_filled_price = float(market_ord_info.get("avgPx"))
+                        market_filled_sz = float(market_ord_info.get("accFillSz", "0") or "0")
+                        ladder_orders.append({
+                            "cl_ord_id": market_cl_ord_id,
+                            "size": market_filled_sz,
+                            "price": market_filled_price,
+                            "level": "MARKET",
+                            "bps": 0,
+                        })
+                        logger.info("tv_webhook ladder_market_filled px=%.6f sz=%.1f", market_filled_price, market_filled_sz)
+                except Exception as e:
+                    logger.warning("tv_webhook market_order_query_failed err=%s", str(e))
+
+        # 2. Place limit orders (30%: L1=20%, L2=10%)
+        signal_price = float(entry_price)
+        if side == "buy":
+            # Buy lower: signal_price * (1 - bps/10000)
+            level1_px = signal_price * (1 - SETTINGS.ladder_level1_bps / 10000)
+            level2_px = signal_price * (1 - SETTINGS.ladder_level2_bps / 10000)
+            level3_px = signal_price * (1 - SETTINGS.ladder_level3_bps / 10000)
+        else:
+            # Sell higher: signal_price * (1 + bps/10000)
+            level1_px = signal_price * (1 + SETTINGS.ladder_level1_bps / 10000)
+            level2_px = signal_price * (1 + SETTINGS.ladder_level2_bps / 10000)
+            level3_px = signal_price * (1 + SETTINGS.ladder_level3_bps / 10000)
+
+        # Place limit orders
+        limit_levels = [
+            (level1_sz, level1_px, "L1", SETTINGS.ladder_level1_bps),
+            (level2_sz, level2_px, "L2", SETTINGS.ladder_level2_bps),
+            (level3_sz, level3_px, "L3", SETTINGS.ladder_level3_bps),
+        ]
+
+        for sz, px, label, bps in limit_levels:
+            if sz <= 0:
+                continue
+
+            limit_cl_ord_id = f"tv{ts}{rnd}{side[:1]}{label}"[:32]
+            px_rounded = _round_price_to_tick(px, tick_size)
+
+            resp = exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=side,
+                pos_side=pos_side,
+                ord_type="limit",
+                sz=str(sz),
+                px=px_rounded,
+                cl_ord_id=limit_cl_ord_id,
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=False,
+            )
+
+            if str(resp.get("code", "")) not in {"0", "success"}:
+                notify_error(
+                    f"okx ladder {label} rejected instId={inst_id} side={side} sz={sz} px={px_rounded} resp={resp}"
+                )
+            else:
+                ladder_orders.append({
+                    "cl_ord_id": limit_cl_ord_id,
+                    "size": float(sz),
+                    "price": float(px_rounded),
+                    "level": label,
+                    "bps": bps,
+                })
+                logger.info("tv_webhook ladder_limit_order_placed level=%s sz=%s px=%s bps=%.1f", label, sz, px_rounded, bps)
+
+                # Record pending order in state for later cancellation
+                # Convert inst_id to symbol format for Lighter compatibility
+                symbol_for_state = inst_id.replace("-USDT-SWAP", "/USDT")
+                state.add_pending_order(
+                    key=key,
+                    order_id=limit_cl_ord_id,
+                    symbol=symbol_for_state,
+                    level=label
+                )
+
+        notify_info(
+            f"okx ladder orders placed instId={inst_id} side={side} total_sz={order_sz} "
+            f"market={market_sz}({SETTINGS.ladder_market_pct:.0%}) "
+            f"limit={level1_sz + level2_sz + level3_sz}(L1={level1_sz} L2={level2_sz} L3={level3_sz}) "
+            f"signal={signal_price:.6f}"
         )
+
+        # Use market order's cl_ord_id as reference
+        cl_ord_id = market_cl_ord_id
+    else:
+        # Single market order (original logic)
+        cl_ord_id = f"tv{ts}{rnd}{side[:1]}"[:32]
+
+        resp = exchange.place_order(
+            inst_id=inst_id,
+            td_mode=SETTINGS.okx_td_mode,
+            side=side,
+            pos_side=pos_side,
+            ord_type="market",
+            sz=order_sz,
+            px=None,
+            cl_ord_id=cl_ord_id[:32],
+            sl_trigger_px=None,
+            tp_trigger_px=None,
+            reduce_only=False,
+        )
+        if str(resp.get("code", "")) not in {"0", "success"}:
+            notify_error(
+                f"okx entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
+            )
 
     # 4. 等待成交并获取实际成交价（带重试机制）
     filled_price = None
-    max_retries = 5
-    for retry in range(max_retries):
-        await asyncio.sleep(0.3 * (retry + 1))  # Progressive backoff: 0.3s, 0.6s, 0.9s, 1.2s, 1.5s
-        try:
-            ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
-            if ord_info and ord_info.get("avgPx"):
-                filled_price = float(ord_info.get("avgPx"))
-                logger.info("tv_webhook order_filled cl_ord_id=%s filled_price=%.4f retry=%d",
-                           cl_ord_id, filled_price, retry)
-                notify_info(
-                    f"okx entry filled instId={inst_id} side={side} px={filled_price:.6f} sz={order_sz}"
-                )
-                break
-            # Check order state
-            state_val = ord_info.get("state", "").lower() if ord_info else ""
-            if state_val in {"filled", "partially_filled"}:
-                # Order is filled but avgPx might be processing
+    total_filled_sz = 0.0
+    ord_info = None
+    ord_info = None
+    entry_source = "unknown"
+
+    if SETTINGS.ladder_enabled and ladder_orders:
+        if SETTINGS.exchange == "lighter":
+            # Lighter fills: try trade history (order_index) first, then position as fallback.
+            await asyncio.sleep(1.0)
+            filled_price = None
+            total_filled_sz = 0.0
+            entry_source = "signal"
+            try:
+                store = getattr(exchange, "_okx_compat_state", None)
+                if store:
+                    filled_value = 0.0
+                    for ladder_ord in ladder_orders:
+                        cl_ord_id = ladder_ord.get("cl_ord_id", "")
+                        order_id = store.get("cl_to_order", {}).get(cl_ord_id, cl_ord_id)
+                        try:
+                            fills = exchange.get_order_fills(inst_id=inst_id, order_id=str(order_id))
+                        except Exception:
+                            fills = None
+                        if fills:
+                            fill_sz, fill_px = fills
+                            if fill_sz > 0 and fill_px > 0:
+                                total_filled_sz += fill_sz
+                                filled_value += fill_sz * fill_px
+                    if total_filled_sz > 0 and filled_value > 0:
+                        filled_price = filled_value / total_filled_sz
+                        entry_source = "fills"
+            except Exception as e:
+                logger.warning("tv_webhook lighter_fill_fetch_failed err=%s", str(e))
+
+            for _ in range(3):
+                try:
+                    pos = exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+                    if pos and float(pos.get("pos", "0") or "0") > 0:
+                        total_filled_sz = float(pos.get("pos", "0") or "0")
+                        avg_px = pos.get("avgPx")
+                        if avg_px:
+                            avg_val = float(avg_px)
+                            if avg_val > 0:
+                                filled_price = avg_val
+                                entry_source = "position"
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+            if filled_price is None:
+                filled_price = market_filled_price or float(entry_price)
+                entry_source = "signal"
+            if total_filled_sz == 0.0:
+                total_filled_sz = float(market_sz) if market_sz is not None else float(order_sz)
+            logger.info(
+                "tv_webhook ladder_lighter_assume_filled px=%.6f sz=%.1f source=%s",
+                filled_price,
+                total_filled_sz,
+                entry_source,
+            )
+        else:
+            # For ladder orders: calculate weighted average fill price using TF-based wait times
+            candle_seconds = tf_to_seconds(tf)
+            base_wait_candles = get_ladder_wait_candles(tf)
+            max_wait_candles = get_ladder_max_wait_candles(tf)
+            price_distance_threshold = get_ladder_price_distance(tf)
+
+            base_wait_time = candle_seconds * base_wait_candles  # e.g., 5m * 0.5 = 150s
+            max_wait_time = candle_seconds * max_wait_candles    # e.g., 5m * 1 = 300s
+            check_interval = min(10, max(2, candle_seconds / 30))  # Check every 2-10s depending on TF
+
+            max_retries = int(max_wait_time / check_interval)
+            has_partial_fills = False
+
+            logger.info("tv_webhook ladder_wait_config tf=%s candle_sec=%d base_wait=%.1fs max_wait=%.1fs interval=%.1fs",
+                       tf, candle_seconds, base_wait_time, max_wait_time, check_interval)
+
+            # Initial check after brief delay
+            await asyncio.sleep(1.0)
+
+            filled_levels = []
+            for retry in range(max_retries):
+                if retry > 0:
+                    await asyncio.sleep(check_interval)
+
+                total_filled_value = 0.0
+                total_filled_sz = 0.0
+                all_checked = True
+
+                for ladder_ord in ladder_orders:
+                    try:
+                        ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                        if ord_info:
+                            order_state = ord_info.get("state", "").lower()
+                            avg_px = ord_info.get("avgPx")
+                            acc_fill_sz = float(ord_info.get("accFillSz", "0") or "0")
+
+                            if avg_px and acc_fill_sz > 0:
+                                px = float(avg_px)
+                                total_filled_value += px * acc_fill_sz
+                                total_filled_sz += acc_fill_sz
+                                if ladder_ord["level"] not in [f["level"] for f in filled_levels]:
+                                    filled_levels.append({
+                                        "level": ladder_ord["level"],
+                                        "price": px,
+                                        "size": acc_fill_sz,
+                                    })
+                            elif order_state == "live":
+                                all_checked = False  # Still waiting for this order
+                    except Exception as e:
+                        logger.warning("tv_webhook ladder_query_failed level=%s err=%s", ladder_ord["level"], str(e))
+                        all_checked = False
+
+                # Calculate weighted average
+                if total_filled_sz > 0:
+                    filled_price = total_filled_value / total_filled_sz
+                    has_partial_fills = True
+
+                    elapsed_time = (retry + 1) * check_interval
+                    logger.info("tv_webhook ladder_filled avg_px=%.4f total_sz=%.1f levels=%d elapsed=%.1fs retry=%d",
+                               filled_price, total_filled_sz, len(filled_levels), elapsed_time, retry)
+
+                    # Check if should stop waiting
+                    should_stop = False
+                    if all_checked:
+                        # All orders checked
+                        should_stop = True
+                    elif elapsed_time >= max_wait_time:
+                        # Max wait time exceeded
+                        logger.info("tv_webhook max_wait_reached elapsed=%.1fs max=%.1fs", elapsed_time, max_wait_time)
+                        should_stop = True
+
+                    if should_stop:
+                        notify_info(
+                            f"okx ladder filled instId={inst_id} side={side} avg_px={filled_price:.6f} "
+                            f"sz={total_filled_sz:.1f}/{order_sz} levels={len(filled_levels)} "
+                            f"wait={elapsed_time:.1f}s"
+                        )
+
+                        # Cancel any unfilled limit orders (skip market order)
+                        if total_filled_sz < float(order_sz):
+                            logger.info("tv_webhook canceling_unfilled_ladder_orders filled=%.1f planned=%s",
+                                       total_filled_sz, order_sz)
+                            for ladder_ord in ladder_orders:
+                                if ladder_ord["level"] == "MARKET":
+                                    continue  # Skip market order (already filled)
+                                try:
+                                    ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                    if ord_info and ord_info.get("state", "").lower() in {"live", "partially_filled"}:
+                                        cancel_resp = exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                        if str(cancel_resp.get("code", "")) in {"0", "success"}:
+                                            logger.info("tv_webhook canceled_ladder_order level=%s", ladder_ord["level"])
+                                        else:
+                                            logger.warning("tv_webhook cancel_ladder_failed level=%s resp=%s",
+                                                          ladder_ord["level"], cancel_resp)
+                                except Exception as e:
+                                    logger.warning("tv_webhook cancel_ladder_error level=%s err=%s",
+                                                 ladder_ord["level"], str(e))
+
+                        # Clear pending orders from state (whether fully filled or partially filled with cancellations)
+                        state.clear_pending_orders(key)
+                        break
+                else:
+                    # No fills yet
+                    elapsed_time = (retry + 1) * check_interval
+
+                    if elapsed_time >= base_wait_time:
+                        # Base wait time exceeded with no fills - should only happen if market order failed
+                        logger.error("tv_webhook ladder_no_fills_canceling_all elapsed=%.1fs base_wait=%.1fs",
+                                   elapsed_time, base_wait_time)
+
+                        # Cancel all ladder orders
+                        for ladder_ord in ladder_orders:
+                            try:
+                                cancel_resp = exchange.cancel_order(inst_id=inst_id, cl_ord_id=ladder_ord["cl_ord_id"])
+                                if str(cancel_resp.get("code", "")) in {"0", "success"}:
+                                    logger.info("tv_webhook canceled_unfilled_ladder level=%s", ladder_ord["level"])
+                            except Exception as e:
+                                logger.warning("tv_webhook cancel_unfilled_error level=%s err=%s",
+                                             ladder_ord["level"], str(e))
+
+                        # Clear pending orders from state
+                        state.clear_pending_orders(key)
+
+                        # Return error to stop execution
+                        notify_error(
+                            f"⚠️ Ladder orders not filled\n"
+                            f"Symbol: {inst_id}\n"
+                            f"Direction: {side}\n"
+                            f"Planned: {order_sz} contracts\n"
+                            f"Filled: 0 (market order may have failed)\n"
+                            f"Action: Canceled all orders, stopped execution"
+                        )
+                        _log_decision(inst_id, tf, action="error", reason="ladder_no_fills")
+                        return {
+                            "ok": False,
+                            "error": "ladder_no_fills",
+                            "instId": inst_id,
+                            "side": side,
+                            "planned_sz": order_sz,
+                            "filled_sz": 0,
+                        }
+                        break
+            # End of non-lighter ladder wait
+    else:
+        # Single order (market or limit): original logic
+        max_retries = 10  # Default for non-ladder orders
+        for retry in range(max_retries):
+            await asyncio.sleep(0.3 * (retry + 1))  # Progressive backoff
+            try:
+                ord_info = exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
+                if ord_info and ord_info.get("avgPx"):
+                    filled_price = float(ord_info.get("avgPx"))
+                    total_filled_sz = float(ord_info.get("accFillSz", order_sz))
+                    logger.info("tv_webhook order_filled cl_ord_id=%s filled_price=%.4f retry=%d",
+                               cl_ord_id, filled_price, retry)
+                    notify_info(
+                        f"okx entry filled instId={inst_id} side={side} px={filled_price:.6f} sz={total_filled_sz}"
+                    )
+                    break
+                # Check order state
+                state_val = ord_info.get("state", "").lower() if ord_info else ""
+                if state_val in {"filled", "partially_filled"}:
+                    if retry < max_retries - 1:
+                        continue
+            except Exception as e:
+                logger.warning("tv_webhook order_query_failed retry=%d err=%s", retry, str(e))
                 if retry < max_retries - 1:
                     continue
-        except Exception as e:
-            logger.warning("tv_webhook order_query_failed retry=%d err=%s", retry, str(e))
-            if retry < max_retries - 1:
-                continue
 
     if filled_price is None:
         filled_price = float(entry_price)
+        total_filled_sz = float(order_sz) if total_filled_sz == 0 else total_filled_sz
         logger.warning("tv_webhook no_filled_price_after_retries using_estimated price=%.4f", filled_price)
 
     # 5. 基于实际成交价重新计算止损价
@@ -1969,16 +2697,28 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 side=side,
                 entry_price=filled_price,
                 candles=candles,
-                lookback_bars=SETTINGS.stop_lookback_bars,
+                lookback_bars=get_lookback_bars(tf),
                 atr_len=SETTINGS.atr_len,
                 atr_buffer_mult=SETTINGS.atr_buffer_mult,
                 min_buffer_bps=SETTINGS.min_buffer_bps,
             )
 
         if sl_actual:
-            sl = sl_actual
-            r_value_actual = abs(filled_price - sl)
-            logger.info("tv_webhook recalculated_sl entry=%.4f sl=%.4f r=%.4f", filled_price, sl, r_value_actual)
+            # Validate recalculated stop loss
+            sl_valid = True
+            if side == "buy" and sl_actual >= filled_price:
+                logger.error("tv_webhook recalculated_sl_invalid_buy sl=%.4f >= entry=%.4f", sl_actual, filled_price)
+                sl_valid = False
+            elif side == "sell" and sl_actual <= filled_price:
+                logger.error("tv_webhook recalculated_sl_invalid_sell sl=%.4f <= entry=%.4f", sl_actual, filled_price)
+                sl_valid = False
+
+            if sl_valid:
+                sl = sl_actual
+                r_value_actual = abs(filled_price - sl)
+                logger.info("tv_webhook recalculated_sl entry=%.4f sl=%.4f r=%.4f", filled_price, sl, r_value_actual)
+            else:
+                logger.warning("tv_webhook using_original_sl sl=%.4f (recalculated was invalid)", sl)
         else:
             logger.warning("tv_webhook failed_to_recalculate_sl using_original sl=%.4f", sl)
 
@@ -1988,15 +2728,101 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         entry_price=float(filled_price),
         stop_loss=float(sl),
     )
+    state.set_entry(
+        inst_id=inst_id,
+        side=side,
+        entry_price=float(filled_price),
+        stop_loss=float(sl),
+    )
+    if SETTINGS.exchange == "lighter":
+        logger.info(
+            "lighter entry persisted instId=%s side=%s entry=%.6f sl=%.6f source=%s",
+            inst_id,
+            side,
+            float(filled_price),
+            float(sl),
+            entry_source,
+        )
 
     # 6. 下单独的止损单
     sl_side = "sell" if side == "buy" else "buy"
     sl_order_success = False
     sl_failure_reason = ""
 
-    # Get instrument info for price precision
-    inst_info = exchange.get_instrument_info(inst_id=inst_id)
-    tick_size = inst_info.get("tickSz") if inst_info else None
+    # Use actual filled size for SL order, normalized to lot size
+    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+    lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+    min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+    filled_sz_decimal = Decimal(str(total_filled_sz)) if total_filled_sz > 0 else Decimal(str(order_sz))
+    normalized_sl_sz = _normalize_qty(filled_sz_decimal, step=lot_step, min_sz=min_order)
+    sl_order_sz = _format_decimal(normalized_sl_sz)
+
+    # Check current market price before placing SL order
+    # If price has already moved past SL, close immediately instead
+    try:
+        current_price = exchange.get_last_price(inst_id=inst_id) or 0.0
+
+        if current_price > 0:
+            # For long: SL should be below current price
+            # For short: SL should be above current price
+            sl_invalid = False
+            if side == "buy" and sl >= current_price:
+                sl_invalid = True
+                logger.warning("tv_webhook sl_price_invalid_long current=%.4f sl=%.4f (SL must be < current)",
+                              current_price, sl)
+            elif side == "sell" and sl <= current_price:
+                sl_invalid = True
+                logger.warning("tv_webhook sl_price_invalid_short current=%.4f sl=%.4f (SL must be > current)",
+                              current_price, sl)
+
+            if sl_invalid:
+                # Price already past SL, close position immediately
+                logger.error("tv_webhook sl_already_breached closing_immediately current=%.4f sl=%.4f",
+                            current_price, sl)
+
+                # Cancel any pending ladder orders before closing
+                await _cancel_pending_ladder_orders(key, inst_id, exchange)
+
+                notify_error(
+                    f"⚠️ 止损已触发 - 立即平仓\n"
+                    f"交易对: {inst_id}\n"
+                    f"方向: {side}\n"
+                    f"成交价: {filled_price:.6f}\n"
+                    f"止损位: {sl:.6f}\n"
+                    f"当前价: {current_price:.6f}\n"
+                    f"数量: {sl_order_sz}"
+                )
+                # Try to close position immediately
+                close_resp = exchange.place_order(
+                    inst_id=inst_id,
+                    td_mode=SETTINGS.okx_td_mode,
+                    side=sl_side,
+                    pos_side=pos_side,
+                    ord_type="market",
+                    sz=sl_order_sz,
+                    px=None,
+                    reduce_only=True,
+                )
+                if str(close_resp.get("code", "")) in {"0", "success"}:
+                    logger.info("tv_webhook emergency_close_success sz=%s resp=%s", sl_order_sz, close_resp)
+                    # Skip SL order placement since we closed
+                    sl_order_success = True
+                    return {
+                        "ok": True,
+                        "action": "emergency_close",
+                        "instId": inst_id,
+                        "side": side,
+                        "entry": float(filled_price),
+                        "sl": sl,
+                        "current_price": current_price,
+                        "closed_sz": sl_order_sz,
+                    }
+                else:
+                    logger.error("tv_webhook emergency_close_failed resp=%s", close_resp)
+                    sl_failure_reason = f"emergency_close_failed: {close_resp}"
+    except Exception as e:
+        logger.warning("tv_webhook market_price_check_failed err=%s continuing_with_sl", str(e))
 
     try:
         sl_resp = exchange.place_algo_order(
@@ -2005,7 +2831,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             side=sl_side,
             pos_side=pos_side,
             ord_type="conditional",
-            sz=order_sz,
+            sz=sl_order_sz,
             sl_trigger_px=_round_price_to_tick(sl, tick_size),
             sl_ord_px="-1",
         )
@@ -2043,7 +2869,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 side=sl_side,
                 pos_side=pos_side,
                 ord_type="limit",
-                sz=order_sz,
+                sz=sl_order_sz,
                 px=_round_price_to_tick(sl, tick_size),
                 cl_ord_id=f"{cl_ord_id}_slb"[:32],
                 sl_trigger_px=None,
@@ -2090,9 +2916,14 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         emergency_close_success = False
         emergency_close_resp = None
         try:
+            # Cancel any pending ladder orders before emergency close
+            await _cancel_pending_ladder_orders(key, inst_id, exchange)
+
+            # Use actual filled size for emergency close
+            emergency_sz = str(total_filled_sz) if total_filled_sz > 0 else order_sz
             logger.critical(
                 "tv_webhook attempting_emergency_close instId=%s posSide=%s sz=%s",
-                inst_id, pos_side, order_sz
+                inst_id, pos_side, emergency_sz
             )
             emergency_close_resp = exchange.place_order(
                 inst_id=inst_id,
@@ -2100,7 +2931,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 side=sl_side,
                 pos_side=pos_side,
                 ord_type="market",
-                sz=order_sz,
+                sz=emergency_sz,
                 px=None,
                 cl_ord_id=f"{cl_ord_id}_emerg"[:32],
                 sl_trigger_px=None,
@@ -2115,7 +2946,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 notify_error(
                     f"⚠️ Emergency close executed: {inst_id}\n"
                     f"Side: {pos_side}\n"
-                    f"Size: {order_sz}\n"
+                    f"Size: {emergency_sz}\n"
                     f"Reason: SL order failed\n"
                     f"Response: {emergency_close_resp.get('code')}"
                 )
@@ -2157,8 +2988,54 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 f"⚠️ Position is being monitored by emergency handler"
             )
 
-            # Even though we failed, continue to mark the trade so we can track it
-            # The emergency handler will monitor this position
+            # DO NOT register to TradeManager since position has no protection
+            # Emergency handler will monitor this position separately
+            state.mark_traded(key)
+            state.clear_zone(key)
+            return {
+                "ok": False,
+                "error": "stop_loss_failed_no_protection",
+                "instId": inst_id,
+                "side": side,
+                "posSide": pos_side,
+                "entry": filled_price,
+                "intended_sl": sl,
+                "size": order_sz,
+                "warning": "Position has NO STOP LOSS protection - emergency handler monitoring",
+            }
+
+    # 6.5 Lighter: place TP orders directly (no TradeManager support)
+    tp_orders: list[dict[str, str]] = []
+    if SETTINGS.exchange == "lighter" and SETTINGS.tp_enabled:
+        r_value_final = abs(filled_price - float(sl))
+        if r_value_final > 0:
+            tp_orders = await _build_tp_targets(
+                inst_id=inst_id,
+                side=side,
+                entry_price=filled_price,
+                sl=float(sl),
+                total_sz=Decimal(str(total_filled_sz)) if total_filled_sz > 0 else Decimal(str(order_sz)),
+                tick_size=tick_size,
+            )
+            for target in tp_orders:
+                tp_resp = exchange.place_algo_order(
+                    inst_id=inst_id,
+                    td_mode=SETTINGS.okx_td_mode,
+                    side="sell" if side == "buy" else "buy",
+                    pos_side=pos_side,
+                    ord_type="conditional",
+                    sz=target["size"],
+                    tp_trigger_px=target["price"],
+                    tp_ord_px="-1",
+                )
+                if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                    notify_error(
+                        f"lighter tp failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+                    )
+            if tp_orders:
+                notify_info(
+                    f"lighter tp orders placed instId={inst_id} count={len(tp_orders)}"
+                )
 
     # 7. 标记交易和清除zone
     state.mark_traded(key)
@@ -2170,8 +3047,10 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     if SETTINGS.tp_enabled:
         tp = take_profit_price(side=side, entry_price=filled_price, stop_loss=float(sl), rr=SETTINGS.tp4_r)
 
-    # 9. 注册TradePlan给TradeManager
+    # 9. 注册TradePlan给TradeManager (only if SL is successfully placed)
     if manager is not None:
+        # Use actual filled size for trade plan
+        plan_sz = str(total_filled_sz) if total_filled_sz > 0 else order_sz
         await manager.upsert_plan(
             key,
             TradePlan(
@@ -2182,7 +3061,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 td_mode=SETTINGS.okx_td_mode,
                 entry_price=filled_price,
                 stop_loss=float(sl),
-                total_sz=Decimal(str(order_sz)),
+                total_sz=Decimal(plan_sz),
                 r_value=r_value_final,
                 cl_ord_id=cl_ord_id[:32],
             ),

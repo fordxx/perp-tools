@@ -23,6 +23,10 @@ class InMemoryState:
     def get_zone(self, key: str) -> ZoneState | None:
         return self.zone_by_key.get(key)
 
+    def clear_zone(self, key: str) -> None:
+        """Clear zone state after it has been used for trading."""
+        self.zone_by_key.pop(key, None)
+
     def can_trade(self, key: str, cooldown_seconds: int) -> bool:
         last_ts = self.last_trade_ts_by_key.get(key)
         if last_ts is None:

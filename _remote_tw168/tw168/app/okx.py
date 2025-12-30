@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -59,25 +58,14 @@ class OKXClient:
         # Apply rate limiting if enabled
         if self.enable_rate_limit:
             try:
-                from app.rate_limiter import acquire_okx_trading, acquire_okx_market
-                loop = None
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    pass
-
-                if loop and loop.is_running():
-                    # We're in an async context
-                    if is_trading:
-                        future = asyncio.ensure_future(acquire_okx_trading())
-                        acquired = asyncio.get_event_loop().run_until_complete(future)
-                    else:
-                        future = asyncio.ensure_future(acquire_okx_market())
-                        acquired = asyncio.get_event_loop().run_until_complete(future)
-
-                    if not acquired:
-                        self.logger.warning("Rate limit timeout for OKX %s request to %s",
-                                          "trading" if is_trading else "market", path)
+                from app.rate_limiter import acquire_okx_market_sync, acquire_okx_trading_sync
+                acquired = acquire_okx_trading_sync() if is_trading else acquire_okx_market_sync()
+                if not acquired:
+                    self.logger.warning(
+                        "Rate limit timeout for OKX %s request to %s",
+                        "trading" if is_trading else "market",
+                        path,
+                    )
             except Exception as e:
                 self.logger.debug("Rate limiter not available: %s", str(e))
 
@@ -245,6 +233,48 @@ class OKXClient:
             payload["tpOrdPx"] = tp_ord_px or "-1"
 
         return self.request("POST", "/api/v5/trade/order-algo", json_body=payload, is_trading=True)
+
+    def get_algo_orders(self, *, inst_id: str, ord_type: str = "conditional") -> list[dict[str, Any]]:
+        """Get algorithmic orders (stop-loss, take-profit).
+
+        Args:
+            inst_id: Instrument ID
+            ord_type: Order type - "conditional" (SL/TP), "oco", "trigger", "iceberg", "twap"
+
+        Returns:
+            List of algo orders
+        """
+        try:
+            params = {"instId": inst_id, "ordType": ord_type}
+            payload = self.request("GET", "/api/v5/trade/orders-algo-pending", params=params, is_trading=True)
+            return payload.get("data") or []
+        except Exception:
+            return []
+
+    def cancel_algo_order(self, *, inst_id: str, algo_id: str) -> Any:
+        """Cancel algorithmic order (stop-loss or take-profit).
+
+        Args:
+            inst_id: Instrument ID
+            algo_id: Algo order ID to cancel
+        """
+        payload = [{"instId": inst_id, "algoId": algo_id}]
+        return self.request("POST", "/api/v5/trade/cancel-algos", json_body=payload, is_trading=True)
+
+    def cancel_order(self, *, inst_id: str, ord_id: str | None = None, cl_ord_id: str | None = None) -> Any:
+        """Cancel a normal order (limit or market).
+
+        Args:
+            inst_id: Instrument ID
+            ord_id: Exchange order ID (optional if cl_ord_id provided)
+            cl_ord_id: Client order ID (optional if ord_id provided)
+        """
+        payload: dict[str, Any] = {"instId": inst_id}
+        if ord_id:
+            payload["ordId"] = ord_id
+        if cl_ord_id:
+            payload["clOrdId"] = cl_ord_id
+        return self.request("POST", "/api/v5/trade/cancel-order", json_body=payload, is_trading=True)
 
     def get_instrument_info(self, *, inst_id: str) -> dict[str, Any] | None:
         """Get instrument information including contract value (ctVal)."""

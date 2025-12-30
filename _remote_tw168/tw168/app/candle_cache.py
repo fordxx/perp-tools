@@ -165,7 +165,7 @@ async def _okx_candles_loop(
                     consecutive_errors = 0
 
                     await ws.send(json.dumps({"op": "subscribe", "args": sub_args}))
-                    logger.info("OKX candle ws subscribed to %d symbols", len(sub_args))
+                    logger.info("OKX candle ws subscribed to %d channels (symbols x timeframes)", len(sub_args))
 
                     async for raw in ws:
                         msg = json.loads(raw)
@@ -256,13 +256,16 @@ async def _okx_candles_loop_dynamic(
                 if subscribed:
                     items = list(subscribed)
                     chunk_size = 80
+                    logger.info(f"OKX candle ws re-subscribing to {len(items)} channels on reconnect")
                     for i in range(0, len(items), chunk_size):
                         await _send_subscribe(ws, items[i : i + chunk_size])
+                    logger.info(f"OKX candle ws re-subscription sent ({len(items)} channels)")
 
                 async def _sender() -> None:
                     while not stop_event.is_set():
                         inst_id, tf = await sub_queue.get()
                         await _send_subscribe(ws, [(inst_id, tf)])
+                        logger.info(f"OKX candle ws dynamic subscription sent: {inst_id} {tf}")
 
                 sender_task = asyncio.create_task(_sender())
 
@@ -364,6 +367,7 @@ class CandleWsManager:
         "extended_subscribed": 0,
         "extended_rejected": 0,
     })
+    _first_candle_received: set[tuple[str, str]] = field(default_factory=set)
 
     def start(self) -> None:
         self._stop_event = asyncio.Event()
@@ -427,6 +431,7 @@ class CandleWsManager:
         self._okx_subscribed.add(key)
         self._subscription_stats["okx_subscribed"] += 1
         await self._okx_queue.put(key)
+        logger.debug(f"OKX candle ws queued subscription: {inst_id} {tf} (total: {len(self._okx_subscribed)})")
 
     async def _ensure_extended(self, *, inst_id: str, tf: str) -> None:
         import logging

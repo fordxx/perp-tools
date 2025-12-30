@@ -5,12 +5,23 @@ import logging
 import os
 import sqlite3
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from perpbot.models import AlertRecord, ArbitrageOpportunity, ProfitResult
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_DB_RETENTION_DAYS = 3
+_DEFAULT_DB_MAX_ROWS = 50_000
+_DEFAULT_DB_COMPACT_INTERVAL_SECONDS = 60 * 60
+
+
+def _getenv_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
 
 
 class TradeRecorder:
@@ -19,6 +30,12 @@ class TradeRecorder:
     def __init__(self, path: str) -> None:
         self.path = path
         self.is_sqlite = path.endswith(".db") or path.endswith(".sqlite")
+        self._retention_days = _getenv_int("PERPBOT_DB_RETENTION_DAYS", _DEFAULT_DB_RETENTION_DAYS)
+        self._max_rows = _getenv_int("PERPBOT_TRADES_DB_MAX_ROWS", _DEFAULT_DB_MAX_ROWS)
+        self._compact_interval_seconds = _getenv_int(
+            "PERPBOT_DB_COMPACT_INTERVAL_SECONDS", _DEFAULT_DB_COMPACT_INTERVAL_SECONDS
+        )
+        self._last_compact_ts = 0.0
         if self.is_sqlite:
             self._init_db()
         else:
@@ -45,6 +62,41 @@ class TradeRecorder:
                 );
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
+
+    def _maybe_compact_db(self, conn: sqlite3.Connection) -> None:
+        if self._compact_interval_seconds <= 0:
+            return
+        now = datetime.utcnow().timestamp()
+        if (now - self._last_compact_ts) < self._compact_interval_seconds:
+            return
+
+        cutoff = None
+        if self._retention_days > 0:
+            cutoff = (datetime.utcnow() - timedelta(days=self._retention_days)).isoformat()
+
+        conn.commit()
+        deleted = 0
+        if cutoff:
+            cur = conn.execute("DELETE FROM trades WHERE timestamp < ?", (cutoff,))
+            deleted += cur.rowcount if cur.rowcount is not None else 0
+        if self._max_rows > 0:
+            cur = conn.execute(
+                """
+                DELETE FROM trades
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM trades ORDER BY timestamp DESC LIMIT ?
+                )
+                """,
+                (self._max_rows,),
+            )
+            deleted += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+
+        if deleted > 0:
+            conn.execute("VACUUM")
+
+        self._last_compact_ts = now
 
     def _init_csv(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -101,6 +153,7 @@ class TradeRecorder:
                         error_message,
                     ),
                 )
+                self._maybe_compact_db(conn)
         else:
             with open(self.path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -157,6 +210,12 @@ class AlertRecorder:
     def __init__(self, path: str) -> None:
         self.path = path
         self.is_sqlite = path.endswith(".db") or path.endswith(".sqlite")
+        self._retention_days = _getenv_int("PERPBOT_DB_RETENTION_DAYS", _DEFAULT_DB_RETENTION_DAYS)
+        self._max_rows = _getenv_int("PERPBOT_ALERTS_DB_MAX_ROWS", _DEFAULT_DB_MAX_ROWS)
+        self._compact_interval_seconds = _getenv_int(
+            "PERPBOT_DB_COMPACT_INTERVAL_SECONDS", _DEFAULT_DB_COMPACT_INTERVAL_SECONDS
+        )
+        self._last_compact_ts = 0.0
         if self.is_sqlite:
             self._init_db()
         else:
@@ -177,6 +236,41 @@ class AlertRecorder:
                 );
                 """
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp)")
+
+    def _maybe_compact_db(self, conn: sqlite3.Connection) -> None:
+        if self._compact_interval_seconds <= 0:
+            return
+        now = datetime.utcnow().timestamp()
+        if (now - self._last_compact_ts) < self._compact_interval_seconds:
+            return
+
+        cutoff = None
+        if self._retention_days > 0:
+            cutoff = (datetime.utcnow() - timedelta(days=self._retention_days)).isoformat()
+
+        conn.commit()
+        deleted = 0
+        if cutoff:
+            cur = conn.execute("DELETE FROM alerts WHERE timestamp < ?", (cutoff,))
+            deleted += cur.rowcount if cur.rowcount is not None else 0
+        if self._max_rows > 0:
+            cur = conn.execute(
+                """
+                DELETE FROM alerts
+                WHERE rowid NOT IN (
+                    SELECT rowid FROM alerts ORDER BY timestamp DESC LIMIT ?
+                )
+                """,
+                (self._max_rows,),
+            )
+            deleted += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+
+        if deleted > 0:
+            conn.execute("VACUUM")
+
+        self._last_compact_ts = now
 
     def _init_csv(self) -> None:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
@@ -202,6 +296,7 @@ class AlertRecorder:
                         1 if alert.success else 0,
                     ),
                 )
+                self._maybe_compact_db(conn)
         else:
             with open(self.path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -239,4 +334,3 @@ class AlertRecorder:
 
 def profit_to_dict(profit: ProfitResult) -> dict:
     return asdict(profit)
-

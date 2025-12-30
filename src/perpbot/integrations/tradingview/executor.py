@@ -147,8 +147,21 @@ def execute_market_with_stop_loss(
             limit_price=None,  # Market order
         )
 
-        # Place order with hedge mode support (OKX-specific)
-        if exchange_name.lower() == "okx" and hasattr(exchange_client, 'place_open_order'):
+        allow_extended_tpsl = os.getenv("PERPBOT_EXTENDED_TPSL", "true").lower() in {"1", "true", "yes", "y", "on"}
+        tpsl_attached = False
+        if (
+            exchange_name.lower() == "extended"
+            and hasattr(exchange_client, "place_open_order_with_tpsl")
+            and (stop_loss_price or take_profit_price)
+            and allow_extended_tpsl
+        ):
+            order = exchange_client.place_open_order_with_tpsl(
+                order_req,
+                stop_loss_price=stop_loss_price,
+                take_profit_price=take_profit_price,
+            )
+            tpsl_attached = True
+        elif exchange_name.lower() == "okx" and hasattr(exchange_client, 'place_open_order'):
             # OKX client supports hedge_mode parameter
             order = exchange_client.place_open_order(order_req, hedge_mode=hedge_mode)
         else:
@@ -190,85 +203,89 @@ def execute_market_with_stop_loss(
             elapsed_ms=int((time.time() - start_ts) * 1000),
         )
 
-        # Step 3: Place stop-loss order if requested and we have a filled price
-        if place_stop_loss and stop_loss_price and filled_price > 0:
-            try:
-                sl_result = _place_stop_loss_order(
-                    exchange_client=exchange_client,
-                    exchange_name=exchange_name,
-                    symbol=symbol,
-                    canonical_symbol=canonical_symbol,
-                    side=side,
-                    size=size,
-                    stop_loss_price=stop_loss_price,
-                    entry_price=filled_price,
-                    hedge_mode=hedge_mode,
-                )
-                result.stop_loss_order = sl_result.order
-                if not sl_result.ok:
-                    logger.warning(
-                        "tv168_exec: stop-loss placement failed but entry filled error=%s",
-                        sl_result.error_msg
-                    )
-            except Exception as exc:
-                logger.exception("tv168_exec: stop-loss placement exception: %s", exc)
-
-        # Step 4: Place take-profit order if requested and we have a filled price
-        if take_profit_price and filled_price > 0:
-            try:
-                tp_result = _place_take_profit_order(
-                    exchange_client=exchange_client,
-                    exchange_name=exchange_name,
-                    symbol=symbol,
-                    canonical_symbol=canonical_symbol,
-                    side=side,
-                    size=size,
-                    take_profit_price=take_profit_price,
-                    entry_price=filled_price,
-                    hedge_mode=hedge_mode,
-                )
-                result.take_profit_order = tp_result.order
-                if not tp_result.ok:
-                    logger.warning(
-                        "tv168_exec: take-profit placement failed but entry filled error=%s",
-                        tp_result.error_msg
-                    )
-            except Exception as exc:
-                logger.exception("tv168_exec: take-profit placement exception: %s", exc)
-
-        # Step 5: Place Multi-Level Take-Profit orders (1.5R, 2.0R, 2.5R, 3.0R)
-        # This overrides Step 4 if valid SL and Entry are present
-        if stop_loss_price and filled_price > 0:
-             try:
-                tp_levels = _calculate_tp_levels(
-                    side=side,
-                    entry_price=filled_price,
-                    stop_loss=stop_loss_price,
-                    total_size=size
-                )
-                result.take_profit_levels = tp_levels
-                
-                for lvl in tp_levels:
-                    tp_res = _place_take_profit_order(
+        if tpsl_attached:
+            logger.info("tv168_exec: tpsl attached to entry order exchange=%s", exchange_name)
+        else:
+            # Step 3: Place stop-loss order if requested and we have a filled price
+            if place_stop_loss and stop_loss_price and filled_price > 0:
+                try:
+                    sl_result = _place_stop_loss_order(
                         exchange_client=exchange_client,
                         exchange_name=exchange_name,
                         symbol=symbol,
                         canonical_symbol=canonical_symbol,
                         side=side,
-                        size=lvl["size"],
-                        take_profit_price=lvl["price"],
+                        size=size,
+                        stop_loss_price=stop_loss_price,
                         entry_price=filled_price,
                         hedge_mode=hedge_mode,
                     )
-                    if tp_res.ok and tp_res.order:
-                        result.take_profit_orders.append(tp_res.order)
-                    else:
+                    result.stop_loss_order = sl_result.order
+                    if not sl_result.ok:
                         logger.warning(
-                            "tv168_exec: multi-tp level failed: price=%.4f size=%.4f error=%s",
-                            lvl["price"], lvl["size"], tp_res.error_msg
+                            "tv168_exec: stop-loss placement failed but entry filled error=%s",
+                            sl_result.error_msg
                         )
-             except Exception as exc:
-                logger.exception("tv168_exec: multi-tp placement exception: %s", exc)
+                except Exception as exc:
+                    logger.exception("tv168_exec: stop-loss placement exception: %s", exc)
+
+            # Step 4: Place take-profit order if requested and we have a filled price
+            # ONLY if we don't have stop_loss (multi-level TP requires SL)
+            if take_profit_price and filled_price > 0 and not stop_loss_price:
+                try:
+                    tp_result = _place_take_profit_order(
+                        exchange_client=exchange_client,
+                        exchange_name=exchange_name,
+                        symbol=symbol,
+                        canonical_symbol=canonical_symbol,
+                        side=side,
+                        size=size,
+                        take_profit_price=take_profit_price,
+                        entry_price=filled_price,
+                        hedge_mode=hedge_mode,
+                    )
+                    result.take_profit_order = tp_result.order
+                    if not tp_result.ok:
+                        logger.warning(
+                            "tv168_exec: take-profit placement failed but entry filled error=%s",
+                            tp_result.error_msg
+                        )
+                except Exception as exc:
+                    logger.exception("tv168_exec: take-profit placement exception: %s", exc)
+
+            # Step 5: Place Multi-Level Take-Profit orders (1.5R, 2.0R, 2.5R, 3.0R)
+            # This overrides Step 4 if valid SL and Entry are present
+            if stop_loss_price and filled_price > 0:
+                try:
+                    tp_levels = _calculate_tp_levels(
+                        side=side,
+                        entry_price=filled_price,
+                        stop_loss=stop_loss_price,
+                        total_size=size
+                    )
+                    result.take_profit_levels = tp_levels
+
+                    for lvl in tp_levels:
+                        tp_res = _place_take_profit_order(
+                            exchange_client=exchange_client,
+                            exchange_name=exchange_name,
+                            symbol=symbol,
+                            canonical_symbol=canonical_symbol,
+                            side=side,
+                            size=lvl["size"],
+                            take_profit_price=lvl["price"],
+                            entry_price=filled_price,
+                            hedge_mode=hedge_mode,
+                        )
+                        if tp_res.ok and tp_res.order:
+                            result.take_profit_orders.append(tp_res.order)
+                        else:
+                            logger.warning(
+                                "tv168_exec: multi-tp level failed: price=%.4f size=%.4f error=%s",
+                                lvl["price"], lvl["size"], tp_res.error_msg
+                            )
+                except Exception as exc:
+                    logger.exception("tv168_exec: multi-tp placement exception: %s", exc)
 
         return result
 
@@ -383,6 +400,7 @@ def _place_take_profit_order(
     hedge_mode: bool,
 ) -> ExecutionResult:
     """Place take-profit order after entry fill."""
+    start_ts = time.time()
     try:
         # Determine TP order side (opposite of entry)
         tp_side = "sell" if side == "buy" else "buy"
@@ -439,19 +457,19 @@ def _calculate_tp_levels(
     total_size: float,
     min_size: float = 0.01
 ) -> list[dict[str, float]]:
-    """Calculate 4 levels of TP based on RR: 1.5, 2.0, 2.5, 3.0.
+    """Calculate 4 levels of TP based on RR: 1.5, 2.0, 2.5, 3.5.
 
     Ratios:
     - 1.5R -> 70%
     - 2.0R -> 15%
     - 2.5R -> 10%
-    - 3.0R -> 5%
+    - 3.5R -> 5%
     """
     risk = abs(entry_price - stop_loss)
     if risk <= 0:
         return []
 
-    rrs = [1.5, 2.0, 2.5, 3.0]
+    rrs = [1.5, 2.0, 2.5, 3.5]
     pcts = [0.70, 0.15, 0.10, 0.05]
     levels = []
 

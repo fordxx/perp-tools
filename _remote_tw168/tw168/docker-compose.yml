@@ -3,7 +3,8 @@ services:
     build: .
     ports:
       - "8000:8000"
+    volumes:
+      - ${PERPBOT_SRC_PATH:-../../src}:/src:ro
     env_file:
       - .env
     restart: unless-stopped
-

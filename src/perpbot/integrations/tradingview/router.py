@@ -307,6 +307,8 @@ def create_tradingview_router(service: Any) -> APIRouter:
 
                 if exec_result.ok:
                     state.mark_traded(key)
+                    # Clear zone state after using it (prevent repeated trades in same zone)
+                    state.clear_zone(key)
                     tp_ids = [o.id for o in exec_result.take_profit_orders]
                     logger.info(
                         "tv168 execution success: exchange=%s symbol=%s side=%s status=%s "

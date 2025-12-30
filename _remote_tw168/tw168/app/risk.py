@@ -98,9 +98,14 @@ def atr(candles: list[Candle], length: int) -> float | None:
 def last_pivot_low(candles: list[Candle], pivot_len: int) -> float | None:
     # Find the most recent confirmed pivot low (needs pivot_len bars on both sides).
     n = len(candles)
-    if n < (pivot_len * 2 + 3):
+    min_required = pivot_len * 2 + 3
+    if n < min_required:
         return None
-    for i in range(n - pivot_len - 2, pivot_len, -1):
+    start_idx = n - pivot_len - 2
+    end_idx = pivot_len
+    if start_idx < end_idx:
+        return None
+    for i in range(start_idx, end_idx, -1):
         center = candles[i].l
         left = [candles[j].l for j in range(i - pivot_len, i)]
         right = [candles[j].l for j in range(i + 1, i + 1 + pivot_len)]
@@ -111,9 +116,14 @@ def last_pivot_low(candles: list[Candle], pivot_len: int) -> float | None:
 
 def last_pivot_high(candles: list[Candle], pivot_len: int) -> float | None:
     n = len(candles)
-    if n < (pivot_len * 2 + 3):
+    min_required = pivot_len * 2 + 3
+    if n < min_required:
         return None
-    for i in range(n - pivot_len - 2, pivot_len, -1):
+    start_idx = n - pivot_len - 2
+    end_idx = pivot_len
+    if start_idx < end_idx:
+        return None
+    for i in range(start_idx, end_idx, -1):
         center = candles[i].h
         left = [candles[j].h for j in range(i - pivot_len, i)]
         right = [candles[j].h for j in range(i + 1, i + 1 + pivot_len)]
