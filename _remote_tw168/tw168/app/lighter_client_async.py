@@ -17,7 +17,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from lighter import ApiClient, Configuration, AccountApi, OrderApi, SignerClient
+from lighter import ApiClient, Configuration, AccountApi, OrderApi, SignerClient, CandlestickApi
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,7 @@ class LighterClient:
         self._order_api: Optional[OrderApi] = None
         self._account_api: Optional[AccountApi] = None
         self._signer_client: Optional[SignerClient] = None
+        self._candlestick_api: Optional[CandlestickApi] = None
         
         # Market cache: symbol -> market_id
         self._markets: Dict[str, int] = {}
@@ -68,6 +69,7 @@ class LighterClient:
         self._api_client = ApiClient(configuration=config)
         self._order_api = OrderApi(api_client=self._api_client)
         self._account_api = AccountApi(api_client=self._api_client)
+        self._candlestick_api = CandlestickApi(api_client=self._api_client)
         
         # Load trading credentials (optional)
         self.api_key_private_key = os.getenv("LIGHTER_API_KEY_PRIVATE_KEY", "").strip() or None
@@ -240,6 +242,38 @@ class LighterClient:
             "lotStep": "0.01",
             "tickSz": "0.01",
         }
+
+    async def fetch_candles(self, *, inst_id: str, tf: str, limit: int = 300) -> list:
+        """获取K线数据 (OKX-compatible interface)
+        
+        Args:
+            inst_id: 合约ID (e.g., "EIGEN-USDT-SWAP")
+            tf: 时间周期 (e.g., "1m", "5m", "15m", "1h", "4h", "1d")
+            limit: 数量限制 (默认300)
+            
+        Returns:
+            List of Candle objects with ts_ms, o, h, l, c
+            
+        Note:
+            Lighter的K线API需要认证(403 Forbidden)，因此回退到OKX公开API获取数据
+        """
+        from app.risk import Candle, fetch_candles_paged
+        
+        # Fallback to OKX public API (same data, no auth required)
+        # Convert EIGEN-USDT-SWAP -> EIGEN-USDT-SWAP (keep OKX format)
+        try:
+            logger.info("fetch_candles: using OKX fallback for %s %s", inst_id, tf)
+            candles = fetch_candles_paged(
+                base_url="https://www.okx.com",
+                inst_id=inst_id,
+                bar=tf,
+                limit=limit
+            )
+            logger.info("fetch_candles: %s %s -> %d candles (OKX)", inst_id, tf, len(candles))
+            return candles
+        except Exception as e:
+            logger.error("fetch_candles failed: %s %s - %s", inst_id, tf, str(e))
+            return []
 
     # ========== Trading Operations ==========
 
