@@ -4,7 +4,7 @@ import asyncio
 import logging
 import logging.handlers
 import time
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from types import SimpleNamespace
 from typing import Any
 
@@ -514,7 +514,13 @@ def _parse_side(value: str | None) -> str | None:
     return None
 
 
-async def _calculate_order_size(*, inst_id: str, r_value: float, tf: str | None = None) -> tuple[str, dict[str, object]]:
+async def _calculate_order_size(
+    *,
+    inst_id: str,
+    r_value: float,
+    entry_price: float,
+    tf: str | None = None,
+) -> tuple[str, dict[str, object]]:
     from app.config import get_risk_per_trade
 
     order_sz = SETTINGS.order_sz
@@ -523,26 +529,38 @@ async def _calculate_order_size(*, inst_id: str, r_value: float, tf: str | None 
     # Get timeframe-specific risk if available, otherwise use default
     risk_amount = get_risk_per_trade(tf) if tf else SETTINGS.risk_per_trade_usdt
 
+    def _ceil_to_step(value: Decimal, step: Decimal | None) -> Decimal:
+        if step is None or step <= 0:
+            return value
+        return (value / step).to_integral_value(rounding=ROUND_UP) * step
+
+    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+    lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+    min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+    min_quote = None
+    if inst_info and inst_info.get("minQuote") and entry_price > 0:
+        try:
+            min_quote = Decimal(str(inst_info.get("minQuote")))
+        except Exception:
+            min_quote = None
+
     if not (risk_amount and risk_amount > 0 and r_value > 0):
-        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
-        lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
-        min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
         try:
             qty = _normalize_qty(Decimal(str(order_sz)), step=lot_step, min_sz=min_order)
+            if min_quote is not None and entry_price > 0:
+                min_qty_by_quote = _ceil_to_step(min_quote / Decimal(str(entry_price)), lot_step)
+                if qty < min_qty_by_quote:
+                    qty = min_qty_by_quote
+                    meta["min_quote"] = str(min_quote)
             order_sz = _format_decimal(qty)
             if min_order:
-                meta = {
-                    "fixed_adjusted": True,
-                    "min_order": str(min_order),
-                }
+                meta["fixed_adjusted"] = True
+                meta["min_order"] = str(min_order)
         except Exception:
             pass
         return order_sz, meta
 
-    inst_info = await exchange.get_instrument_info(inst_id=inst_id)
     ct_val = float(inst_info.get("ctVal")) if inst_info and inst_info.get("ctVal") else 1.0
-    lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
-    min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
 
     risk_usdt = Decimal(str(risk_amount))
     r_value_dec = Decimal(str(r_value))
@@ -550,6 +568,11 @@ async def _calculate_order_size(*, inst_id: str, r_value: float, tf: str | None 
     calculated_sz_coins = risk_usdt / r_value_dec
     calculated_sz_contracts = calculated_sz_coins / ct_val_dec
     qty = _normalize_qty(calculated_sz_contracts, step=lot_step, min_sz=min_order)
+    if min_quote is not None and entry_price > 0:
+        min_qty_by_quote = _ceil_to_step(min_quote / Decimal(str(entry_price)), lot_step)
+        if qty < min_qty_by_quote:
+            qty = min_qty_by_quote
+            meta["min_quote"] = str(min_quote)
     if qty <= 0:
         qty = min_order or Decimal("1")
 
@@ -2287,7 +2310,12 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if not SETTINGS.trading_enabled:
         r_value = abs(float(entry_price) - float(sl))
-        order_sz, size_meta = await _calculate_order_size(inst_id=inst_id, r_value=r_value, tf=tf)
+        order_sz, size_meta = await _calculate_order_size(
+            inst_id=inst_id,
+            r_value=r_value,
+            entry_price=float(entry_price),
+            tf=tf,
+        )
         if size_meta:
             from app.config import get_risk_per_trade
             logger.info(
@@ -2340,7 +2368,12 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # E.g., 1 BTC contract ≈ $100k vs 1 DOGE contract ≈ $0.10
     # Use RISK_PER_TRADE_USDT for consistent risk management.
     # Now supports timeframe-specific risk: 15m=100U, 30m-4h=300U
-    order_sz, size_meta = await _calculate_order_size(inst_id=inst_id, r_value=r_value, tf=tf)
+    order_sz, size_meta = await _calculate_order_size(
+        inst_id=inst_id,
+        r_value=r_value,
+        entry_price=float(entry_price),
+        tf=tf,
+    )
     if size_meta and size_meta.get("fixed_adjusted"):
         logger.info(
             "tv_webhook fixed_sizing_adjusted sz=%s min_order=%s",

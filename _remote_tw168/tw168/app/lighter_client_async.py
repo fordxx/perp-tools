@@ -384,8 +384,12 @@ class LighterClient:
         symbol = inst_id.replace("-USDT-SWAP", "").replace("-", "/")
         try:
             market_id, base_multiplier, price_multiplier = await self._get_market_config(symbol)
-        except Exception as e:
-            return {"code": "1", "msg": str(e)}
+        except Exception:
+            await self._load_markets()
+            try:
+                market_id, base_multiplier, price_multiplier = await self._get_market_config(symbol)
+            except Exception as e:
+                return {"code": "1", "msg": str(e)}
         
         try:
             # Determine order type
@@ -547,8 +551,12 @@ class LighterClient:
         symbol = inst_id.replace("-USDT-SWAP", "").replace("-", "/")
         try:
             market_id, base_multiplier, price_multiplier = await self._get_market_config(symbol)
-        except Exception as e:
-            return {"code": "1", "msg": str(e)}
+        except Exception:
+            await self._load_markets()
+            try:
+                market_id, base_multiplier, price_multiplier = await self._get_market_config(symbol)
+            except Exception as e:
+                return {"code": "1", "msg": str(e)}
 
         try:
             is_ask = (side == "sell")
