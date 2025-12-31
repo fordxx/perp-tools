@@ -155,88 +155,8 @@ elif SETTINGS.exchange == "lighter":
     use_testnet = env == "testnet"
     exchange = create_lighter_adapter(use_testnet=use_testnet)
     # Note: exchange.connect() will be called in startup event (async)
-    logger.info(f"Lighter adapter created (env={env}, will connect on startup)")
-
-    # Enable WebSocket for real-time monitoring (all trading symbols)
-    # Includes all K-line monitored symbols + important allowlist symbols
-    LIGHTER_WS_SYMBOLS = [
-        # Primary trading pairs (K-line monitored)
-        "ETH-USDT-SWAP",
-        "BTC-USDT-SWAP",
-        "SOL-USDT-SWAP",
-        "LINK-USDT-SWAP",
-        "DOGE-USDT-SWAP",
-        "BNB-USDT-SWAP",
-        "BCH-USDT-SWAP",
-        "TRX-USDT-SWAP",
-        "EIGEN-USDT-SWAP",
-        "ETHFI-USDT-SWAP",
-        "FARTCOIN-USDT-SWAP",
-        "JTO-USDT-SWAP",
-        "PUMP-USDT-SWAP",
-        "TAO-USDT-SWAP",
-        "TON-USDT-SWAP",
-        "TRUMP-USDT-SWAP",
-        # Additional allowlist symbols
-        "XRP-USDT-SWAP",
-        "ONDO-USDT-SWAP",
-        "LTC-USDT-SWAP",
-    ]
-
-    logger.info("🔌 Starting Lighter WebSocket initialization...")
-    try:
-        logger.info("🔌 Enabling Lighter WebSocket for real-time monitoring...")
-        # Enable WebSocket (public channels don't need auth)
-        exchange.enable_websocket(auto_subscribe_account=False)
-        logger.info("✅ Lighter WebSocket client created")
-
-        # Subscribe to orderbook and trades for all symbols
-        ws_subscribed = 0
-        ws_failed = []
-        for okx_symbol in LIGHTER_WS_SYMBOLS:
-            try:
-                # Convert OKX format to Lighter format (ETH-USDT-SWAP -> ETH/USDT)
-                lighter_symbol = okx_symbol.replace("-SWAP", "").replace("-", "/")
-
-                # Orderbook handler
-                def make_orderbook_handler(sym):
-                    def handler(data):
-                        bids = data.get("bids", [])
-                        asks = data.get("asks", [])
-                        if bids and asks:
-                            best_bid = float(bids[0].get("price", 0)) if bids else 0
-                            best_ask = float(asks[0].get("price", 0)) if asks else 0
-                            logger.debug(f"📖 {sym} WS盘口: bid={best_bid:.2f} ask={best_ask:.2f} ({len(bids)}b/{len(asks)}a)")
-                    return handler
-
-                # Trade handler
-                def make_trade_handler(sym):
-                    def handler(data):
-                        trade = data.get("trade", {})
-                        side = trade.get("side", "")
-                        size = trade.get("size", 0)
-                        price = trade.get("price", 0)
-                        if price and size:
-                            logger.debug(f"💹 {sym} WS成交: {side.upper()} {size} @ {price}")
-                    return handler
-
-                exchange.subscribe_orderbook_stream(lighter_symbol, make_orderbook_handler(okx_symbol))
-                exchange.subscribe_trades_stream(lighter_symbol, make_trade_handler(okx_symbol))
-                ws_subscribed += 1
-
-            except Exception as e:
-                logger.error(f"❌ Failed to subscribe WebSocket for {okx_symbol}: {e}")
-                ws_failed.append(okx_symbol)
-
-        logger.info(f"✅ Lighter WebSocket enabled: {ws_subscribed}/{len(LIGHTER_WS_SYMBOLS)} symbols subscribed")
-        if ws_failed:
-            logger.warning(f"⚠️  Failed to subscribe: {', '.join(ws_failed)}")
-
-    except Exception as e:
-        import traceback
-        logger.error(f"❌ Failed to enable Lighter WebSocket: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        logger.info("ℹ️  Continuing without WebSocket (REST API only)")
+    # WebSocket will be enabled after connection in _startup()
+    logger.info(f"Lighter adapter created (env={env}, WebSocket will be enabled on startup)")
 else:
     from app.okx import OKXClient, OKXCredentials
 
@@ -1214,9 +1134,125 @@ async def _refresh_lighter_protection() -> None:
                 side = entry_info.side
                 sl_side = "sell" if side == "buy" else "buy"
 
-                # Cancel previously placed protection orders if tracked
+                # If existing protection orders already match, skip refresh.
+                try:
+                    existing_orders = await exchange.get_open_orders(inst_id=inst_id)
+                except Exception:
+                    logger.warning("lighter refresh skipped instId=%s posSide=%s reason=open_orders_error", inst_id, pos_side)
+                    _last_refresh_by_key[key] = now
+                    _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                    continue
+
+                open_err_ts = getattr(exchange, "_open_orders_error_ts", 0.0)
+                if not existing_orders and open_err_ts and (now - open_err_ts) < 5:
+                    _last_refresh_by_key[key] = now
+                    _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                    logger.info(
+                        "lighter refresh skipped instId=%s posSide=%s reason=open_orders_recent_error",
+                        inst_id,
+                        pos_side,
+                    )
+                    continue
+
                 store = getattr(exchange, "_okx_compat_state", None)
-                if store:
+                if store and not existing_orders:
+                    protect = store.get("protective_by_key", {}).get(key, {})
+                    if protect.get("sl") or protect.get("tp"):
+                        _last_refresh_by_key[key] = now
+                        _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                        logger.info(
+                            "lighter refresh skipped instId=%s posSide=%s reason=stored_protection",
+                            inst_id,
+                            pos_side,
+                        )
+                        continue
+
+                if not existing_orders:
+                    last_ts = _last_refresh_by_key.get(key, 0.0)
+                    refresh_guard = SETTINGS.lighter_refresh_seconds * 2
+                    if last_ts and (now - last_ts) < refresh_guard:
+                        _last_refresh_by_key[key] = now
+                        _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                        continue
+
+                protect_orders = []
+                for order in existing_orders:
+                    if not order.get("reduce_only"):
+                        continue
+                    otype = str(order.get("type", "")).lower()
+                    trigger_px = order.get("trigger_price")
+                    if trigger_px is None and otype not in {"stop-loss", "stop-loss-limit", "take-profit", "take-profit-limit", "sl", "tp", "conditional"}:
+                        continue
+                    protect_orders.append(order)
+
+                if protect_orders:
+                    def _order_ts(o):
+                        val = o.get("created_at")
+                        if val is None:
+                            return 0.0
+                        if isinstance(val, (int, float)):
+                            return float(val)
+                        try:
+                            return float(str(val))
+                        except Exception:
+                            return 0.0
+
+                    def _order_kind(o):
+                        otype = str(o.get("type", "")).lower()
+                        if "stop" in otype or "sl" in otype:
+                            return "sl"
+                        if "take" in otype or "tp" in otype:
+                            return "tp"
+                        return "trigger" if o.get("trigger_price") is not None else "other"
+
+                    def _order_key(o):
+                        trigger_px = o.get("trigger_price")
+                        size_val = o.get("size") or o.get("sz") or o.get("remaining_size")
+                        try:
+                            size_val = Decimal(str(size_val))
+                        except Exception:
+                            size_val = Decimal("0")
+                        try:
+                            trigger_val = Decimal(str(trigger_px)) if trigger_px is not None else None
+                        except Exception:
+                            trigger_val = None
+                        return (_order_kind(o), str(trigger_val) if trigger_val is not None else None, str(size_val))
+
+                    keep_by_key = {}
+                    dupes = []
+                    for order in protect_orders:
+                        key_info = _order_key(order)
+                        current = keep_by_key.get(key_info)
+                        if current is None:
+                            keep_by_key[key_info] = order
+                            continue
+                        if _order_ts(order) >= _order_ts(current):
+                            dupes.append(current)
+                            keep_by_key[key_info] = order
+                        else:
+                            dupes.append(order)
+
+                    for order in dupes:
+                        ord_id = order.get("ordId")
+                        if ord_id:
+                            try:
+                                await exchange.cancel_order(inst_id=inst_id, order_id=str(ord_id))
+                            except Exception:
+                                pass
+                    if dupes:
+                        logger.info(
+                            "lighter protection dedupe instId=%s posSide=%s cancelled=%d",
+                            inst_id,
+                            pos_side,
+                            len(dupes),
+                        )
+
+                    kept_orders = list(keep_by_key.values())
+                    if kept_orders:
+                        protect_orders = kept_orders
+
+                # Cancel previously placed protection orders if tracked
+                if store and not protect_orders:
                     protect = store.get("protective_by_key", {}).get(key)
                     if protect:
                         for order_id in (protect.get("sl", []) + protect.get("tp", [])):
@@ -1227,8 +1263,43 @@ async def _refresh_lighter_protection() -> None:
                         protect["sl"] = []
                         protect["tp"] = []
 
-                if SETTINGS.lighter_refresh_sl_enabled:
+                sl_orders = []
+                tp_orders = []
+                for order in protect_orders:
+                    otype = str(order.get("type", "")).lower()
+                    if "stop" in otype or "sl" in otype:
+                        sl_orders.append(order)
+                    elif "take" in otype or "tp" in otype:
+                        tp_orders.append(order)
+
+                if SETTINGS.lighter_refresh_sl_enabled and not sl_orders:
                     sl_px = _round_price_to_tick(entry_info.stop_loss, tick_size)
+                    sl_failed = False
+                    try:
+                        current_price = await exchange.get_last_price(inst_id=inst_id) or 0.0
+                    except Exception:
+                        current_price = 0.0
+                    if current_price > 0:
+                        sl_invalid = False
+                        if side == "buy" and entry_info.stop_loss >= current_price:
+                            sl_invalid = True
+                        elif side == "sell" and entry_info.stop_loss <= current_price:
+                            sl_invalid = True
+                        if sl_invalid:
+                            await _lighter_emergency_close(
+                                inst_id=inst_id,
+                                pos_side=pos_side,
+                                close_side=sl_side,
+                                size=sl_order_sz,
+                                current_price=current_price,
+                                entry_info=entry_info,
+                                inst_info=inst_info,
+                                protect_orders=protect_orders,
+                                failure_reason="sl_already_breached",
+                            )
+                            _last_refresh_by_key[key] = now
+                            _lighter_refresh_size_by_key[key] = float(normalized_sz)
+                            continue
                     sl_resp = await exchange.place_algo_order(
                         inst_id=inst_id,
                         td_mode=SETTINGS.okx_td_mode,
@@ -1240,8 +1311,80 @@ async def _refresh_lighter_protection() -> None:
                         sl_ord_px="-1",
                     )
                     if str(sl_resp.get("code", "")) not in {"0", "success"}:
+                        sl_failed = True
                         notify_error(
                             f"lighter sl refresh failed instId={inst_id} posSide={pos_side} sl={sl_px} sz={sl_order_sz} resp={sl_resp}"
+                        )
+
+                    if sl_failed:
+                        code = str(sl_resp.get("code", ""))
+                        msg = str(sl_resp.get("msg", ""))
+                        if code == "21720" or "maximum pending" in msg.lower():
+                            candidates = tp_orders or protect_orders
+                            if candidates:
+                                oldest = min(candidates, key=lambda o: o.get("created_at") or 0)
+                                ord_id = oldest.get("ordId")
+                                if ord_id:
+                                    try:
+                                        await exchange.cancel_order(inst_id=inst_id, order_id=str(ord_id))
+                                    except Exception:
+                                        pass
+                                    sl_retry = await exchange.place_algo_order(
+                                        inst_id=inst_id,
+                                        td_mode=SETTINGS.okx_td_mode,
+                                        side=sl_side,
+                                        pos_side=pos_side,
+                                        ord_type="conditional",
+                                        sz=sl_order_sz,
+                                        sl_trigger_px=sl_px,
+                                        sl_ord_px="-1",
+                                    )
+                                    if str(sl_retry.get("code", "")) in {"0", "success"}:
+                                        sl_failed = False
+
+                    if sl_failed and SETTINGS.backup_sl_enabled:
+                        try:
+                            backup_sl_resp = await exchange.place_order(
+                                inst_id=inst_id,
+                                td_mode=SETTINGS.okx_td_mode,
+                                side=sl_side,
+                                pos_side=pos_side,
+                                ord_type="limit",
+                                sz=sl_order_sz,
+                                px=_round_price_to_tick(entry_info.stop_loss, tick_size),
+                                cl_ord_id=f"tv_slb_{int(time.time())}"[:32],
+                                sl_trigger_px=None,
+                                tp_trigger_px=None,
+                                reduce_only=True,
+                            )
+                            if str(backup_sl_resp.get("code", "")) not in {"0", "success"}:
+                                sl_failed = True
+                            else:
+                                sl_failed = False
+                        except Exception:
+                            sl_failed = True
+
+                    if sl_failed:
+                        emergency_handler = get_emergency_handler()
+                        await emergency_handler.register_emergency(
+                            inst_id=inst_id,
+                            pos_side=pos_side,
+                            size=sl_order_sz,
+                            entry_price=entry_info.entry_price,
+                            stop_loss=float(entry_info.stop_loss),
+                            cl_ord_id="lighter_refresh",
+                            failure_reason="lighter_refresh_sl_failed",
+                        )
+                        await _lighter_emergency_close(
+                            inst_id=inst_id,
+                            pos_side=pos_side,
+                            close_side=sl_side,
+                            size=sl_order_sz,
+                            current_price=current_price,
+                            entry_info=entry_info,
+                            inst_info=inst_info,
+                            protect_orders=protect_orders,
+                            failure_reason="lighter_refresh_sl_failed",
                         )
 
                 if SETTINGS.lighter_refresh_tp_enabled and SETTINGS.tp_enabled:
@@ -1253,7 +1396,34 @@ async def _refresh_lighter_protection() -> None:
                         total_sz=normalized_sz,
                         tick_size=tick_size,
                     )
+                    existing_tp_prices = []
+                    for order in tp_orders:
+                        trigger_val = order.get("trigger_price") or order.get("price")
+                        if trigger_val is not None:
+                            try:
+                                existing_tp_prices.append(Decimal(str(trigger_val)))
+                            except Exception:
+                                continue
+
+                    def _tp_exists(target_price: Decimal) -> bool:
+                        if not existing_tp_prices:
+                            return False
+                        tick_val = None
+                        try:
+                            tick_val = Decimal(str(tick_size)) if tick_size else None
+                        except Exception:
+                            tick_val = None
+                        if tick_val is None:
+                            return any(abs(target_price - p) <= Decimal("0.00000001") for p in existing_tp_prices)
+                        return any(abs(target_price - p) <= tick_val for p in existing_tp_prices)
+
                     for target in tp_targets:
+                        try:
+                            target_price = Decimal(str(target["price"]))
+                        except Exception:
+                            continue
+                        if _tp_exists(target_price):
+                            continue
                         tp_resp = await exchange.place_algo_order(
                             inst_id=inst_id,
                             td_mode=SETTINGS.okx_td_mode,
@@ -1279,6 +1449,160 @@ async def _refresh_lighter_protection() -> None:
                 )
 
 
+async def _lighter_emergency_close(
+    *,
+    inst_id: str,
+    pos_side: str,
+    close_side: str,
+    size: str,
+    current_price: float,
+    entry_info: SimpleNamespace,
+    inst_info: dict | None,
+    protect_orders: list[dict],
+    failure_reason: str,
+) -> bool:
+    min_quote = None
+    if inst_info and inst_info.get("minQuote"):
+        try:
+            min_quote = Decimal(str(inst_info.get("minQuote")))
+        except Exception:
+            min_quote = None
+
+    if min_quote is not None and current_price > 0:
+        try:
+            if Decimal(str(current_price)) * Decimal(str(size)) < min_quote:
+                notify_error(
+                    f"lighter emergency close skipped instId={inst_id} reason=min_quote_not_met"
+                )
+                emergency_handler = get_emergency_handler()
+                await emergency_handler.register_emergency(
+                    inst_id=inst_id,
+                    pos_side=pos_side,
+                    size=size,
+                    entry_price=entry_info.entry_price,
+                    stop_loss=float(entry_info.stop_loss),
+                    cl_ord_id="lighter_emerg",
+                    failure_reason="min_quote_not_met",
+                )
+                return False
+        except Exception:
+            pass
+
+    # Only attempt to clear protection orders when SL is missing.
+    for order in protect_orders:
+        ord_id = order.get("ordId")
+        if ord_id:
+            try:
+                await exchange.cancel_order(inst_id=inst_id, order_id=str(ord_id))
+            except Exception:
+                pass
+
+    emergency_handler = get_emergency_handler()
+    await emergency_handler.register_emergency(
+        inst_id=inst_id,
+        pos_side=pos_side,
+        size=size,
+        entry_price=entry_info.entry_price,
+        stop_loss=float(entry_info.stop_loss),
+        cl_ord_id="lighter_emerg",
+        failure_reason=failure_reason,
+    )
+
+    for attempt in range(3):
+        try:
+            resp = await exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=close_side,
+                pos_side=pos_side,
+                ord_type="market",
+                sz=size,
+                px=None,
+                cl_ord_id=f"tv_emerg_{int(time.time())}_{attempt}"[:32],
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=True,
+            )
+            if str(resp.get("code", "")) in {"0", "success"}:
+                await emergency_handler.clear_emergency(inst_id, pos_side)
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.2 * (attempt + 1))
+    notify_error(
+        f"🚨 CRITICAL ALERT 🚨\n"
+        f"Emergency close failed\n"
+        f"Symbol: {inst_id}\n"
+        f"Side: {pos_side}\n"
+        f"Size: {size}\n"
+        f"Reason: {failure_reason}"
+    )
+    return False
+
+
+async def _dedupe_lighter_orders() -> None:
+    if SETTINGS.exchange != "lighter":
+        return
+    dedupe_interval = min(SETTINGS.lighter_refresh_seconds, 15)
+    while True:
+        await asyncio.sleep(dedupe_interval)
+        if not SETTINGS.trading_enabled:
+            continue
+        for inst_id in allowed_symbols:
+            if inst_id == "*":
+                continue
+            try:
+                orders = await exchange.get_open_orders(inst_id=inst_id)
+            except Exception:
+                continue
+            protect_orders = [o for o in orders if o.get("reduce_only")]
+            if not protect_orders:
+                continue
+
+            def _order_ts(o):
+                val = o.get("created_at")
+                if val is None:
+                    return 0.0
+                if isinstance(val, (int, float)):
+                    return float(val)
+                try:
+                    return float(str(val))
+                except Exception:
+                    return 0.0
+
+            def _order_key(o):
+                return (
+                    str(o.get("side")),
+                    str(o.get("type")),
+                    str(o.get("trigger_price")),
+                    str(o.get("size") or o.get("sz") or o.get("remaining_size")),
+                )
+
+            keep_by_key = {}
+            dupes = []
+            for order in protect_orders:
+                key_info = _order_key(order)
+                current = keep_by_key.get(key_info)
+                if current is None:
+                    keep_by_key[key_info] = order
+                    continue
+                if _order_ts(order) >= _order_ts(current):
+                    dupes.append(current)
+                    keep_by_key[key_info] = order
+                else:
+                    dupes.append(order)
+
+            for order in dupes:
+                ord_id = order.get("ordId")
+                if ord_id:
+                    try:
+                        await exchange.cancel_order(inst_id=inst_id, order_id=str(ord_id))
+                    except Exception:
+                        pass
+            if dupes:
+                logger.info("lighter protection dedupe instId=%s cancelled=%d", inst_id, len(dupes))
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     # Configure log rotation
@@ -1289,6 +1613,54 @@ async def _startup() -> None:
         logger.info("Connecting to Lighter exchange (async via adapter)...")
         await exchange.connect()
         logger.info("✅ Lighter client connected via adapter")
+        
+        # Enable Lighter WebSocket for real-time monitoring
+        LIGHTER_WS_SYMBOLS = [
+            "ETH-USDT-SWAP", "BTC-USDT-SWAP", "SOL-USDT-SWAP", "LINK-USDT-SWAP",
+            "DOGE-USDT-SWAP", "BNB-USDT-SWAP", "BCH-USDT-SWAP", "TRX-USDT-SWAP",
+            "EIGEN-USDT-SWAP", "ETHFI-USDT-SWAP", "FARTCOIN-USDT-SWAP", "JTO-USDT-SWAP",
+            "PUMP-USDT-SWAP", "TAO-USDT-SWAP", "TON-USDT-SWAP", "TRUMP-USDT-SWAP",
+            "XRP-USDT-SWAP", "ONDO-USDT-SWAP", "LTC-USDT-SWAP",
+        ]
+        
+        logger.info("🔌 Enabling Lighter WebSocket for real-time monitoring...")
+        try:
+            exchange.enable_websocket(auto_subscribe_account=False)
+            
+            ws_subscribed = 0
+            for okx_symbol in LIGHTER_WS_SYMBOLS:
+                lighter_symbol = okx_symbol.replace("-SWAP", "").replace("-", "/")
+                
+                # Orderbook handler
+                def make_orderbook_handler(sym):
+                    def handler(data):
+                        try:
+                            # Extract bid/ask from Lighter format
+                            bids = data.get("bids", []) if isinstance(data, dict) else getattr(data, "bids", [])
+                            asks = data.get("asks", []) if isinstance(data, dict) else getattr(data, "asks", [])
+                            if bids and asks:
+                                best_bid = float(bids[0]["price"]) / 10**6 if isinstance(bids[0], dict) else float(bids[0].price) / 10**6
+                                best_ask = float(asks[0]["price"]) / 10**6 if isinstance(asks[0], dict) else float(asks[0].price) / 10**6
+                                if best_bid > 0 and best_ask > 0:
+                                    logger.info(f"📖 {sym} 盘口: bid={best_bid:.4f} ask={best_ask:.4f}")
+                        except Exception as e:
+                            logger.debug(f"Orderbook parse error for {sym}: {e}")
+                    return handler
+                
+                await exchange.subscribe_orderbook_stream(lighter_symbol, make_orderbook_handler(okx_symbol))
+                exchange.subscribe_trades_stream(lighter_symbol, lambda x: None)  # Placeholder
+                ws_subscribed += 1
+            
+            # Start WebSocket after all subscriptions
+            await exchange.start_websocket()
+            
+            logger.info(f"✅ Lighter WebSocket enabled: {ws_subscribed} symbols subscribed")
+        
+        except Exception as e:
+            import traceback
+            logger.error(f"❌ Failed to enable Lighter WebSocket: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.info("ℹ️  Continuing without WebSocket (REST API only)")
 
     if SETTINGS.trading_enabled and manager is not None:
         manager.start()
@@ -1332,6 +1704,7 @@ async def _startup() -> None:
         _refresh_task = asyncio.create_task(_refresh_paradex_protection())
     if SETTINGS.exchange == "lighter" and SETTINGS.lighter_refresh_enabled:
         _refresh_task = asyncio.create_task(_refresh_lighter_protection())
+        _refresh_task = asyncio.create_task(_dedupe_lighter_orders())
 
 
 @app.on_event("shutdown")
@@ -2283,8 +2656,6 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     if SETTINGS.ladder_enabled:
         # Ladder orders: 70% market + 30% limit (L1: 20%, L2: 10%)
-        from decimal import Decimal, ROUND_DOWN
-
         total_sz = Decimal(str(order_sz))
 
         # Get instrument lot size info for proper normalization
@@ -2442,6 +2813,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             notify_error(
                 f"okx entry rejected instId={inst_id} side={side} sz={order_sz} resp={resp}"
             )
+            if SETTINGS.exchange == "lighter":
+                _log_decision(inst_id, tf, action="order_rejected", side=side, posSide=pos_side)
+                return {"ok": False, "error": "entry_rejected", "order": resp}
 
     # 4. 等待成交并获取实际成交价（带重试机制）
     filled_price = None
@@ -2465,7 +2839,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                         cl_ord_id = ladder_ord.get("cl_ord_id", "")
                         order_id = store.get("cl_to_order", {}).get(cl_ord_id, cl_ord_id)
                         try:
-                            fills = exchange.get_order_fills(inst_id=inst_id, order_id=str(order_id))
+                            fills = await exchange.get_order_fills(inst_id=inst_id, order_id=str(order_id))
                         except Exception:
                             fills = None
                         if fills:
@@ -2651,9 +3025,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             # End of non-lighter ladder wait
     else:
         # Single order (market or limit): original logic
-        max_retries = 10  # Default for non-ladder orders
+        max_retries = 2 if SETTINGS.exchange == "lighter" else 10  # Lighter doesn't return avgPx reliably
         for retry in range(max_retries):
-            await asyncio.sleep(0.3 * (retry + 1))  # Progressive backoff
+            await asyncio.sleep(0.2 * (retry + 1))  # Progressive backoff
             try:
                 ord_info = await exchange.get_order(inst_id=inst_id, cl_ord_id=cl_ord_id)
                 if ord_info and ord_info.get("avgPx"):

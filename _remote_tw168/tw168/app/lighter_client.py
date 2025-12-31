@@ -973,6 +973,7 @@ class LighterClient(ExchangeClient):
                     account_index=int(self.account_index),
                     market_id=market_id,
                     authorization=auth_token,
+                    auth=auth_token,
                 ),
                 timeout=15.0,
             )

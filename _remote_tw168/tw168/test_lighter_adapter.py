@@ -81,7 +81,7 @@ async def test_adapter():
                 print(f"✅ {symbol}: {len(orders)} 个未成交订单")
                 total_orders += len(orders)
                 for order in orders[:3]:  # 最多显示3个
-                    order_id = order.get("id", "N/A")
+                    order_id = order.get("ordId", "N/A")
                     side = order.get("side", "N/A")
                     price = order.get("price", "N/A")
                     print(f"   - {order_id}: {side} @ {price}")
@@ -92,8 +92,11 @@ async def test_adapter():
     print("\n6️⃣  测试撤单功能...")
     if total_orders > 0:
         print("⚠️  检测到未成交订单")
-        response = input("是否测试 cancel_all_orders()? (y/N): ").strip().lower()
-        if response == 'y':
+        if sys.stdin.isatty():
+            response = input("是否测试 cancel_all_orders()? (y/N): ").strip().lower()
+        else:
+            response = "n"
+        if response == "y":
             try:
                 # 测试撤销 EIGEN 的订单
                 symbol = "EIGEN/USDT"  # Lighter 格式

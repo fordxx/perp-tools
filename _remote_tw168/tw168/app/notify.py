@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from typing import Optional
 
@@ -15,6 +16,8 @@ def _send(message: str) -> None:
     token = _env("TELEGRAM_BOT_TOKEN")
     chat_id = _env("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        logger = logging.getLogger("uvicorn.error")
+        logger.warning("telegram notify skipped (missing env)")
         return
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -24,8 +27,12 @@ def _send(message: str) -> None:
         "disable_web_page_preview": True,
     }
     try:
-        requests.post(url, json=payload, timeout=5)
+        resp = requests.post(url, json=payload, timeout=5)
+        logger = logging.getLogger("uvicorn.error")
+        logger.info("telegram notify status=%s", resp.status_code)
     except Exception:
+        logger = logging.getLogger("uvicorn.error")
+        logger.exception("telegram notify failed")
         return
 
 

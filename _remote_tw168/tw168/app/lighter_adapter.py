@@ -31,6 +31,28 @@ class LighterAsyncAdapter:
         """异步断开连接"""
         await self._client.disconnect()
     
+    # ==================== WebSocket 方法显式代理 ====================
+    
+    def enable_websocket(self, auto_subscribe_account: bool = False) -> None:
+        """启用 WebSocket"""
+        return self._client.enable_websocket(auto_subscribe_account=auto_subscribe_account)
+    
+    async def subscribe_orderbook_stream(self, symbol: str, handler: Any) -> None:
+        """订阅orderbook流 (async)"""
+        return await self._client.subscribe_orderbook_stream(symbol, handler)
+    
+    def subscribe_trades_stream(self, symbol: str, handler: Any) -> None:
+        """订阅trades流 (Lighter不支持)"""
+        return self._client.subscribe_trades_stream(symbol, handler)
+    
+    async def start_websocket(self) -> None:
+        """启动 WebSocket"""
+        return await self._client.start_websocket()
+    
+    async def stop_websocket(self) -> None:
+        """停止 WebSocket"""
+        return await self._client.stop_websocket()
+    
     # ==================== 透传所有方法 ====================
     
     def __getattr__(self, name: str) -> Any:
@@ -47,18 +69,8 @@ def create_lighter_adapter(use_testnet: bool = False) -> LighterAsyncAdapter:
     Returns:
         LighterAsyncAdapter 实例
     """
-    try:
-        from app.okx_compat_layer import add_okx_compat_methods
-    except ImportError:
-        logger.warning("okx_compat_layer not found, skipping OKX compatibility methods")
-        add_okx_compat_methods = None
-    
     # 创建 LighterClient
     client = LighterClient(use_testnet=use_testnet)
-    
-    # 添加 OKX 兼容方法（如果可用）
-    if add_okx_compat_methods is not None:
-        add_okx_compat_methods(client)
     
     # 创建适配器
     adapter = LighterAsyncAdapter(client)
