@@ -67,6 +67,9 @@ class LighterClient:
         # Algo order dedupe guard
         self._algo_guard: Dict[str, float] = {}
         self._algo_guard_ttl_s = 120
+        # Open orders cache / throttling
+        self._open_orders_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+        self._open_orders_min_interval_s = 6
 
     async def connect(self) -> None:
         """连接 Lighter (公开行情 + 可选交易)"""
@@ -909,6 +912,12 @@ class LighterClient:
         """获取未成交订单"""
         if not self._order_api or self.account_index is None:
             return []
+
+        cache = self._open_orders_cache.get(inst_id)
+        if cache:
+            ts, data = cache
+            if (time.time() - ts) < self._open_orders_min_interval_s:
+                return data
         
         symbol = inst_id.replace("-USDT-SWAP", "").replace("-", "/")
         market_id = await self._get_market_id(symbol)
@@ -981,6 +990,7 @@ class LighterClient:
                     "created_at": getattr(order, "created_at", None),
                 })
 
+            self._open_orders_cache[inst_id] = (time.time(), result)
             return result
         except Exception as exc:
             self._open_orders_error_ts = time.time()
