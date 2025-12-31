@@ -524,6 +524,19 @@ async def _calculate_order_size(*, inst_id: str, r_value: float, tf: str | None 
     risk_amount = get_risk_per_trade(tf) if tf else SETTINGS.risk_per_trade_usdt
 
     if not (risk_amount and risk_amount > 0 and r_value > 0):
+        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+        lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+        min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+        try:
+            qty = _normalize_qty(Decimal(str(order_sz)), step=lot_step, min_sz=min_order)
+            order_sz = _format_decimal(qty)
+            if min_order:
+                meta = {
+                    "fixed_adjusted": True,
+                    "min_order": str(min_order),
+                }
+        except Exception:
+            pass
         return order_sz, meta
 
     inst_info = await exchange.get_instrument_info(inst_id=inst_id)
@@ -2328,7 +2341,13 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # Use RISK_PER_TRADE_USDT for consistent risk management.
     # Now supports timeframe-specific risk: 15m=100U, 30m-4h=300U
     order_sz, size_meta = await _calculate_order_size(inst_id=inst_id, r_value=r_value, tf=tf)
-    if size_meta:
+    if size_meta and size_meta.get("fixed_adjusted"):
+        logger.info(
+            "tv_webhook fixed_sizing_adjusted sz=%s min_order=%s",
+            order_sz,
+            size_meta.get("min_order"),
+        )
+    elif size_meta:
         from app.config import get_risk_per_trade
         logger.info(
             "tv_webhook risk_based_sizing tf=%s risk_usdt=%s r_value=%.4f coins=%.4f ct_val=%s contracts=%s actual_coins=%.4f",
