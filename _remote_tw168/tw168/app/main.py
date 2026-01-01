@@ -11,7 +11,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from app.config import SETTINGS, get_lookback_bars, get_ladder_wait_candles, get_ladder_max_wait_candles, get_ladder_price_distance, tf_to_seconds
+from app.config import SETTINGS, get_lookback_bars, get_ladder_wait_candles, get_ladder_max_wait_candles, get_ladder_price_distance, get_entry_two_limit_timeout_candles, tf_to_seconds
+from app.risk import fetch_candles_paged
+from app.signal_audit import append_event as _audit_append_event, sanitize_payload as _audit_sanitize_payload, utc_now_iso as _audit_utc_now_iso
 from app.charting import plot_kline
 from app.candle_cache import CandleCache, CandleWsManager
 from app.fill_tracker import FillTracker
@@ -59,12 +61,176 @@ _lighter_refresh_size_by_key: dict[str, float] = {}
 
 # Concurrency limiter for order placement (max 3 concurrent orders)
 _order_semaphore = asyncio.Semaphore(3)
+_entry_protect_tasks: dict[str, asyncio.Task] = {}
 
 
 async def _place_order_with_limit(exchange_obj: Any, *args: Any, **kwargs: Any) -> Any:
     """Place order with concurrency limiting."""
     async with _order_semaphore:
         return exchange_obj.place_order(*args, **kwargs)
+
+
+async def _get_ref_price_from_bar(inst_id: str, *, bar: str) -> float | None:
+    try:
+        candles = await asyncio.to_thread(fetch_candles_paged, SETTINGS.okx_base_url, inst_id, bar, 3)
+    except Exception:
+        return None
+    if not candles:
+        return None
+    return candles[-1].c
+
+
+async def _monitor_entry_and_set_protection(
+    *,
+    key: str,
+    inst_id: str,
+    tf: str,
+    side: str,
+    pos_side: str,
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> None:
+    start = time.time()
+    deadline = start + max(1.0, timeout_seconds)
+    sl_side = "sell" if side == "buy" else "buy"
+
+    while time.time() < deadline:
+        try:
+            pos = await exchange.get_position(inst_id=inst_id, pos_side=pos_side)
+        except Exception:
+            pos = None
+        if pos and float(pos.get("pos", "0") or "0") > 0:
+            try:
+                filled_sz = float(pos.get("pos", "0") or "0")
+            except Exception:
+                filled_sz = 0.0
+            try:
+                filled_price = float(pos.get("avgPx", "0") or "0")
+            except Exception:
+                filled_price = 0.0
+            if filled_price <= 0:
+                try:
+                    filled_price = float(await exchange.get_last_price(inst_id=inst_id) or 0.0)
+                except Exception:
+                    filled_price = 0.0
+            if filled_price <= 0:
+                _log_decision(inst_id, tf, action="two_limit_filled_but_no_price")
+                return
+
+            desired_limit = max(300, SETTINGS.rsi_max_data + SETTINGS.rsi_length + 2)
+            candles: list = []
+            try:
+                if hasattr(exchange, "fetch_candles"):
+                    candles = await exchange.fetch_candles(inst_id=inst_id, tf=tf, limit=desired_limit)
+            except Exception:
+                candles = []
+            if not candles:
+                try:
+                    candles = await asyncio.to_thread(fetch_candles_paged, SETTINGS.okx_base_url, inst_id, tf, desired_limit)
+                except Exception:
+                    candles = []
+
+            # Compute stop loss from TF candles and actual fill price.
+            sl = None
+            try:
+                if SETTINGS.stop_method == "pivot":
+                    sl = stop_loss_price_pivot(
+                        side=side,
+                        entry_price=filled_price,
+                        candles=candles,
+                        pivot_len=SETTINGS.pivot_len,
+                        atr_len=SETTINGS.atr_len,
+                        atr_buffer_mult=SETTINGS.atr_buffer_mult,
+                        min_buffer_bps=SETTINGS.min_buffer_bps,
+                    )
+                else:
+                    sl = stop_loss_price_lookback(
+                        side=side,
+                        entry_price=filled_price,
+                        candles=candles,
+                        lookback_bars=get_lookback_bars(tf),
+                        atr_len=SETTINGS.atr_len,
+                        atr_buffer_mult=SETTINGS.atr_buffer_mult,
+                        min_buffer_bps=SETTINGS.min_buffer_bps,
+                    )
+            except Exception:
+                sl = None
+
+            if not sl:
+                _log_decision(inst_id, tf, action="two_limit_skip_protection", reason="no_sl_computed")
+                return
+
+            inst_info = None
+            try:
+                inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+            except Exception:
+                inst_info = None
+            tick_size = inst_info.get("tickSz") if inst_info else None
+            lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+            min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+            filled_sz_decimal = Decimal(str(filled_sz)) if filled_sz > 0 else Decimal("0")
+            normalized_sl_sz = _normalize_qty(filled_sz_decimal, step=lot_step, min_sz=min_order) if filled_sz_decimal > 0 else Decimal("0")
+            sl_order_sz = _format_decimal(normalized_sl_sz) if normalized_sl_sz > 0 else "0"
+
+            fill_tracker.register_entry(inst_id=inst_id, side=side, entry_price=float(filled_price), stop_loss=float(sl))
+            state.set_entry(inst_id=inst_id, side=side, entry_price=float(filled_price), stop_loss=float(sl))
+
+            if sl_order_sz != "0":
+                try:
+                    sl_resp = await exchange.place_algo_order(
+                        inst_id=inst_id,
+                        td_mode=SETTINGS.okx_td_mode,
+                        side=sl_side,
+                        pos_side=pos_side,
+                        ord_type="conditional",
+                        sz=sl_order_sz,
+                        sl_trigger_px=_round_price_to_tick(sl, tick_size),
+                        sl_ord_px="-1",
+                    )
+                except Exception as e:
+                    sl_resp = {"code": "1", "msg": str(e)}
+
+                if str(sl_resp.get("code", "")) not in {"0", "success"}:
+                    _log_decision(inst_id, tf, action="two_limit_sl_failed", resp=sl_resp)
+                else:
+                    _log_decision(inst_id, tf, action="two_limit_sl_set", entry=filled_price, sl=sl, sz=sl_order_sz)
+
+            if SETTINGS.tp_enabled and SETTINGS.lighter_refresh_tp_enabled:
+                try:
+                    tp_targets = await _build_tp_targets(
+                        inst_id=inst_id,
+                        side=side,
+                        entry_price=float(filled_price),
+                        sl=float(sl),
+                        total_sz=Decimal(str(sl_order_sz)),
+                        tick_size=tick_size,
+                    )
+                    for target in tp_targets:
+                        tp_resp = await exchange.place_algo_order(
+                            inst_id=inst_id,
+                            td_mode=SETTINGS.okx_td_mode,
+                            side=sl_side,
+                            pos_side=pos_side,
+                            ord_type="conditional",
+                            sz=target["size"],
+                            tp_trigger_px=target["price"],
+                            tp_ord_px="-1",
+                        )
+                        if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                            _log_decision(inst_id, tf, action="two_limit_tp_failed", tag=target["tag"], resp=tp_resp)
+                except Exception as e:
+                    _log_decision(inst_id, tf, action="two_limit_tp_error", err=str(e))
+
+            return
+
+        await asyncio.sleep(max(0.5, poll_seconds))
+
+    # Timeout: cancel any remaining pending entry orders.
+    try:
+        await _cancel_pending_ladder_orders(key, inst_id, exchange)
+    except Exception:
+        pass
+    _log_decision(inst_id, tf, action="two_limit_timeout_canceled", timeout_s=timeout_seconds)
 
 
 async def _cancel_pending_ladder_orders(key: str, inst_id: str, exchange_obj: Any) -> tuple[int, int]:
@@ -458,6 +624,13 @@ def _build_dedupe_key(payload: "TvPayload", *, inst_id: str, tf: str, close_f: f
 
 
 def _log_payload(payload: TvPayload) -> None:
+    _audit_append_event(
+        {
+            "ts": _audit_utc_now_iso(),
+            "event": "tv_webhook_received",
+            **_audit_sanitize_payload(payload),
+        }
+    )
     logger.info(
         "tv_webhook received type=%s instId=%s tf=%s zone=%s t=%s close=%s rsi=%s long=%s short=%s",
         payload.type,
@@ -473,6 +646,16 @@ def _log_payload(payload: TvPayload) -> None:
 
 
 def _log_decision(inst_id: str, tf: str, *, action: str, **extra: object) -> None:
+    _audit_append_event(
+        {
+            "ts": _audit_utc_now_iso(),
+            "event": "tv_webhook_decision",
+            "instId": inst_id,
+            "tf": tf,
+            "action": action,
+            **{k: v for k, v in extra.items()},
+        }
+    )
     parts = " ".join(f"{k}={v}" for k, v in extra.items())
     logger.info("tv_webhook decision instId=%s tf=%s action=%s %s", inst_id, tf, action, parts)
 
@@ -1859,6 +2042,22 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     inst_id = _normalize_inst_id(payload.instId)
     if inst_id != payload.instId:
         _log_decision(payload.instId, payload.tf, action="symbol_mapped", mapped=inst_id)
+    _audit_append_event(
+        {
+            "ts": _audit_utc_now_iso(),
+            "event": "tv_webhook_validated",
+            "instId": inst_id,
+            "tf": payload.tf,
+            "type": payload.type,
+            "t": payload.t,
+            "close": payload.close,
+            "zone": payload.zone,
+            "side": payload.side,
+            "rsi": payload.rsi,
+            "rsi_long": payload.rsi_long,
+            "rsi_short": payload.rsi_short,
+        }
+    )
     if payload.secret != SETTINGS.tv_webhook_secret:
         _log_decision(inst_id, payload.tf, action="reject", reason="bad_secret")
         raise HTTPException(status_code=401, detail="Bad secret")
@@ -1867,6 +2066,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         raise HTTPException(status_code=403, detail="Symbol not allowed")
 
     tf = payload.tf
+    is_paper_tf = tf.lower() in SETTINGS.paper_trade_tfs
     key = _key(inst_id, tf)
 
     _log_payload(payload)
@@ -1950,8 +2150,8 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         _log_decision(inst_id, tf, action="skip", reason="missing_side")
         raise HTTPException(status_code=400, detail="DIV signal must specify 'side' field (buy or sell)")
 
-    # Check cooldown
-    if not state.can_trade(key, SETTINGS.cooldown_seconds):
+    # Check cooldown (skip for paper-collection TFs)
+    if (not is_paper_tf) and (not state.can_trade(key, SETTINGS.cooldown_seconds)):
         _log_decision(inst_id, tf, action="skip", reason="cooldown")
         return {"ok": True, "skipped": "cooldown"}
 
@@ -2021,7 +2221,20 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     last_candle_close = candles[-1].c if candles else None
 
     # Priority: use real-time price from candles, fallback to payload close, then zone close
-    entry_price = last_candle_close or close_f or (zone_state.close if zone_state is not None else None)
+    zone_close = zone_state.close if zone_state is not None else None
+    entry_price = last_candle_close or close_f or zone_close
+
+    entry_source = "candles" if last_candle_close is not None else ("payload_close" if close_f is not None else "zone_close")
+    _log_decision(
+        inst_id,
+        tf,
+        action="entry_price_selected",
+        source=entry_source,
+        entry=entry_price,
+        candle_close=last_candle_close,
+        payload_close=close_f,
+        zone_close=zone_close,
+    )
 
     if entry_price is None:
         _log_decision(inst_id, tf, action="skip", reason="no_entry_price")
@@ -2308,7 +2521,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     if SETTINGS.tp_enabled:
         tp = take_profit_price(side=side, entry_price=float(entry_price), stop_loss=float(sl), rr=SETTINGS.tp4_r)
 
-    if not SETTINGS.trading_enabled:
+    if (not SETTINGS.trading_enabled) or is_paper_tf:
         r_value = abs(float(entry_price) - float(sl))
         order_sz, size_meta = await _calculate_order_size(
             inst_id=inst_id,
@@ -2328,10 +2541,37 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 order_sz,
                 size_meta.get("actual_coins"),
             )
+        ref_price = await _get_ref_price_from_bar(inst_id, bar=SETTINGS.entry_two_limit_ref_bar)
+        two_limit = None
+        if ref_price is not None and sl is not None:
+            try:
+                l1_r = float(SETTINGS.entry_two_limit_l1_r)
+                l2_r = float(SETTINGS.entry_two_limit_l2_r)
+                if side == "buy":
+                    d = float(ref_price) - float(sl)
+                    p1 = float(ref_price) - l1_r * d
+                    p2 = float(ref_price) - l2_r * d
+                else:
+                    d = float(sl) - float(ref_price)
+                    p1 = float(ref_price) + l1_r * d
+                    p2 = float(ref_price) + l2_r * d
+                two_limit = {
+                    "ref_bar": SETTINGS.entry_two_limit_ref_bar,
+                    "ref": ref_price,
+                    "l1_r": l1_r,
+                    "l2_r": l2_r,
+                    "p1": p1,
+                    "p2": p2,
+                }
+            except Exception:
+                two_limit = None
+
+        mode = "paper_tf" if is_paper_tf else "paper_trading_disabled"
         _log_decision(
             inst_id,
             tf,
             action="paper_trade",
+            mode=mode,
             side=side,
             posSide=pos_side,
             entry=float(entry_price),
@@ -2340,10 +2580,13 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             r=r_value,
             sz=order_sz,
             zone=zone_state.zone,
+            ref_1m=ref_price,
+            two_limit=two_limit,
         )
         return {
             "ok": True,
             "paper": True,
+            "paper_mode": mode,
             "instId": inst_id,
             "zone": zone_state.zone,
             "side": side,
@@ -2354,6 +2597,8 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             "r": r_value,
             "order_sz": order_sz,
             "pattern": pattern,
+            "ref_1m": ref_price,
+            "two_limit": two_limit,
         }
 
     # ========== 新的下单逻辑：以损订仓 ==========
@@ -2702,6 +2947,137 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     # Get instrument info for price precision
     inst_info = await exchange.get_instrument_info(inst_id=inst_id)
     tick_size = inst_info.get("tickSz") if inst_info else None
+
+    if SETTINGS.entry_two_limit_enabled:
+        ref_price = await _get_ref_price_from_bar(inst_id, bar=SETTINGS.entry_two_limit_ref_bar) or float(entry_price)
+        if ref_price <= 0:
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="no_ref_price")
+            return {"ok": True, "skipped": "no_ref_price"}
+
+        # Compute stop-loss distance from ref price (D) and derive two limit prices.
+        if side == "buy":
+            d = float(ref_price) - float(sl)
+        else:
+            d = float(sl) - float(ref_price)
+        if d <= 0:
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="invalid_sl_distance", ref=ref_price, sl=sl)
+            return {"ok": True, "skipped": "invalid_sl_distance"}
+
+        l1_r = float(SETTINGS.entry_two_limit_l1_r)
+        l2_r = float(SETTINGS.entry_two_limit_l2_r)
+        if not (0 < l1_r < l2_r < 1.0):
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="bad_r_config", l1_r=l1_r, l2_r=l2_r)
+            return {"ok": True, "skipped": "bad_r_config"}
+
+        if side == "buy":
+            px1 = ref_price - l1_r * d
+            px2 = ref_price - l2_r * d
+        else:
+            px1 = ref_price + l1_r * d
+            px2 = ref_price + l2_r * d
+
+        px1_rounded = _round_price_to_tick(px1, tick_size)
+        px2_rounded = _round_price_to_tick(px2, tick_size)
+
+        total_sz = Decimal(str(order_sz))
+        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+        lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+        min_order_sz = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+        l1_pct = float(SETTINGS.entry_two_limit_l1_pct)
+        l2_pct = float(SETTINGS.entry_two_limit_l2_pct)
+        if l1_pct <= 0 or l2_pct <= 0 or abs((l1_pct + l2_pct) - 1.0) > 0.01:
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="bad_pct_config", l1_pct=l1_pct, l2_pct=l2_pct)
+            return {"ok": True, "skipped": "bad_pct_config"}
+
+        level1_sz_raw = total_sz * Decimal(str(l1_pct))
+        level2_sz_raw = total_sz * Decimal(str(l2_pct))
+        level1_sz = _normalize_qty(level1_sz_raw, step=lot_step, min_sz=min_order_sz) if level1_sz_raw > 0 else Decimal("0")
+        level2_sz = _normalize_qty(level2_sz_raw, step=lot_step, min_sz=min_order_sz) if level2_sz_raw > 0 else Decimal("0")
+
+        if level1_sz <= 0 and level2_sz <= 0:
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="zero_size")
+            return {"ok": True, "skipped": "zero_size"}
+
+        cl1 = f"tv{ts}{rnd}{side[:1]}E1"[:32]
+        cl2 = f"tv{ts}{rnd}{side[:1]}E2"[:32]
+
+        placed_orders: list[dict[str, object]] = []
+        for label, sz_dec, px_dec, cl in (
+            ("E1", level1_sz, px1_rounded, cl1),
+            ("E2", level2_sz, px2_rounded, cl2),
+        ):
+            if sz_dec <= 0:
+                continue
+            resp = await exchange.place_order(
+                inst_id=inst_id,
+                td_mode=SETTINGS.okx_td_mode,
+                side=side,
+                pos_side=pos_side,
+                ord_type="limit",
+                sz=_format_decimal(sz_dec),
+                px=px_dec,
+                cl_ord_id=cl,
+                sl_trigger_px=None,
+                tp_trigger_px=None,
+                reduce_only=False,
+            )
+            if str(resp.get("code", "")) not in {"0", "success"}:
+                _log_decision(inst_id, tf, action="two_limit_rejected", level=label, resp=resp)
+            else:
+                placed_orders.append({"level": label, "cl_ord_id": cl, "sz": float(sz_dec), "px": float(px_dec)})
+                fill_tracker.register_order_label(key=cl, label=f"entry_{label.lower()}")
+                symbol_for_state = inst_id.replace("-USDT-SWAP", "/USDT")
+                state.add_pending_order(key=key, order_id=cl, symbol=symbol_for_state, level=label)
+
+        if not placed_orders:
+            _log_decision(inst_id, tf, action="two_limit_skip", reason="no_orders_placed")
+            return {"ok": False, "error": "no_orders_placed"}
+
+        state.mark_traded(key)
+        state.clear_zone(key)
+        _log_decision(
+            inst_id,
+            tf,
+            action="two_limit_orders_placed",
+            side=side,
+            posSide=pos_side,
+            ref=ref_price,
+            sl=sl,
+            e1_px=px1_rounded,
+            e2_px=px2_rounded,
+            e1_sz=_format_decimal(level1_sz),
+            e2_sz=_format_decimal(level2_sz),
+        )
+
+        timeout_candles = float(get_entry_two_limit_timeout_candles(tf))
+        timeout_seconds = tf_to_seconds(tf) * timeout_candles if timeout_candles > 0 else 24 * 3600
+        task_key = f"{key}:two_limit"
+        prev = _entry_protect_tasks.get(task_key)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        _entry_protect_tasks[task_key] = asyncio.create_task(
+            _monitor_entry_and_set_protection(
+                key=key,
+                inst_id=inst_id,
+                tf=tf,
+                side=side,
+                pos_side=pos_side,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=float(SETTINGS.entry_two_limit_poll_seconds),
+            )
+        )
+
+        return {
+            "ok": True,
+            "type": "DIV",
+            "side": side,
+            "posSide": pos_side,
+            "ref": ref_price,
+            "sl": sl,
+            "orders": placed_orders,
+            "note": "two_limit_orders_pending",
+        }
 
     ladder_orders = []  # Track all ladder orders
     market_sz = None

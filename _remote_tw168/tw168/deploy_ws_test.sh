@@ -10,7 +10,12 @@ echo ""
 
 REMOTE_HOST="ubuntu@3.38.98.169"
 REMOTE_DIR="/home/ubuntu/tw168"
-SSH_KEY="../../LightsailDefaultKey-ap-northeast-2.pem"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/ssh_key_helper.sh
+source "${SCRIPT_DIR}/scripts/ssh_key_helper.sh"
+
+SSH_KEY="${SSH_KEY:-../../LightsailDefaultKey-ap-northeast-2.pem}"
+KEY_TO_USE="$(ssh_key_decrypt_to_temp_if_needed "$SSH_KEY")"
 
 echo "📋 测试配置："
 echo "  - WebSocket 监控: 6 个币种 (ETH, BTC, SOL, LINK, DOGE, BNB)"
@@ -21,20 +26,20 @@ echo ""
 echo "Step 1: 同步更新的代码..."
 echo "  - app/main.py (WebSocket 配置)"
 rsync -avz \
-  -e "ssh -i $SSH_KEY" \
+  -e "ssh -i $KEY_TO_USE" \
   app/main.py \
   "$REMOTE_HOST:$REMOTE_DIR/app/"
 
 echo "  - Lighter 客户端代码 (WebSocket 支持)"
 rsync -avz \
-  -e "ssh -i $SSH_KEY" \
+  -e "ssh -i $KEY_TO_USE" \
   /home/fordxx/perp-tools/src/perpbot/exchanges/lighter.py \
   /home/fordxx/perp-tools/src/perpbot/exchanges/lighter_websocket.py \
   "$REMOTE_HOST:$REMOTE_DIR/src/perpbot/exchanges/"
 
 echo ""
 echo "Step 2: 重启容器..."
-ssh -i "$SSH_KEY" "$REMOTE_HOST" << 'EOF'
+ssh -i "$KEY_TO_USE" "$REMOTE_HOST" << 'EOF'
 cd /home/ubuntu/tw168
 
 echo "停止容器..."

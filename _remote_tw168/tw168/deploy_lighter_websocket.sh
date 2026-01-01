@@ -11,17 +11,22 @@ echo ""
 REMOTE_HOST="ubuntu@3.38.98.169"
 REMOTE_DIR="/home/ubuntu/tw168"
 LOCAL_SRC="/home/fordxx/perp-tools/src"
-SSH_KEY="../../LightsailDefaultKey-ap-northeast-2.pem"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/ssh_key_helper.sh
+source "${SCRIPT_DIR}/scripts/ssh_key_helper.sh"
+
+SSH_KEY="${SSH_KEY:-../../LightsailDefaultKey-ap-northeast-2.pem}"
+KEY_TO_USE="$(ssh_key_decrypt_to_temp_if_needed "$SSH_KEY")"
 
 echo "Step 1: Syncing source code to remote server..."
 rsync -avz --progress \
-  -e "ssh -i $SSH_KEY" \
+  -e "ssh -i $KEY_TO_USE" \
   "$LOCAL_SRC/" \
   "$REMOTE_HOST:$REMOTE_DIR/src/"
 
 echo ""
 echo "Step 2: Rebuilding Docker image on remote server..."
-ssh -i "$SSH_KEY" "$REMOTE_HOST" << 'EOF'
+ssh -i "$KEY_TO_USE" "$REMOTE_HOST" << 'EOF'
 cd /home/ubuntu/tw168
 
 echo "Building Docker image with WebSocket support..."

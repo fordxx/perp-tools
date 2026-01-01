@@ -19,8 +19,26 @@ class Candle:
     c: float
 
 
+def _normalize_okx_bar(bar: str) -> str:
+    b = (bar or "").strip()
+    if not b:
+        return b
+    # OKX expects hour/day/week/month bars uppercased (e.g. 1H, 4H, 1D).
+    # Minute bars are lowercased (e.g. 15m, 30m).
+    if b.endswith("h") or b.endswith("d") or b.endswith("w"):
+        return b[:-1] + b[-1].upper()
+    # Month bars are typically "1M"
+    if b.endswith("M") or b.endswith("m"):
+        # Keep minutes as "m" when suffix is 'm' and pref is numeric; OKX uses 'm' for minutes.
+        if b.endswith("m"):
+            return b
+        return b
+    return b
+
+
 def fetch_candles(base_url: str, inst_id: str, bar: str, limit: int = 300) -> list[Candle]:
     url = f"{base_url}/api/v5/market/candles"
+    bar = _normalize_okx_bar(bar)
     resp = requests.get(url, params={"instId": inst_id, "bar": bar, "limit": str(limit)}, timeout=10)
     resp.raise_for_status()
     payload = resp.json()
@@ -43,15 +61,16 @@ def fetch_candles(base_url: str, inst_id: str, bar: str, limit: int = 300) -> li
 def fetch_candles_paged(base_url: str, inst_id: str, bar: str, limit: int = 3000) -> list[Candle]:
     if limit <= 300:
         return fetch_candles(base_url, inst_id, bar, limit=limit)
+    bar = _normalize_okx_bar(bar)
     all_rows: list[list[str]] = []
-    before: str | None = None
-    last_before: str | None = None
+    after: str | None = None
+    last_after: str | None = None
     remaining = limit
     while remaining > 0:
         page_limit = min(300, remaining)
         params = {"instId": inst_id, "bar": bar, "limit": str(page_limit)}
-        if before:
-            params["before"] = before
+        if after:
+            params["after"] = after
         resp = requests.get(f"{base_url}/api/v5/market/candles", params=params, timeout=10)
         resp.raise_for_status()
         payload = resp.json()
@@ -60,10 +79,10 @@ def fetch_candles_paged(base_url: str, inst_id: str, bar: str, limit: int = 3000
             break
         all_rows.extend(data)
         last_ts = data[-1][0]
-        if last_ts == last_before:
+        if last_ts == last_after:
             break
-        last_before = last_ts
-        before = last_ts
+        last_after = last_ts
+        after = last_ts
         remaining -= len(data)
     # OKX returns newest-first; convert to oldest-first.
     candles: list[Candle] = []

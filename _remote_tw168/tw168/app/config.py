@@ -48,6 +48,10 @@ def _getenv_optional(name: str) -> str | None:
     return value
 
 
+def _getenv_csv_set(name: str, default: str = "") -> set[str]:
+    return {item.strip().lower() for item in _getenv_list(name, default) if item.strip()}
+
+
 def _validate_settings(settings: "Settings") -> None:
     """Validate settings for common configuration errors."""
     import sys
@@ -139,6 +143,7 @@ class Settings:
     okx_td_mode: str = _getenv("OKX_TD_MODE", "cross")
     exchange: str = _getenv("EXCHANGE", "okx").lower()  # okx | extended | paradex
     trading_enabled: bool = _getenv_bool("TRADING_ENABLED", False)
+    paper_trade_tfs: set[str] = frozenset(_getenv_csv_set("PAPER_TRADE_TFS", ""))
 
     symbol_allowlist: set[str] = frozenset(
         s.strip()
@@ -169,6 +174,17 @@ class Settings:
     ladder_level2_pct: float = _getenv_float("LADDER_LEVEL2_PCT", 0.10)   # L2: 10% of position
     ladder_level3_bps: float = _getenv_float("LADDER_LEVEL3_BPS", 15.0)   # Not used
     ladder_level3_pct: float = _getenv_float("LADDER_LEVEL3_PCT", 0.0)    # Not used
+
+    # Two-limit entry mode (pure limit orders, prices derived from stop-loss distance)
+    entry_two_limit_enabled: bool = _getenv_bool("ENTRY_TWO_LIMIT_ENABLED", False)
+    entry_two_limit_l1_r: float = _getenv_float("ENTRY_TWO_LIMIT_L1_R", 0.25)
+    entry_two_limit_l2_r: float = _getenv_float("ENTRY_TWO_LIMIT_L2_R", 0.65)
+    entry_two_limit_l1_pct: float = _getenv_float("ENTRY_TWO_LIMIT_L1_PCT", 0.70)
+    entry_two_limit_l2_pct: float = _getenv_float("ENTRY_TWO_LIMIT_L2_PCT", 0.30)
+    entry_two_limit_ref_bar: str = _getenv("ENTRY_TWO_LIMIT_REF_BAR", "1m").lower()
+    entry_two_limit_timeout_candles: float = _getenv_float("ENTRY_TWO_LIMIT_TIMEOUT_CANDLES", 1.0)
+    entry_two_limit_timeout_candles_by_tf: str = _getenv("ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF", "")
+    entry_two_limit_poll_seconds: float = _getenv_float("ENTRY_TWO_LIMIT_POLL_SECONDS", 2.0)
 
     # Wait time configuration (by timeframe) - Shorter wait since 70% market fills immediately
     # 基础等待时间（无成交时的等待）
@@ -328,6 +344,7 @@ def _parse_float_by_tf(config_str: str) -> dict[str, float]:
 LADDER_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_wait_candles_by_tf)
 LADDER_MAX_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_max_wait_candles_by_tf)
 LADDER_PRICE_DISTANCE_BY_TF = _parse_float_by_tf(SETTINGS.ladder_price_distance_by_tf)
+ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.entry_two_limit_timeout_candles_by_tf)
 
 
 def get_ladder_wait_candles(tf: str) -> float:
@@ -343,6 +360,11 @@ def get_ladder_max_wait_candles(tf: str) -> float:
 def get_ladder_price_distance(tf: str) -> float:
     """Get price distance threshold (%) for a specific timeframe."""
     return LADDER_PRICE_DISTANCE_BY_TF.get(tf, SETTINGS.ladder_price_distance_pct)
+
+
+def get_entry_two_limit_timeout_candles(tf: str) -> float:
+    """Get two-limit entry timeout candles for a specific timeframe."""
+    return ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF.get(tf, SETTINGS.entry_two_limit_timeout_candles)
 
 
 def tf_to_seconds(tf: str) -> int:
