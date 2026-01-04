@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.config import SETTINGS, get_lookback_bars, get_ladder_wait_candles, get_ladder_max_wait_candles, get_ladder_price_distance, get_entry_two_limit_timeout_candles, tf_to_seconds
@@ -195,7 +196,80 @@ async def _monitor_entry_and_set_protection(
                 else:
                     _log_decision(inst_id, tf, action="two_limit_sl_set", entry=filled_price, sl=sl, sz=sl_order_sz)
 
-            if SETTINGS.tp_enabled and SETTINGS.lighter_refresh_tp_enabled:
+            if SETTINGS.tp_enabled:
+                try:
+                    existing_orders = await exchange.get_open_orders(inst_id=inst_id)
+                except Exception:
+                    existing_orders = []
+
+                def _classify_protect_order(order: dict) -> str | None:
+                    otype = str(order.get("type", "")).lower()
+                    if "take" in otype or "tp" in otype:
+                        return "tp"
+                    if "stop" in otype or "sl" in otype:
+                        return "sl"
+                    info = order.get("info") or {}
+                    if any(k in info for k in ("takeProfitPrice", "takeProfitLimitPrice", "tpTriggerPx")):
+                        return "tp"
+                    if any(k in info for k in ("stopLossPrice", "stopLossLimitPrice", "slTriggerPx")):
+                        return "sl"
+                    return None
+
+                if existing_orders:
+                    sl_val = float(sl)
+                    tick_val = None
+                    try:
+                        tick_val = float(tick_size) if tick_size else None
+                    except Exception:
+                        tick_val = None
+                    tol = (tick_val or 0.0) * 2 if tick_val else 1e-8
+
+                    for order in existing_orders:
+                        if not order.get("reduce_only") and not order.get("reduceOnly"):
+                            continue
+                        order_side = str(order.get("side", "")).lower()
+                        if order_side and order_side != sl_side:
+                            continue
+                        kind = _classify_protect_order(order)
+                        if kind is None:
+                            trigger = (
+                                order.get("trigger_price")
+                                or order.get("triggerPrice")
+                                or (order.get("info") or {}).get("triggerPrice")
+                            )
+                            if trigger is not None:
+                                try:
+                                    trigger_val = float(trigger)
+                                    if abs(trigger_val - sl_val) > tol:
+                                        kind = "tp"
+                                    else:
+                                        kind = "sl"
+                                except Exception:
+                                    kind = None
+                        if kind != "tp":
+                            continue
+                        ord_id = order.get("ordId") or order.get("id") or order.get("orderId")
+                        cl_ord_id = order.get("clOrdId") or order.get("clientOrderId") or order.get("client_order_id")
+                        if not ord_id and not cl_ord_id:
+                            continue
+                        try:
+                            await exchange.cancel_order(
+                                inst_id=inst_id,
+                                ord_id=str(ord_id) if ord_id else None,
+                                cl_ord_id=str(cl_ord_id) if cl_ord_id else None,
+                            )
+                        except TypeError:
+                            try:
+                                await exchange.cancel_order(
+                                    inst_id=inst_id,
+                                    order_id=str(ord_id) if ord_id else None,
+                                    cl_ord_id=str(cl_ord_id) if cl_ord_id else None,
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
                 try:
                     tp_targets = await _build_tp_targets(
                         inst_id=inst_id,
@@ -218,6 +292,12 @@ async def _monitor_entry_and_set_protection(
                         )
                         if str(tp_resp.get("code", "")) not in {"0", "success"}:
                             _log_decision(inst_id, tf, action="two_limit_tp_failed", tag=target["tag"], resp=tp_resp)
+                        else:
+                            data = tp_resp.get("data") or []
+                            if data:
+                                algo_id = data[0].get("algoId") or ""
+                                if algo_id:
+                                    fill_tracker.register_algo_label(algo_id=algo_id, label=target["tag"])
                 except Exception as e:
                     _log_decision(inst_id, tf, action="two_limit_tp_error", err=str(e))
 
@@ -313,6 +393,21 @@ elif SETTINGS.exchange == "paradex":
     use_testnet = env not in {"prod", "mainnet"}
     exchange = ParadexClient(use_testnet=use_testnet)
     exchange.connect()
+elif SETTINGS.exchange == "grvt":
+    import os
+    from app.grvt import GrvtClient, GrvtCredentials
+
+    grvt_base_url = os.getenv("GRVT_BASE_URL", "https://api.grvt.io")
+    exchange = GrvtClient(
+        grvt_base_url,
+        GrvtCredentials(
+            api_key=os.getenv("GRVT_API_KEY", ""),
+            private_key=os.getenv("GRVT_PRIVATE_KEY", ""),
+            trading_account_id=os.getenv("GRVT_TRADING_ACCOUNT_ID", ""),
+        ),
+    )
+    # Note: exchange.connect() will be called in startup event (async)
+    logger.info("GRVT client created, will connect on startup")
 elif SETTINGS.exchange == "lighter":
     import os
     from app.lighter_adapter import create_lighter_adapter
@@ -594,6 +689,14 @@ class TvPayload(BaseModel):
     rsi_short: float | str | None = None
 
 
+class ManualSignalRequest(BaseModel):
+    instId: str = Field(..., description="交易对，如 ETH-USDT-SWAP")
+    tf: str = Field(default="1h", description="时间周期：1m, 5m, 15m, 30m, 1h, 4h")
+    side: str = Field(..., description="方向: long 或 short")
+    type: str = Field(default="DIV", description="信号类型: ZONE 或 DIV")
+    admin_key: str = Field(..., description="管理员密钥")
+
+
 def _key(inst_id: str, tf: str) -> str:
     return f"{inst_id}:{tf}"
 
@@ -614,6 +717,41 @@ def _normalize_qty(qty: Decimal, *, step: Decimal | None, min_sz: Decimal | None
     if min_sz and qty < min_sz:
         qty = min_sz
     return qty
+
+
+def _adjust_size_for_min_quote(
+    sz: Decimal,
+    price: float,
+    inst_info: dict | None,
+    lot_step: Decimal | None,
+) -> tuple[Decimal, bool]:
+    """
+    Adjust order size to meet min_quote requirement.
+
+    Returns:
+        (adjusted_sz, was_adjusted)
+    """
+    if not inst_info or not inst_info.get("minQuote") or price <= 0:
+        return sz, False
+
+    min_quote = Decimal(str(inst_info.get("minQuote")))
+    order_value = sz * Decimal(str(price))
+
+    if order_value >= min_quote:
+        return sz, False
+
+    # Calculate minimum size to meet min_quote
+    required_sz = (min_quote / Decimal(str(price))).quantize(
+        Decimal("0.000001"), rounding=ROUND_UP
+    )
+
+    # Round up to lot_step
+    if lot_step and lot_step > 0:
+        required_sz = (required_sz / lot_step).quantize(
+            Decimal("1"), rounding=ROUND_UP
+        ) * lot_step
+
+    return required_sz, True
 
 
 def _build_dedupe_key(payload: "TvPayload", *, inst_id: str, tf: str, close_f: float | None) -> str:
@@ -692,8 +830,10 @@ def _parse_side(value: str | None) -> str | None:
     if not value:
         return None
     val = value.strip().lower()
-    if val in {"buy", "sell"}:
-        return val
+    if val in {"buy", "long"}:
+        return "buy"
+    if val in {"sell", "short"}:
+        return "sell"
     return None
 
 
@@ -1330,16 +1470,92 @@ async def _refresh_lighter_protection() -> None:
                     if (now - last_ts) < SETTINGS.lighter_refresh_seconds:
                         continue
 
+                # Try to get entry info from tracker or state
                 entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
                 if entry_info is None:
                     entry_state = state.get_entry(inst_id, ttl_seconds=SETTINGS.lighter_entry_ttl_seconds)
                     if entry_state is None:
-                        continue
-                    entry_info = SimpleNamespace(
-                        side=entry_state.side,
-                        entry_price=entry_state.entry_price,
-                        stop_loss=entry_state.stop_loss,
-                    )
+                        # NEW: If no entry_info, try to compute from position data
+                        logger.info(
+                            "lighter refresh no_entry_info instId=%s posSide=%s size=%s, attempting to compute from position",
+                            inst_id, pos_side, size
+                        )
+
+                        # Get entry price from position
+                        pos_entry_price = pos.get("avgPx") or pos.get("entry_price") or pos.get("open_price")
+                        if pos_entry_price is None:
+                            logger.warning(
+                                "lighter refresh skip instId=%s posSide=%s reason=no_entry_price_in_position",
+                                inst_id, pos_side
+                            )
+                            continue
+
+                        try:
+                            entry_price = float(pos_entry_price)
+                        except Exception:
+                            logger.warning(
+                                "lighter refresh skip instId=%s posSide=%s reason=invalid_entry_price",
+                                inst_id, pos_side
+                            )
+                            continue
+
+                        # Determine side from pos_side
+                        side = "buy" if pos_side == "long" else "sell"
+
+                        # Determine timeframe from candle_ws_symbol_tfs mapping
+                        tf = "1h"  # Default fallback
+                        if candle_ws_symbol_tfs and inst_id in candle_ws_symbol_tfs:
+                            tfs = candle_ws_symbol_tfs[inst_id]
+                            if tfs:
+                                tf = tfs[0]  # Use first configured timeframe
+
+                        logger.info(
+                            "lighter refresh using_timeframe instId=%s tf=%s (from candle_ws_symbol_tfs)",
+                            inst_id, tf
+                        )
+
+                        # Fetch candles to compute stop loss
+                        try:
+                            candles = await asyncio.to_thread(
+                                fetch_candles_paged,
+                                SETTINGS.okx_base_url,
+                                inst_id,
+                                tf,  # Use detected timeframe
+                                max(300, get_lookback_bars(tf) + 50)
+                            )
+                            stop_loss = stop_loss_price_lookback(
+                                side=side,
+                                entry_price=entry_price,
+                                candles=candles,
+                                lookback_bars=get_lookback_bars(tf),
+                                atr_len=SETTINGS.atr_len,
+                                atr_buffer_mult=SETTINGS.atr_buffer_mult,
+                                min_buffer_bps=SETTINGS.min_buffer_bps,
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "lighter refresh skip instId=%s posSide=%s reason=sl_computation_error err=%s",
+                                inst_id, pos_side, str(e)
+                            )
+                            continue
+
+                        # Create synthetic entry_info
+                        entry_info = SimpleNamespace(
+                            side=side,
+                            entry_price=entry_price,
+                            stop_loss=stop_loss,
+                        )
+
+                        logger.info(
+                            "lighter refresh computed_entry_info instId=%s posSide=%s tf=%s entry=%.4f sl=%.4f",
+                            inst_id, pos_side, tf, entry_price, stop_loss
+                        )
+                    else:
+                        entry_info = SimpleNamespace(
+                            side=entry_state.side,
+                            entry_price=entry_state.entry_price,
+                            stop_loss=entry_state.stop_loss,
+                        )
 
                 inst_info = await exchange.get_instrument_info(inst_id=inst_id)
                 tick_size = inst_info.get("tickSz") if inst_info else None
@@ -1881,6 +2097,16 @@ async def _startup() -> None:
             logger.error(f"Traceback: {traceback.format_exc()}")
             logger.info("ℹ️  Continuing without WebSocket (REST API only)")
 
+    # Connect GRVT exchange if using GRVT (async)
+    if SETTINGS.exchange == "grvt":
+        logger.info("Connecting to GRVT exchange...")
+        try:
+            await exchange.connect()
+            logger.info("✅ GRVT client connected")
+        except Exception as e:
+            logger.error(f"❌ Failed to connect GRVT client: {e}")
+            raise
+
     if SETTINGS.trading_enabled and manager is not None:
         manager.start()
     if SETTINGS.trading_enabled and ws_manager is not None:
@@ -2036,6 +2262,445 @@ async def webhook_tradingview(req: Request) -> dict:
     last_webhook_ts = time.time()
     last_webhook_count += 1
     return await _process_payload(payload)
+
+
+@app.post("/manual/signal")
+async def manual_signal(req: ManualSignalRequest) -> dict:
+    """手动发送交易信号"""
+    # 验证管理员密钥
+    if req.admin_key != SETTINGS.tv_webhook_secret:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+    # 构造 TvPayload
+    from datetime import datetime
+    payload = TvPayload(
+        secret=SETTINGS.tv_webhook_secret,
+        type=req.type,
+        instId=req.instId,
+        tf=req.tf,
+        side=req.side,
+        t=datetime.utcnow().isoformat() + "Z",
+        close=None,  # 让系统自动获取最新价格
+        zone=None
+    )
+
+    # 复用现有的信号处理逻辑
+    return await _process_payload(payload, allow_no_zone=True)
+
+
+@app.get("/")
+async def web_ui():
+    """提供网页UI界面"""
+    html_content = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 TW168 交易控制面板</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        .navbar {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 2px 20px rgba(0,0,0,0.1);
+        }
+        .main-container {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+            margin: 20px;
+            padding: 30px;
+        }
+        .card {
+            border: none;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        .btn-primary {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            border: none;
+            border-radius: 25px;
+            padding: 12px 30px;
+            font-weight: 600;
+            transition: all 0.3s ease;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .form-control {
+            border-radius: 10px;
+            border: 2px solid #e9ecef;
+            transition: border-color 0.3s ease;
+        }
+        .form-control:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 0.2rem rgba(102, 126, 234, 0.25);
+        }
+        .status-card {
+            background: linear-gradient(45deg, #28a745, #20c997);
+            color: white;
+        }
+        .alert-custom {
+            border-radius: 10px;
+            border: none;
+        }
+        .price-display {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #28a745;
+        }
+        .trading-signal {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        .symbol-badge {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            margin: 2px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-light">
+        <div class="container">
+            <a class="navbar-brand fw-bold" href="#">
+                <i class="fas fa-rocket text-primary"></i> TW168 交易控制面板
+            </a>
+            <div class="d-flex">
+                <span class="badge bg-success me-2">GRVT</span>
+                <span class="badge bg-info">在线</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid">
+        <div class="main-container">
+            <!-- 状态概览 -->
+            <div class="row mb-4">
+                <div class="col-md-3">
+                    <div class="card status-card text-white">
+                        <div class="card-body text-center">
+                            <i class="fas fa-chart-line fa-2x mb-2"></i>
+                            <h5>系统状态</h5>
+                            <p class="mb-0">运行正常</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body text-center">
+                            <i class="fas fa-clock fa-2x mb-2 text-warning"></i>
+                            <h5>最后信号</h5>
+                            <p class="mb-0" id="lastSignalTime">-</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body text-center">
+                            <i class="fas fa-signal fa-2x mb-2 text-info"></i>
+                            <h5>信号计数</h5>
+                            <p class="mb-0" id="signalCount">-</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="card">
+                        <div class="card-body text-center">
+                            <i class="fas fa-exchange-alt fa-2x mb-2 text-success"></i>
+                            <h5>活跃仓位</h5>
+                            <p class="mb-0" id="activePositions">-</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 手动信号发送 -->
+            <div class="row">
+                <div class="col-lg-8">
+                    <div class="card">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="fas fa-hand-paper"></i> 手动交易信号</h5>
+                        </div>
+                        <div class="card-body">
+                            <form id="signalForm">
+                                <div class="row">
+                                    <div class="col-md-6 mb-3">
+                                        <label class="form-label fw-bold">交易对</label>
+                                        <select class="form-select" id="instId" required>
+                                            <option value="">选择交易对</option>
+                                            <option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option>
+                                            <option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option>
+                                            <option value="SOL-USDT-SWAP">SOL-USDT-SWAP</option>
+                                            <option value="LINK-USDT-SWAP">LINK-USDT-SWAP</option>
+                                            <option value="DOGE-USDT-SWAP">DOGE-USDT-SWAP</option>
+                                            <option value="BNB-USDT-SWAP">BNB-USDT-SWAP</option>
+                                            <option value="BCH-USDT-SWAP">BCH-USDT-SWAP</option>
+                                            <option value="TRX-USDT-SWAP">TRX-USDT-SWAP</option>
+                                            <option value="EIGEN-USDT-SWAP">EIGEN-USDT-SWAP</option>
+                                            <option value="ETHFI-USDT-SWAP">ETHFI-USDT-SWAP</option>
+                                            <option value="FARTCOIN-USDT-SWAP">FARTCOIN-USDT-SWAP</option>
+                                            <option value="JTO-USDT-SWAP">JTO-USDT-SWAP</option>
+                                            <option value="PUMP-USDT-SWAP">PUMP-USDT-SWAP</option>
+                                            <option value="TAO-USDT-SWAP">TAO-USDT-SWAP</option>
+                                            <option value="TON-USDT-SWAP">TON-USDT-SWAP</option>
+                                            <option value="TRUMP-USDT-SWAP">TRUMP-USDT-SWAP</option>
+                                            <option value="PENGU-USDT-SWAP">PENGU-USDT-SWAP</option>
+                                            <option value="BONK-USDT-SWAP">BONK-USDT-SWAP</option>
+                                            <option value="BOME-USDT-SWAP">BOME-USDT-SWAP</option>
+                                            <option value="PNUT-USDT-SWAP">PNUT-USDT-SWAP</option>
+                                            <option value="XRP-USDT-SWAP">XRP-USDT-SWAP</option>
+                                            <option value="ONDO-USDT-SWAP">ONDO-USDT-SWAP</option>
+                                            <option value="LTC-USDT-SWAP">LTC-USDT-SWAP</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-3 mb-3">
+                                        <label class="form-label fw-bold">时间周期</label>
+                                        <select class="form-select" id="tf" required>
+                                            <option value="1m">1分钟</option>
+                                            <option value="5m">5分钟</option>
+                                            <option value="15m">15分钟</option>
+                                            <option value="30m">30分钟</option>
+                                            <option value="1h" selected>1小时</option>
+                                            <option value="4h">4小时</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-3 mb-3">
+                                        <label class="form-label fw-bold">方向</label>
+                                        <select class="form-select" id="side" required>
+                                            <option value="">选择方向</option>
+                                            <option value="long">📈 做多</option>
+                                            <option value="short">📉 做空</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label fw-bold">管理员密钥</label>
+                                    <input type="password" class="form-control" id="adminKey" placeholder="输入管理员密钥" required>
+                                </div>
+                                <button type="submit" class="btn btn-primary btn-lg w-100" id="submitBtn">
+                                    <i class="fas fa-paper-plane"></i> 发送交易信号
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 实时价格显示 -->
+                <div class="col-lg-4">
+                    <div class="card">
+                        <div class="card-header bg-info text-white">
+                            <h5 class="mb-0"><i class="fas fa-dollar-sign"></i> 实时价格</h5>
+                        </div>
+                        <div class="card-body">
+                            <div id="priceDisplay" class="text-center">
+                                <div class="spinner-border text-info" role="status">
+                                    <span class="visually-hidden">加载中...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 热门交易对 -->
+                    <div class="card mt-3">
+                        <div class="card-header bg-warning text-dark">
+                            <h6 class="mb-0"><i class="fas fa-star"></i> 热门交易对</h6>
+                        </div>
+                        <div class="card-body">
+                            <div class="d-flex flex-wrap">
+                                <span class="symbol-badge">BTC</span>
+                                <span class="symbol-badge">ETH</span>
+                                <span class="symbol-badge">SOL</span>
+                                <span class="symbol-badge">LINK</span>
+                                <span class="symbol-badge">DOGE</span>
+                                <span class="symbol-badge">BNB</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 结果显示区域 -->
+            <div class="row mt-4">
+                <div class="col-12">
+                    <div id="result" class="alert alert-custom" style="display: none;"></div>
+                </div>
+            </div>
+
+            <!-- 信号历史 -->
+            <div class="row mt-4">
+                <div class="col-12">
+                    <div class="card">
+                        <div class="card-header bg-secondary text-white">
+                            <h6 class="mb-0"><i class="fas fa-history"></i> 最近信号历史</h6>
+                        </div>
+                        <div class="card-body">
+                            <div id="signalHistory" class="small">
+                                <div class="text-muted">暂无信号历史</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        // 页面加载时获取系统状态
+        window.onload = function() {
+            updateSystemStatus();
+            setInterval(updateSystemStatus, 30000); // 每30秒更新一次
+        };
+
+        async function updateSystemStatus() {
+            try {
+                const response = await fetch('/health');
+                const data = await response.json();
+
+                // 更新最后信号时间
+                const lastSignal = localStorage.getItem('lastSignalTime');
+                if (lastSignal) {
+                    const time = new Date(parseInt(lastSignal));
+                    document.getElementById('lastSignalTime').textContent = time.toLocaleString();
+                }
+
+                // 更新信号计数
+                const count = localStorage.getItem('signalCount') || '0';
+                document.getElementById('signalCount').textContent = count;
+
+                // 更新活跃仓位 (这里需要实际的API调用)
+                document.getElementById('activePositions').textContent = '检查中...';
+
+            } catch (error) {
+                console.error('获取系统状态失败:', error);
+            }
+        }
+
+        // 信号表单提交
+        document.getElementById('signalForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const submitBtn = document.getElementById('submitBtn');
+            const resultDiv = document.getElementById('result');
+
+            const data = {
+                instId: document.getElementById('instId').value,
+                tf: document.getElementById('tf').value,
+                side: document.getElementById('side').value,
+                type: 'DIV',
+                admin_key: document.getElementById('adminKey').value
+            };
+
+            if (!data.instId || !data.tf || !data.side || !data.admin_key) {
+                showResult('请填写所有必填字段', 'danger');
+                return;
+            }
+
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>发送中...';
+            resultDiv.style.display = 'none';
+
+            try {
+                const response = await fetch('/manual/signal', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    // 保存到本地存储
+                    localStorage.setItem('lastSignalTime', Date.now());
+                    const count = parseInt(localStorage.getItem('signalCount') || '0') + 1;
+                    localStorage.setItem('signalCount', count.toString());
+
+                    showResult(`✅ 信号发送成功！\\n\\n交易对: ${data.instId}\\n方向: ${data.side}\\n时间周期: ${data.tf}`, 'success');
+                    updateSignalHistory(data, result);
+                    updateSystemStatus();
+                } else {
+                    showResult(`❌ 发送失败: ${result.detail || JSON.stringify(result)}`, 'danger');
+                }
+
+            } catch (error) {
+                showResult(`❌ 网络错误: ${error.message}`, 'danger');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> 发送交易信号';
+            }
+        });
+
+        function showResult(message, type) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.className = `alert alert-${type} alert-custom`;
+            resultDiv.innerHTML = `<pre class="mb-0">${message}</pre>`;
+            resultDiv.style.display = 'block';
+
+            // 3秒后自动隐藏成功消息
+            if (type === 'success') {
+                setTimeout(() => {
+                    resultDiv.style.display = 'none';
+                }, 3000);
+            }
+        }
+
+        function updateSignalHistory(signal, result) {
+            const historyDiv = document.getElementById('signalHistory');
+            const time = new Date().toLocaleString();
+            const entry = `<div class="mb-2 p-2 bg-light rounded">
+                <small class="text-muted">${time}</small><br>
+                <strong>${signal.instId}</strong> ${signal.side} (${signal.tf})
+                ${result.paper ? '<span class="badge bg-warning">纸上交易</span>' : '<span class="badge bg-success">实盘交易</span>'}
+            </div>`;
+            historyDiv.innerHTML = entry + historyDiv.innerHTML;
+        }
+
+        // 交易对选择时显示实时价格
+        document.getElementById('instId').addEventListener('change', async function() {
+            const symbol = this.value;
+            if (!symbol) return;
+
+            const priceDisplay = document.getElementById('priceDisplay');
+            priceDisplay.innerHTML = '<div class="spinner-border spinner-border-sm text-info" role="status"></div>';
+
+            try {
+                // 这里可以调用实际的价格API
+                // 暂时显示模拟价格
+                setTimeout(() => {
+                    const mockPrice = (Math.random() * 100000).toFixed(2);
+                    priceDisplay.innerHTML = `<div class="price-display">$${mockPrice}</div>`;
+                }, 500);
+            } catch (error) {
+                priceDisplay.innerHTML = '<div class="text-muted">获取价格失败</div>';
+            }
+        });
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content, status_code=200)
 
 
 async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -> dict:
@@ -2404,8 +3069,12 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 )
                 return {"ok": True, "skipped": "rsi_not_overbought"}
     elif allow_no_zone:
-        _log_decision(inst_id, tf, action="skip", reason="rsi_disabled_no_zone")
-        return {"ok": True, "skipped": "rsi_disabled_no_zone"}
+        # When RSI filter is disabled, allow manual signals without zone
+        # Create a synthetic zone based on the requested side
+        if zone_state is None:
+            zone = "OVERSOLD" if side == "buy" else "OVERBOUGHT"
+            zone_state = SimpleNamespace(zone=zone, close=entry_price)
+        _log_decision(inst_id, tf, action="manual_signal_no_zone_allowed", zone=zone_state.zone)
 
     if side == "buy" and not SETTINGS.enable_long:
         _log_decision(inst_id, tf, action="skip", reason="long_disabled")
@@ -2999,8 +3668,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             _log_decision(inst_id, tf, action="two_limit_skip", reason="zero_size")
             return {"ok": True, "skipped": "zero_size"}
 
-        cl1 = f"tv{ts}{rnd}{side[:1]}E1"[:32]
-        cl2 = f"tv{ts}{rnd}{side[:1]}E2"[:32]
+        # Use numeric suffix (1/2) instead of letters (E1/E2) for GRVT compatibility
+        cl1 = f"tv{ts}{rnd}{side[:1]}1"[:32]
+        cl2 = f"tv{ts}{rnd}{side[:1]}2"[:32]
 
         placed_orders: list[dict[str, object]] = []
         for label, sz_dec, px_dec, cl in (
@@ -3558,6 +4228,29 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     filled_sz_decimal = Decimal(str(total_filled_sz)) if total_filled_sz > 0 else Decimal(str(order_sz))
     normalized_sl_sz = _normalize_qty(filled_sz_decimal, step=lot_step, min_sz=min_order)
+
+    # Adjust stop-loss order size to meet min_quote requirement
+    sl_adjusted = False
+    if sl > 0:
+        adjusted_sz, was_adjusted = _adjust_size_for_min_quote(
+            normalized_sl_sz,
+            float(sl),
+            inst_info,
+            lot_step,
+        )
+        if was_adjusted:
+            logger.warning(
+                "tv_webhook sl_size_adjusted instId=%s original_sz=%s adjusted_sz=%s "
+                "reason=min_quote entry_value=%.2f sl_value=%.2f",
+                inst_id,
+                normalized_sl_sz,
+                adjusted_sz,
+                float(normalized_sl_sz) * filled_price,
+                float(adjusted_sz) * float(sl),
+            )
+            normalized_sl_sz = adjusted_sz
+            sl_adjusted = True
+
     sl_order_sz = _format_decimal(normalized_sl_sz)
 
     # Check current market price before placing SL order
@@ -3638,6 +4331,36 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             sl_ord_px="-1",
         )
         logger.info("tv_webhook sl_order_placed sl_price=%.4f resp=%s", sl, sl_resp)
+
+        # Check if failed due to min_quote
+        if str(sl_resp.get("code", "")) == "min_quote_failed":
+            # Extract details and retry with adjusted size
+            details = sl_resp.get("details", {})
+            logger.warning(
+                "tv_webhook sl_min_quote_failed attempting_retry with_adjusted_size "
+                "original_value=%.2f min_quote=%.2f",
+                details.get("order_value", 0),
+                details.get("min_quote", 0),
+            )
+
+            # If already adjusted, increase by 10% buffer
+            if sl_adjusted:
+                retry_sz = normalized_sl_sz * Decimal("1.1")
+                retry_sz = _normalize_qty(retry_sz, step=lot_step, min_sz=min_order)
+                retry_sz_str = _format_decimal(retry_sz)
+
+                logger.info("tv_webhook sl_retry with_increased_size=%s", retry_sz_str)
+                sl_resp = await exchange.place_algo_order(
+                    inst_id=inst_id,
+                    td_mode=SETTINGS.okx_td_mode,
+                    side=sl_side,
+                    pos_side=pos_side,
+                    ord_type="conditional",
+                    sz=retry_sz_str,
+                    sl_trigger_px=_round_price_to_tick(sl, tick_size),
+                    sl_ord_px="-1",
+                )
+
         if str(sl_resp.get("code", "")) not in {"0", "success"}:
             sl_failure_reason = f"code={sl_resp.get('code')} msg={sl_resp.get('msg')}"
             notify_error(
@@ -3806,9 +4529,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 "warning": "Position has NO STOP LOSS protection - emergency handler monitoring",
             }
 
-    # 6.5 Lighter: place TP orders directly (no TradeManager support)
+    # 6.5 Lighter/GRVT: place TP orders directly (no TradeManager support)
     tp_orders: list[dict[str, str]] = []
-    if SETTINGS.exchange == "lighter" and SETTINGS.tp_enabled:
+    if SETTINGS.exchange in {"lighter", "grvt"} and SETTINGS.tp_enabled:
         r_value_final = abs(filled_price - float(sl))
         if r_value_final > 0:
             tp_orders = await _build_tp_targets(
@@ -3832,11 +4555,18 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 )
                 if str(tp_resp.get("code", "")) not in {"0", "success"}:
                     notify_error(
-                        f"lighter tp failed instId={inst_id} tag={target['tag']} price={target['price']} sz={target['size']} resp={tp_resp}"
+                        f"{SETTINGS.exchange} tp failed instId={inst_id} tag={target['tag']} "
+                        f"price={target['price']} sz={target['size']} resp={tp_resp}"
                     )
+                else:
+                    data = tp_resp.get("data") or []
+                    if data:
+                        algo_id = data[0].get("algoId") or ""
+                        if algo_id:
+                            fill_tracker.register_algo_label(algo_id=algo_id, label=target["tag"])
             if tp_orders:
                 notify_info(
-                    f"lighter tp orders placed instId={inst_id} count={len(tp_orders)}"
+                    f"{SETTINGS.exchange} tp orders placed instId={inst_id} count={len(tp_orders)}"
                 )
 
     # 7. 标记交易和清除zone
@@ -3878,6 +4608,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         "entry": filled_price,
         "sl": sl,
         "tp3": tp,
+        "tp_orders": tp_orders,
         "order_sz": order_sz,
         "r_value": r_value_final,
         "order": resp,

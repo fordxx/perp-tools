@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY okx_compat_layer.py ./
 COPY README.md ./
+COPY router_app.py ./
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/src:$PYTHONPATH

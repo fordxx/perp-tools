@@ -7,3 +7,4 @@ lighter-sdk
 websockets
 httpx
 ccxt
+grvt-pysdk

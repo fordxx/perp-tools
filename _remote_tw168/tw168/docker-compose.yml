@@ -2,10 +2,37 @@ services:
   tv-okx:
     build: .
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"  # 只监听本地，不暴露到公网
     volumes:
       - ${PERPBOT_SRC_PATH:-../../src}:/src:ro
       - ./logs:/app/logs
     env_file:
       - .env
+    environment:
+      EXCHANGE: grvt
+    restart: unless-stopped
+
+  # tv-grvt:
+  #   build: .
+  #   volumes:
+  #     - ${PERPBOT_SRC_PATH:-../../src}:/src:ro
+  #     - ./logs:/app/logs
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     EXCHANGE: grvt
+  #   restart: unless-stopped
+
+  tv-router:
+    build: .
+    ports:
+      - "127.0.0.1:8001:8000"  # 只监听本地
+    env_file:
+      - .env
+    environment:
+      LIGHTER_BACKEND_URL: http://tv-okx:8000
+      GRVT_BACKEND_URL: http://tv-grvt:8000
+      MIRROR_PRIMARY: lighter
+      MIRROR_TIMEOUT_SECONDS: "30"
+    command: ["uvicorn", "router_app:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped

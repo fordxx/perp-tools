@@ -136,6 +136,7 @@ class EmergencyHandler:
         logger.warning("Emergency handler checking %d positions", len(positions))
 
         for pos in positions:
+            # Check if max retries reached
             if pos.retry_count >= pos.max_retries:
                 # Max retries reached, send critical alert
                 notify_error(
@@ -151,10 +152,87 @@ class EmergencyHandler:
                 )
                 continue
 
-            # Position still has retries left
+            # Attempt active recovery: retry setting stop-loss
             age_seconds = int(time.time() - pos.timestamp)
-            if age_seconds > 30 and age_seconds % 30 == 0:
-                # Send periodic reminder every 30 seconds
+            retry_interval = 30  # Retry every 30 seconds
+
+            if age_seconds % retry_interval == 0:
+                try:
+                    from app.main import exchange, _adjust_size_for_min_quote, _normalize_qty, _format_decimal
+                    from decimal import Decimal, ROUND_UP
+
+                    logger.info(
+                        "emergency_handler attempting_sl_recovery instId=%s retry=%d/%d",
+                        pos.inst_id,
+                        pos.retry_count + 1,
+                        pos.max_retries,
+                    )
+
+                    # Get instrument info
+                    inst_info = await exchange.get_instrument_info(inst_id=pos.inst_id)
+                    if not inst_info:
+                        logger.warning("emergency_handler inst_info_unavailable instId=%s", pos.inst_id)
+                        continue
+
+                    lot_step = Decimal(str(inst_info.get("lotStep", "1")))
+                    min_order = Decimal(str(inst_info.get("lotSz", "1")))
+
+                    # Adjust stop-loss order size to meet min_quote
+                    sl_sz = Decimal(str(pos.size))
+                    adjusted_sz, was_adjusted = _adjust_size_for_min_quote(
+                        sl_sz,
+                        float(pos.stop_loss),
+                        inst_info,
+                        lot_step,
+                    )
+
+                    if was_adjusted:
+                        logger.info(
+                            "emergency_handler sl_size_adjusted from=%s to=%s min_quote_requirement",
+                            sl_sz,
+                            adjusted_sz,
+                        )
+
+                    sl_sz_str = _format_decimal(adjusted_sz)
+                    sl_side = "buy" if pos.pos_side == "short" else "sell"
+
+                    # Attempt to place stop-loss order
+                    sl_resp = await exchange.place_algo_order(
+                        inst_id=pos.inst_id,
+                        td_mode="cross",
+                        side=sl_side,
+                        pos_side=pos.pos_side,
+                        ord_type="conditional",
+                        sz=sl_sz_str,
+                        sl_trigger_px=str(pos.stop_loss),
+                        sl_ord_px="-1",
+                    )
+
+                    if str(sl_resp.get("code", "")) in {"0", "success"}:
+                        logger.info("emergency_handler recovery_success instId=%s", pos.inst_id)
+                        await self.clear_emergency(pos.inst_id, pos.pos_side)
+                        from app.notify import notify_info
+                        notify_info(
+                            f"✅ Emergency Recovery Success\n"
+                            f"Symbol: {pos.inst_id}\n"
+                            f"SL set at: {pos.stop_loss}\n"
+                            f"Size: {sl_sz_str}"
+                        )
+                    else:
+                        logger.warning(
+                            "emergency_handler recovery_failed instId=%s resp=%s",
+                            pos.inst_id,
+                            sl_resp,
+                        )
+                        # Increment retry count
+                        pos.retry_count += 1
+
+                except Exception as e:
+                    logger.error("emergency_handler recovery_exception instId=%s err=%s", pos.inst_id, e)
+                    pos.retry_count += 1
+
+            # Send periodic reminder
+            if age_seconds > 30 and age_seconds % 60 == 0:
                 notify_error(
                     f"⚠️ Emergency position still open ({age_seconds}s)\n"
                     f"Symbol: {pos.inst_id} {pos.pos_side}\n"

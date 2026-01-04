@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>手动交易信号发送</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        select, input[type="text"], input[type="password"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 20px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 5px;
+            display: none;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .examples {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #007bff;
+        }
+        .examples h3 {
+            margin-top: 0;
+            color: #007bff;
+        }
+        .examples ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .examples li {
+            margin: 5px 0;
+        }
+        code {
+            background-color: #f1f1f1;
+            padding: 2px 4px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📊 手动交易信号发送</h1>
+
+        <div class="examples">
+            <h3>📋 使用说明</h3>
+            <ul>
+                <li>选择交易对、时间周期和交易方向</li>
+                <li>输入管理员密钥（与TradingView webhook密钥相同）</li>
+                <li>点击"发送信号"按钮</li>
+                <li>系统会自动计算止损、止盈并下单</li>
+            </ul>
+            <p><strong>注意：</strong>此功能会立即在配置的交易所（GRVT/Lighter/OKX等）开仓，请谨慎使用！</p>
+        </div>
+
+        <form id="signalForm">
+            <div class="form-group">
+                <label for="instId">交易对:</label>
+                <select id="instId" required>
+                    <option value="">请选择交易对</option>
+                    <option value="BTC-USDT-SWAP">BTC-USDT-SWAP</option>
+                    <option value="ETH-USDT-SWAP">ETH-USDT-SWAP</option>
+                    <option value="SOL-USDT-SWAP">SOL-USDT-SWAP</option>
+                    <option value="LINK-USDT-SWAP">LINK-USDT-SWAP</option>
+                    <option value="DOGE-USDT-SWAP">DOGE-USDT-SWAP</option>
+                    <option value="BNB-USDT-SWAP">BNB-USDT-SWAP</option>
+                    <option value="BCH-USDT-SWAP">BCH-USDT-SWAP</option>
+                    <option value="TRX-USDT-SWAP">TRX-USDT-SWAP</option>
+                    <option value="EIGEN-USDT-SWAP">EIGEN-USDT-SWAP</option>
+                    <option value="ETHFI-USDT-SWAP">ETHFI-USDT-SWAP</option>
+                    <option value="FARTCOIN-USDT-SWAP">FARTCOIN-USDT-SWAP</option>
+                    <option value="JTO-USDT-SWAP">JTO-USDT-SWAP</option>
+                    <option value="PUMP-USDT-SWAP">PUMP-USDT-SWAP</option>
+                    <option value="TAO-USDT-SWAP">TAO-USDT-SWAP</option>
+                    <option value="TON-USDT-SWAP">TON-USDT-SWAP</option>
+                    <option value="TRUMP-USDT-SWAP">TRUMP-USDT-SWAP</option>
+                    <option value="XRP-USDT-SWAP">XRP-USDT-SWAP</option>
+                    <option value="ONDO-USDT-SWAP">ONDO-USDT-SWAP</option>
+                    <option value="LTC-USDT-SWAP">LTC-USDT-SWAP</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="tf">时间周期:</label>
+                <select id="tf" required>
+                    <option value="1m">1分钟</option>
+                    <option value="5m">5分钟</option>
+                    <option value="15m">15分钟</option>
+                    <option value="30m">30分钟</option>
+                    <option value="1h" selected>1小时</option>
+                    <option value="4h">4小时</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="side">交易方向:</label>
+                <select id="side" required>
+                    <option value="">请选择方向</option>
+                    <option value="long">做多 (Long)</option>
+                    <option value="short">做空 (Short)</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="adminKey">管理员密钥:</label>
+                <input type="password" id="adminKey" placeholder="输入管理员密钥" required>
+            </div>
+
+            <button type="submit" id="submitBtn">
+                🚀 发送信号
+            </button>
+        </form>
+
+        <div id="result" class="result"></div>
+    </div>
+
+    <script>
+        document.getElementById('signalForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const submitBtn = document.getElementById('submitBtn');
+            const resultDiv = document.getElementById('result');
+
+            // 获取表单数据
+            const data = {
+                instId: document.getElementById('instId').value,
+                tf: document.getElementById('tf').value,
+                side: document.getElementById('side').value,
+                type: 'DIV',
+                admin_key: document.getElementById('adminKey').value
+            };
+
+            // 验证数据
+            if (!data.instId || !data.tf || !data.side || !data.admin_key) {
+                showResult('请填写所有必填字段', 'error');
+                return;
+            }
+
+            // 显示加载状态
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="loading"></span> 发送中...';
+            resultDiv.style.display = 'none';
+
+            try {
+                const response = await fetch('/manual/signal', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(data)
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    showResult(`✅ 信号发送成功！\\n\\n${JSON.stringify(result, null, 2)}`, 'success');
+                } else {
+                    showResult(`❌ 发送失败: ${result.detail || JSON.stringify(result)}`, 'error');
+                }
+
+            } catch (error) {
+                showResult(`❌ 网络错误: ${error.message}`, 'error');
+            } finally {
+                // 恢复按钮状态
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '🚀 发送信号';
+            }
+        });
+
+        function showResult(message, type) {
+            const resultDiv = document.getElementById('result');
+            resultDiv.className = `result ${type}`;
+            resultDiv.innerHTML = `<pre>${message}</pre>`;
+            resultDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>

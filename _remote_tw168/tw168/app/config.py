@@ -143,6 +143,9 @@ class Settings:
     okx_td_mode: str = _getenv("OKX_TD_MODE", "cross")
     exchange: str = _getenv("EXCHANGE", "okx").lower()  # okx | extended | paradex
     trading_enabled: bool = _getenv_bool("TRADING_ENABLED", False)
+    # Optional: if set, the UI server (port 9000) can forward manual signals to a remote trading service.
+    # Example: http://3.38.98.169:8000
+    trading_service_base_url: str = _getenv("TRADING_SERVICE_BASE_URL", "").strip().rstrip("/")
     paper_trade_tfs: set[str] = frozenset(_getenv_csv_set("PAPER_TRADE_TFS", ""))
 
     symbol_allowlist: set[str] = frozenset(
@@ -213,6 +216,11 @@ class Settings:
     stop_lookback_bars: int = _getenv_int("STOP_LOOKBACK_BARS", 50)
     stop_lookback_by_tf: str = _getenv("STOP_LOOKBACK_BY_TF", "")  # e.g., "5m:25,15m:30,1h:40"
     backup_sl_enabled: bool = _getenv_bool("BACKUP_SL_ENABLED", False)  # Try limit order SL as backup
+
+    # GRVT-specific settings for stop-loss handling
+    grvt_min_quote_buffer: float = _getenv_float("GRVT_MIN_QUOTE_BUFFER", 1.1)  # 110% buffer for min_quote
+    grvt_emergency_retry_interval: int = _getenv_int("GRVT_EMERGENCY_RETRY_INTERVAL", 30)  # seconds
+    grvt_emergency_max_retries: int = _getenv_int("GRVT_EMERGENCY_MAX_RETRIES", 5)
 
     # Optional pattern filters (approximate, pivot-based)
     pattern_long: str = _getenv("PATTERN_LONG", "none").lower()  # none | w_bottom

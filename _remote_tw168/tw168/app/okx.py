@@ -276,7 +276,7 @@ class OKXClient:
             payload["clOrdId"] = cl_ord_id
         return self.request("POST", "/api/v5/trade/cancel-order", json_body=payload, is_trading=True)
 
-    def get_instrument_info(self, *, inst_id: str) -> dict[str, Any] | None:
+    async def get_instrument_info(self, *, inst_id: str) -> dict[str, Any] | None:
         """Get instrument information including contract value (ctVal)."""
         try:
             payload = self.request("GET", "/api/v5/public/instruments", params={"instType": "SWAP", "instId": inst_id})

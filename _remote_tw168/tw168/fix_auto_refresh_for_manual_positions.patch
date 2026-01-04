@@ -1,0 +1,79 @@
+--- a/app/main.py
++++ b/app/main.py
+@@ -1470,12 +1470,56 @@ async def _refresh_lighter_protection() -> None:
+                     if (now - last_ts) < SETTINGS.lighter_refresh_seconds:
+                         continue
+
++                # Try to get entry info from tracker or state
+                 entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
+                 if entry_info is None:
+                     entry_state = state.get_entry(inst_id, ttl_seconds=SETTINGS.lighter_entry_ttl_seconds)
+                     if entry_state is None:
+-                        continue
++                        # NEW: If no entry_info, try to compute from position data
++                        logger.info(
++                            "lighter refresh no_entry_info instId=%s posSide=%s size=%s, attempting to compute from position",
++                            inst_id, pos_side, size
++                        )
++
++                        # Get entry price from position
++                        pos_entry_price = pos.get("avgPx") or pos.get("entry_price") or pos.get("open_price")
++                        if pos_entry_price is None:
++                            logger.warning(
++                                "lighter refresh skip instId=%s posSide=%s reason=no_entry_price_in_position",
++                                inst_id, pos_side
++                            )
++                            continue
++
++                        try:
++                            entry_price = float(pos_entry_price)
++                        except Exception:
++                            logger.warning(
++                                "lighter refresh skip instId=%s posSide=%s reason=invalid_entry_price",
++                                inst_id, pos_side
++                            )
++                            continue
++
++                        # Determine side from pos_side
++                        side = "buy" if pos_side == "long" else "sell"
++
++                        # Fetch candles to compute stop loss
++                        try:
++                            candles = await asyncio.to_thread(
++                                fetch_candles_paged,
++                                SETTINGS.okx_base_url,
++                                inst_id,
++                                "1h",  # Use 1h as default timeframe
++                                max(300, get_lookback_bars("1h") + 50)
++                            )
++                            stop_loss = stop_loss_price_lookback(
++                                side=side,
++                                entry_price=entry_price,
++                                candles=candles,
++                                lookback_bars=get_lookback_bars("1h"),
++                                atr_len=SETTINGS.atr_len,
++                                atr_buffer_mult=SETTINGS.atr_buffer_mult,
++                                min_buffer_bps=SETTINGS.min_buffer_bps,
++                            )
++                        except Exception as e:
++                            logger.warning(
++                                "lighter refresh skip instId=%s posSide=%s reason=sl_computation_error err=%s",
++                                inst_id, pos_side, str(e)
++                            )
++                            continue
++
++                        # Create synthetic entry_info
++                        entry_info = SimpleNamespace(
++                            side=side,
++                            entry_price=entry_price,
++                            stop_loss=stop_loss,
++                        )
++
++                        logger.info(
++                            "lighter refresh computed_entry_info instId=%s posSide=%s entry=%.4f sl=%.4f",
++                            inst_id, pos_side, entry_price, stop_loss
++                        )
++                    else:
+                     entry_info = SimpleNamespace(
+                         side=entry_state.side,
+                         entry_price=entry_state.entry_price,
