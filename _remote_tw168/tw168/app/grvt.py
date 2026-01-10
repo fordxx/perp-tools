@@ -199,6 +199,41 @@ class GrvtClient:
             self.logger.warning(f"GRVT get_position failed for {inst_id}: {e}")
             return None
 
+    async def get_positions(self, *, inst_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        """Fetch positions in bulk.
+
+        GRVT endpoints are rate-limited; fetching per-symbol can quickly trigger 429.
+
+        - Primary path: attempt a single bulk fetch (no symbols filter) and let the caller filter.
+        - Fallback path: if bulk fetch fails and inst_ids is provided, do sequential per-symbol
+          fetches with a small delay to reduce rate-limit risk.
+        """
+
+        # Best case: one request for all positions.
+        try:
+            positions = await self.api.fetch_positions(params={"trading_account_id": self.trading_account_id})
+            return list(positions or [])
+        except Exception as e:
+            self.logger.warning("GRVT bulk fetch_positions failed: %s", str(e))
+
+        if not inst_ids:
+            return []
+
+        # Fallback: sequential per-symbol fetch with spacing.
+        out: list[dict[str, Any]] = []
+        for inst_id in inst_ids:
+            try:
+                symbol = self._resolve_symbol(inst_id)
+                positions = await self.api.fetch_positions(
+                    symbols=[symbol], params={"trading_account_id": self.trading_account_id}
+                )
+                out.extend(list(positions or []))
+            except Exception as e:
+                self.logger.warning("GRVT fetch_positions failed for %s: %s", inst_id, str(e))
+            # Avoid hammering the API in fallback mode.
+            await asyncio.sleep(0.25)
+        return out
+
     async def get_instrument_info(self, *, inst_id: str) -> dict[str, Any] | None:
         """Get instrument information with minQuote support."""
         try:
@@ -295,8 +330,9 @@ class GrvtClient:
                     params["stopLossPrice"] = float(sl_trigger_px)
                 if tp_trigger_px:
                     params["takeProfitPrice"] = float(tp_trigger_px)
-                # Use conditional order type for TP/SL
-                order_type = GrvtOrderType.LIMIT  # GRVT handles triggers differently
+                # Use a plain limit order type for TP/SL attachment.
+                # Note: GrvtOrderType is a typing Literal ("limit"|"market"), not an Enum.
+                order_type = "limit"
 
             response = await self.api.create_order(
                 symbol=symbol,
@@ -341,7 +377,13 @@ class GrvtClient:
         tp_trigger_px: str | None = None,
         tp_ord_px: str | None = None,
     ) -> Any:
-        """Place algorithmic order with min_quote validation."""
+        """Place algorithmic (trigger) order with min_quote validation.
+
+        Note: GRVT `create_order` responses sometimes contain a placeholder order_id ("0x00")
+        even when the order is actually created. We do a lightweight post-check against
+        open-orders to (a) resolve the real order_id and (b) avoid false "failed" retries
+        that would create duplicates.
+        """
         try:
             symbol = self._resolve_symbol(inst_id)
             order_side = str(side).lower()
@@ -376,14 +418,17 @@ class GrvtClient:
             trigger_type = "STOP_LOSS" if sl_trigger_px else "TAKE_PROFIT"
 
             # Build a GRVT order payload and inject trigger metadata (SDK doesn't expose this).
+            # GRVT TP/SL triggers are typically market-on-trigger closes; sending a limit order
+            # here may be rejected by the venue (often surfaced as msg='LIMIT').
             client_order_id = abs(hash(f"{inst_id}:{trigger_type}:{trigger_px}")) % (10**15)
             order = get_grvt_order(
                 sub_account_id=self.trading_account_id,
                 symbol=symbol,
-                order_type=GrvtOrderType.LIMIT,
+                order_type="market",
                 side=order_side,
                 amount=amount,
-                limit_price=Decimal(str(trigger_px)),
+                # Market order; trigger price is carried in metadata.
+                limit_price=Decimal("0"),
                 params={
                     "reduce_only": True,
                     "client_order_id": client_order_id,
@@ -400,6 +445,8 @@ class GrvtClient:
                 "tpsl": {
                     "trigger_by": "MARK",
                     "trigger_price": str(trigger_px),
+                    # GRVT rejects API-created *position-linked* TPSL orders (close_position=True)
+                    # with code=2117. We instead place a reduce-only trigger order sized to `sz`.
                     "close_position": False,
                 },
             }
@@ -409,20 +456,118 @@ class GrvtClient:
                 payload=payload,
             )
 
-            if response and response.get("result") is not None:
-                return {
-                    "code": "0",
-                    "data": [
-                        {
-                            "algoId": (response.get("result") or {}).get("order_id", ""),
-                            "sCode": "0",
-                            "sMsg": "",
-                        }
-                    ],
-                    "msg": "",
-                }
-            else:
+            if not isinstance(response, dict):
+                return {"code": "1", "msg": f"unexpected_response_type: {type(response)}"}
+
+            # Some GRVT endpoints return {status: 4xx, code: ..., message: ...}
+            status = response.get("status")
+            if isinstance(status, int) and status >= 400:
+                return {"code": "1", "msg": str(response.get("message") or response)}
+
+            result = response.get("result")
+            if not isinstance(result, dict):
                 return {"code": "1", "msg": str(response or "Algo order creation failed")}
+
+            order_id = result.get("order_id") or result.get("id") or result.get("ordId")
+            if not order_id:
+                return {"code": "1", "msg": f"missing_order_id: {response}"}
+
+            resolved_order_id = str(order_id)
+            placeholder = resolved_order_id.lower() in {"0x00", "0x0", "0"}
+
+            # Visibility post-check (for both SL and TP):
+            # - resolves placeholder order_id to a real order_id
+            # - avoids false "failed" retries that create duplicates
+            try:
+                params = {"trading_account_id": self.trading_account_id}
+                found = False
+                want_px = None
+                want_sz = None
+                try:
+                    want_px = Decimal(str(trigger_px))
+                except Exception:
+                    want_px = None
+                try:
+                    want_sz = Decimal(str(amount))
+                except Exception:
+                    want_sz = None
+
+                # GRVT can take a few seconds to surface newly created trigger orders in open_orders.
+                # If we return "not_visible" too early, refresh logic may treat it as failed and keep retrying,
+                # causing missing TP/SL (or duplicates if it later appears). Keep a conservative window here.
+                for delay_s in (0.2, 0.5, 1.2, 2.5, 4.0, 6.5):
+                    oo = await self.api.fetch_open_orders(symbol=symbol, params=params)
+                    if isinstance(oo, list):
+                        for o in oo:
+                            if not isinstance(o, dict):
+                                continue
+                            meta = o.get("metadata")
+                            oid = o.get("order_id") or o.get("id") or o.get("ordId")
+                            cid = meta.get("client_order_id") if isinstance(meta, dict) else None
+
+                            # Primary match: client_order_id
+                            if cid is not None and str(cid) == str(client_order_id):
+                                resolved_order_id = str(oid) if oid is not None else resolved_order_id
+                                found = True
+                                break
+
+                            # Secondary match: the returned order_id (if it wasn't placeholder)
+                            if oid is not None and str(oid) == str(order_id):
+                                resolved_order_id = str(oid)
+                                found = True
+                                break
+
+                            # Fallback match: same trigger_type + trigger_price + size
+                            if isinstance(meta, dict) and want_px is not None and want_sz is not None:
+                                trig = meta.get("trigger")
+                                if isinstance(trig, dict):
+                                    t_type = str(trig.get("trigger_type") or "").upper()
+                                    tpsl = trig.get("tpsl")
+                                    t_px_raw = None
+                                    if isinstance(tpsl, dict):
+                                        t_px_raw = tpsl.get("trigger_price") or tpsl.get("triggerPrice")
+                                    try:
+                                        t_px = Decimal(str(t_px_raw)) if t_px_raw is not None else None
+                                    except Exception:
+                                        t_px = None
+                                    try:
+                                        leg0 = (o.get("legs") or [{}])[0]
+                                        t_sz_raw = leg0.get("size")
+                                        t_sz = Decimal(str(t_sz_raw)) if t_sz_raw is not None else None
+                                    except Exception:
+                                        t_sz = None
+                                    if t_type == str(trigger_type).upper() and t_px is not None and t_sz is not None:
+                                        px_ok = abs(t_px - want_px) <= Decimal("0.00000001")
+                                        sz_ok = abs(t_sz - want_sz) <= Decimal("0.000001")
+                                        if px_ok and sz_ok:
+                                            resolved_order_id = str(oid) if oid is not None else resolved_order_id
+                                            found = True
+                                            break
+                    if found:
+                        break
+                    await asyncio.sleep(delay_s)
+
+                if placeholder and not found:
+                    return {
+                        "code": "not_visible",
+                        "msg": "order_not_visible_in_open_orders",
+                        "order_id": str(order_id),
+                        "client_order_id": str(client_order_id),
+                    }
+            except Exception as e:
+                self.logger.warning("GRVT trigger visibility check failed: %s", str(e))
+
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "algoId": resolved_order_id,
+                        "sCode": "0",
+                        "sMsg": "",
+                    }
+                ],
+                "msg": "",
+            }
 
         except Exception as e:
             self.logger.error(f"GRVT place_algo_order failed: {e}")
@@ -444,11 +589,13 @@ class GrvtClient:
         try:
             symbol = self._resolve_symbol(inst_id)
             params = {"trading_account_id": self.trading_account_id}
-            if cl_ord_id:
+            cancel_id = None
+            if ord_id:
+                cancel_id = ord_id
+            if cl_ord_id and not cancel_id:
                 params["client_order_id"] = cl_ord_id
-            elif ord_id:
-                params["order_id"] = ord_id  # Changed from "id" to "order_id"
-            success = await self.api.cancel_order(symbol=symbol, params=params)
+            # GRVT SDK cancel_order signature is (id, symbol, params). It uses either `id` or `params.client_order_id`.
+            success = await self.api.cancel_order(id=cancel_id, symbol=symbol, params=params)
             return {
                 "code": "0" if success else "1",
                 "msg": "",

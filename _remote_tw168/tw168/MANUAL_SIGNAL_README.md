@@ -74,13 +74,14 @@ python send_manual_signal.py ETH-USDT-SWAP long
 python send_manual_signal.py BTC-USDT-SWAP short -t 4h
 
 # 指定服务器URL和密钥
-python send_manual_signal.py SOL-USDT-SWAP long -u http://3.38.98.169:8000 -k your_key
+python send_manual_signal.py SOL-USDT-SWAP long -u https://trader:TW168Trading!2026@3-38-98-169.nip.io -k your_key
 ```
 
 ### 2. cURL 命令
 
 ```bash
-curl -X POST http://3.38.98.169:8000/manual/signal \
+curl -X POST https://3-38-98-169.nip.io/manual/signal \
+  -u "trader:TW168Trading!2026" \
   -H "Content-Type: application/json" \
   -d '{
     "instId": "ETH-USDT-SWAP",
@@ -98,7 +99,7 @@ import requests
 
 def send_signal(symbol, side, tf="1h"):
     response = requests.post(
-        "http://3.38.98.169:8000/manual/signal",
+        "https://3-38-98-169.nip.io/manual/signal",
         json={
             "instId": symbol,
             "tf": tf,
@@ -134,7 +135,7 @@ print(result)
    python test_manual_signal.py
 
    # 远程测试
-   python send_manual_signal.py ETH-USDT-SWAP long -u http://3.38.98.169:8000
+   python send_manual_signal.py ETH-USDT-SWAP long -u https://trader:TW168Trading!2026@3-38-98-169.nip.io
    ```
 
 ## 安全注意事项

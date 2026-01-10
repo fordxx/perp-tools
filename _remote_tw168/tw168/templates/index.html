@@ -118,7 +118,77 @@
 
     <div class="container-fluid">
         <div class="main-container">
-            <!-- 系统状态 -->
+            <!-- 仓位管理 -->
+            <div class="row mb-4">
+                <div class="col-12">
+                     <div class="card">
+                         <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+                             <h5 class="mb-0"><i class="fas fa-list"></i> 当前仓位</h5>
+                             <button class="btn btn-sm btn-light" onclick="refreshPositions()">
+                                 <i class="fas fa-sync-alt"></i> 刷新仓位
+                             </button>
+                         </div>
+                         <div class="card-body">
+                             <div class="form-check mb-2">
+                                 <input class="form-check-input" type="checkbox" value="" id="openOrdersOnlyThis" checked>
+                                 <label class="form-check-label" for="openOrdersOnlyThis">只看当前交易对（使用右侧“交易对”输入框）</label>
+                             </div>
+                             <div class="table-responsive">
+                                 <table class="table table-hover">
+                                     <thead>
+                                         <tr>
+                                             <th>交易对</th>
+                                             <th>方向</th>
+                                             <th>数量</th>
+                                             <th>均价</th>
+                                             <th>未结盈亏</th>
+                                             <th>操作</th>
+                                         </tr>
+                                     </thead>
+                                     <tbody id="positionsTableBody">
+                                         <tr><td colspan="6" class="text-center text-muted">点击刷新查看仓位</td></tr>
+                                     </tbody>
+                                 </table>
+                             </div>
+                         </div>
+                     </div>
+                </div>
+            </div>
+            
+            <!-- 当前挂单 -->
+            <div class="row mb-4">
+                <div class="col-12">
+                     <div class="card">
+                         <div class="card-header bg-info text-white d-flex justify-content-between align-items-center">
+                             <h5 class="mb-0"><i class="fas fa-receipt"></i> 当前挂单</h5>
+                             <button class="btn btn-sm btn-light" onclick="refreshOpenOrders()">
+                                 <i class="fas fa-sync-alt"></i> 刷新挂单
+                             </button>
+                         </div>
+                         <div class="card-body">
+                             <div class="table-responsive">
+                                 <table class="table table-hover">
+                                     <thead>
+                                         <tr>
+                                             <th>交易对</th>
+                                             <th>方向</th>
+                                             <th>价格</th>
+                                             <th>数量</th>
+                                             <th>类型</th>
+                                             <th>状态</th>
+                                         </tr>
+                                     </thead>
+                                     <tbody id="openOrdersTableBody">
+                                         <tr><td colspan="6" class="text-center text-muted">点击刷新查看挂单</td></tr>
+                                     </tbody>
+                                 </table>
+                             </div>
+                         </div>
+                     </div>
+                </div>
+            </div>
+
+            <!-- 系统状态 (Original Row) -->
             <div class="row mb-4">
                 <div class="col-md-3">
                     <div class="card status-card text-white">
@@ -170,12 +240,15 @@
                                 <div class="row">
                                     <div class="col-md-6 mb-3">
                                         <label class="form-label fw-bold">交易对</label>
-                                        <select class="form-select" id="instId" name="instId" required>
-                                            <option value="">选择交易对</option>
+                                        <div class="d-flex gap-2 align-items-center">
+                                            <input class="form-control" list="instIdList" id="instId" name="instId" placeholder="选择或输入交易对" required>
+                                            <button type="button" class="btn btn-outline-secondary btn-sm" id="refreshSymbolsBtn">刷新GRVT交易对</button>
+                                        </div>
+                                        <datalist id="instIdList">
                                             {% for symbol in symbols %}
-                                            <option value="{{ symbol }}">{{ symbol }}</option>
+                                            <option value="{{ symbol }}">
                                             {% endfor %}
-                                        </select>
+                                        </datalist>
                                     </div>
                                     <div class="col-md-3 mb-3">
                                         <label class="form-label fw-bold">时间周期</label>
@@ -186,6 +259,7 @@
                                             <option value="30m">30分钟</option>
                                             <option value="1h" selected>1小时</option>
                                             <option value="4h">4小时</option>
+                                            <option value="1d">1天</option>
                                         </select>
                                     </div>
                                     <div class="col-md-3 mb-3">
@@ -196,10 +270,6 @@
                                             <option value="short">📉 做空</option>
                                         </select>
                                     </div>
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label fw-bold">管理员密钥</label>
-                                    <input type="password" class="form-control" id="adminKey" name="admin_key" placeholder="输入管理员密钥" required>
                                 </div>
                                 <button type="submit" class="btn btn-primary btn-lg w-100" id="submitBtn">
                                     <i class="fas fa-paper-plane"></i> 发送交易信号
@@ -334,11 +404,10 @@
             const data = {
                 instId: formData.get('instId'),
                 tf: formData.get('tf'),
-                side: formData.get('side'),
-                admin_key: formData.get('admin_key')
+                side: formData.get('side')
             };
 
-            if (!data.instId || !data.tf || !data.side || !data.admin_key) {
+            if (!data.instId || !data.tf || !data.side) {
                 showResult('请填写所有必填字段', 'danger');
                 return;
             }
@@ -383,6 +452,222 @@
                 setTimeout(() => {
                     resultDiv.style.display = 'none';
                 }, 3000);
+            }
+        }
+
+        async function refreshSymbols() {
+            const btn = document.getElementById('refreshSymbolsBtn');
+            const list = document.getElementById('instIdList');
+            if (!btn || !list) return;
+            const prev = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '拉取中...';
+            try {
+                const resp = await fetch('/api/symbols/grvt');
+                const data = await resp.json();
+                if (!resp.ok || !data || data.ok === false) {
+                    throw new Error(data?.error || data?.detail || '拉取失败');
+                }
+                const instIds = Array.isArray(data.instIds) ? data.instIds : [];
+                if (!instIds.length) {
+                    throw new Error('远程未返回交易对列表');
+                }
+                const existing = new Set(Array.from(list.querySelectorAll('option')).map(o => o.value));
+                let added = 0;
+                for (const instId of instIds) {
+                    if (!instId || existing.has(instId)) continue;
+                    const opt = document.createElement('option');
+                    opt.value = instId;
+                    list.appendChild(opt);
+                    existing.add(instId);
+                    added++;
+                }
+                showResult(`✅ 已拉取 GRVT 交易对：${instIds.length} 个（新增 ${added}）`, 'success');
+            } catch (e) {
+                showResult(`❌ 刷新交易对失败: ${e.message}`, 'danger');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = prev;
+            }
+        }
+
+        document.getElementById('refreshSymbolsBtn')?.addEventListener('click', refreshSymbols);
+
+        // 仓位管理功能
+        async function refreshPositions() {
+            const tbody = document.getElementById('positionsTableBody');
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center"><div class="spinner-border spinner-border-sm text-primary"></div> 加载中...</td></tr>';
+            
+            try {
+                const response = await fetch('/api/positions');
+                const data = await response.json();
+                
+                if (data.error) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="text-center text-danger">加载失败: ${data.error}</td></tr>`;
+                    return;
+                }
+                
+                if (!data.positions || data.positions.length === 0) {
+                     tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">当前无持仓</td></tr>';
+                     document.getElementById('activePositions').textContent = '0';
+                     return;
+                }
+
+                document.getElementById('activePositions').textContent = data.positions.length;
+                
+                let html = '';
+                data.positions.forEach(p => {
+                    const pnlClass = parseFloat(p.uPnl) >= 0 ? 'text-success' : 'text-danger';
+                    const sideBadge = p.posSide === 'long' || parseFloat(p.pos) > 0 ? 
+                        '<span class="badge bg-success">多</span>' : 
+                        '<span class="badge bg-danger">空</span>';
+                    
+                    html += `
+                        <tr>
+                            <td><strong>${p.instId}</strong></td>
+                            <td>${sideBadge}</td>
+                            <td>${p.pos}</td>
+                            <td>${parseFloat(p.avgPx).toFixed(4)}</td>
+                            <td class="${pnlClass}">${parseFloat(p.uPnl).toFixed(2)}</td>
+                            <td>
+                                <button class="btn btn-sm btn-outline-danger" onclick="closePosition('${p.instId}', '${p.posSide}')">
+                                    平仓
+                                </button>
+                            </td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = html;
+
+            } catch (error) {
+                console.error('刷新仓位失败:', error);
+                tbody.innerHTML = `<tr><td colspan="6" class="text-center text-danger">网络错误</td></tr>`;
+            }
+        }
+
+        async function refreshOpenOrders() {
+            const tbody = document.getElementById('openOrdersTableBody');
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center"><div class="spinner-border spinner-border-sm text-primary"></div> 加载中...</td></tr>';
+            try {
+                const instInput = document.getElementById('instId');
+                const onlyThis = document.getElementById('openOrdersOnlyThis');
+                const instId = instInput ? instInput.value.trim() : '';
+                const useFilter = !!(onlyThis && onlyThis.checked && instId);
+                const url = useFilter ? (`/api/open_orders?instId=${encodeURIComponent(instId)}`) : '/api/open_orders';
+                const resp = await fetch(url);
+                const data = await resp.json();
+                if (!data || data.ok === false) {
+                    tbody.innerHTML = `<tr><td colspan="6" class="text-center text-danger">加载失败: ${data?.error || data?.detail || '未知错误'}</td></tr>`;
+                    return;
+                }
+                const orders = Array.isArray(data.orders) ? data.orders : [];
+                if (!orders.length) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">当前无挂单</td></tr>';
+                    return;
+                }
+                let html = '';
+                orders.forEach(o => {
+                    const isReduce = !!o.reduce_only;
+                    const typeBadge = isReduce ? '<span class="badge bg-secondary">保护单</span>' : '<span class="badge bg-primary">入场单</span>';
+                    const sideBadge = (o.side === 'buy') ? '<span class="badge bg-success">买</span>' : (o.side === 'sell') ? '<span class="badge bg-danger">卖</span>' : '<span class="badge bg-dark">?</span>';
+                    const priceVal = (o.limit_price ?? '').toString();
+                    const canEdit = !isReduce;
+                    const priceInput = canEdit
+                        ? `<input class="form-control form-control-sm" style="max-width:120px" value="${priceVal}" data-order-price="${o.order_id || ''}">`
+                        : `${priceVal}`;
+                    const sizeVal = (o.size ?? '').toString();
+                    const sizeInput = canEdit
+                        ? `<input class="form-control form-control-sm" style="max-width:120px" value="${sizeVal}" data-order-size="${o.order_id || ''}">`
+                        : `${sizeVal}`;
+                    const cancelBtn = `<button class="btn btn-sm btn-outline-danger" onclick="cancelOpenOrder('${o.instId || ''}','${o.order_id || ''}')">取消</button>`;
+                    const replaceBtn = canEdit
+                        ? `<button class="btn btn-sm btn-outline-primary ms-1" onclick="replaceOpenOrder('${o.instId || ''}','${o.order_id || ''}')">改价</button>`
+                        : '';
+                    html += `
+                        <tr>
+                            <td><strong>${o.instId || o.instrument || ''}</strong></td>
+                            <td>${sideBadge}</td>
+                            <td>${priceInput}</td>
+                            <td>${sizeInput}</td>
+                            <td>${typeBadge}</td>
+                            <td>${o.status || ''}<div class="mt-1">${cancelBtn}${replaceBtn}</div></td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = html;
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="6" class="text-center text-danger">网络错误</td></tr>`;
+            }
+        }
+
+        async function cancelOpenOrder(instId, orderId) {
+            if (!instId || !orderId) { alert('缺少订单信息'); return; }
+            if (!confirm(`确定取消挂单？\n${instId}\n${orderId}`)) return;
+            try {
+                const resp = await fetch('/api/open_orders/cancel', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({instId: instId, order_id: orderId})
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data || data.ok === false) {
+                    alert('取消失败: ' + (data?.detail || data?.error || '未知错误'));
+                    return;
+                }
+                refreshOpenOrders();
+            } catch (e) {
+                alert('网络错误');
+            }
+        }
+
+        async function replaceOpenOrder(instId, orderId) {
+            if (!instId || !orderId) { alert('缺少订单信息'); return; }
+            const input = document.querySelector(`[data-order-price="${CSS.escape(orderId)}"]`);
+            const newPrice = input ? input.value.trim() : '';
+            const sizeInput = document.querySelector(`[data-order-size="${CSS.escape(orderId)}"]`);
+            const newSize = sizeInput ? sizeInput.value.trim() : '';
+            if (!newPrice) { alert('请输入新价格'); return; }
+            if (!newSize) { alert('请输入新数量'); return; }
+            if (!confirm(`确定改价/改数量？\n${instId}\n${orderId}\n新价: ${newPrice}\n新数量: ${newSize}`)) return;
+            try {
+                const resp = await fetch('/api/open_orders/replace', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({instId: instId, order_id: orderId, new_price: newPrice, new_size: newSize})
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data || data.ok === false) {
+                    alert('改价失败: ' + (data?.detail || data?.error || '未知错误'));
+                    return;
+                }
+                refreshOpenOrders();
+            } catch (e) {
+                alert('网络错误');
+            }
+        }
+        
+        async function closePosition(instId, posSide) {
+            if (!confirm(`确定要平仓 ${instId} 吗？`)) return;
+
+            try {
+                const response = await fetch('/api/positions/close', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        instId: instId,
+                        posSide: posSide,
+                    })
+                });
+                
+                const result = await response.json();
+                if (result.ok) {
+                    alert('平仓指令已发送');
+                    refreshPositions();
+                } else {
+                    alert('平仓失败: ' + (result.error || '未知错误'));
+                }
+            } catch (e) {
+                alert('网络请求失败');
             }
         }
     </script>

@@ -14,10 +14,12 @@ class TelegramControl:
         token: str,
         chat_id: str,
         handler: Callable[[str, str], None],
+        command_handler: Callable[[str, list[str]], None] | None = None,
     ) -> None:
         self._token = token
         self._chat_id = str(chat_id)
         self._handler = handler
+        self._command_handler = command_handler
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._offset: Optional[int] = None
@@ -58,6 +60,16 @@ class TelegramControl:
                                 inst_id = parts[1].upper()
                                 tf = parts[2].lower()
                                 self._handler(inst_id, tf)
+                            continue
+                        if text.startswith("/") and self._command_handler is not None:
+                            # Generic commands: /protect yes BTC-USDT-SWAP long
+                            parts = text.split()
+                            cmd = parts[0].lstrip("/").lower()
+                            args = parts[1:]
+                            try:
+                                self._command_handler(cmd, args)
+                            except Exception:
+                                time.sleep(0.2)
             except Exception:
                 time.sleep(2)
 

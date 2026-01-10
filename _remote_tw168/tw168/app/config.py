@@ -144,7 +144,7 @@ class Settings:
     exchange: str = _getenv("EXCHANGE", "okx").lower()  # okx | extended | paradex
     trading_enabled: bool = _getenv_bool("TRADING_ENABLED", False)
     # Optional: if set, the UI server (port 9000) can forward manual signals to a remote trading service.
-    # Example: http://3.38.98.169:8000
+    # Example: https://trader:***@3-38-98-169.nip.io (recommended via 443 reverse-proxy)
     trading_service_base_url: str = _getenv("TRADING_SERVICE_BASE_URL", "").strip().rstrip("/")
     paper_trade_tfs: set[str] = frozenset(_getenv_csv_set("PAPER_TRADE_TFS", ""))
 
@@ -185,6 +185,17 @@ class Settings:
     entry_two_limit_l1_pct: float = _getenv_float("ENTRY_TWO_LIMIT_L1_PCT", 0.70)
     entry_two_limit_l2_pct: float = _getenv_float("ENTRY_TWO_LIMIT_L2_PCT", 0.30)
     entry_two_limit_ref_bar: str = _getenv("ENTRY_TWO_LIMIT_REF_BAR", "1m").lower()
+    # Entry limit price is derived from the stop-loss distance.
+    # Preferred config (more intuitive):
+    #   towards_sl_pct: how far to move from ref_price towards SL (0..1).
+    #   - long:  px = ref - pct * (ref - SL)
+    #   - short: px = ref + pct * (SL - ref)
+    # Accepts either fraction (0.8) or percent (80).
+    entry_two_limit_towards_sl_pct: float = _getenv_float("ENTRY_TWO_LIMIT_TOWARDS_SL_PCT", 0.5)
+    entry_two_limit_towards_sl_pct_by_tf: str = _getenv("ENTRY_TWO_LIMIT_TOWARDS_SL_PCT_BY_TF", "")
+    # Backward-compat (older semantic): percent measured from SL towards ref.
+    entry_two_limit_from_sl_pct: float = _getenv_float("ENTRY_TWO_LIMIT_FROM_SL_PCT", 0.0)
+    entry_two_limit_from_sl_pct_by_tf: str = _getenv("ENTRY_TWO_LIMIT_FROM_SL_PCT_BY_TF", "")
     entry_two_limit_timeout_candles: float = _getenv_float("ENTRY_TWO_LIMIT_TIMEOUT_CANDLES", 1.0)
     entry_two_limit_timeout_candles_by_tf: str = _getenv("ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF", "")
     entry_two_limit_poll_seconds: float = _getenv_float("ENTRY_TWO_LIMIT_POLL_SECONDS", 2.0)
@@ -221,6 +232,43 @@ class Settings:
     grvt_min_quote_buffer: float = _getenv_float("GRVT_MIN_QUOTE_BUFFER", 1.1)  # 110% buffer for min_quote
     grvt_emergency_retry_interval: int = _getenv_int("GRVT_EMERGENCY_RETRY_INTERVAL", 30)  # seconds
     grvt_emergency_max_retries: int = _getenv_int("GRVT_EMERGENCY_MAX_RETRIES", 5)
+    # If price has already crossed the computed/known stop-loss, immediately try to close the position at market.
+    # This is a last-resort safety net in fast moves (exchange UI cancel, trigger issues, etc).
+    grvt_emergency_close_on_stop_breach: bool = _getenv_bool("GRVT_EMERGENCY_CLOSE_ON_STOP_BREACH", False)
+    # Optional early-close buffer in bps (e.g. 5 = 0.05%). 0 means only after crossing the stop price.
+    grvt_emergency_stop_breach_bps: float = _getenv_float("GRVT_EMERGENCY_STOP_BREACH_BPS", 0.0)
+
+    # GRVT protection refresh (auto-attach SL/TP for existing positions)
+    grvt_refresh_seconds: int = _getenv_int("GRVT_REFRESH_SECONDS", 60)
+    # Safety: default OFF to avoid surprise re-placing SL/TP after a user manually cancels on the exchange UI.
+    # Enable explicitly via GRVT_REFRESH_ENABLED=true if you want the service to reconcile protection orders.
+    grvt_refresh_enabled: bool = _getenv_bool("GRVT_REFRESH_ENABLED", False)
+    grvt_refresh_sl_enabled: bool = _getenv_bool("GRVT_REFRESH_SL_ENABLED", True)
+    grvt_refresh_tp_enabled: bool = _getenv_bool("GRVT_REFRESH_TP_ENABLED", True)
+    # Safety: orphan cleanup can thrash when the exchange rounds sizes/prices differently.
+    # Keep default False unless you are confident the TP ladder matches exactly.
+    grvt_refresh_tp_orphan_cleanup: bool = _getenv_bool("GRVT_REFRESH_TP_ORPHAN_CLEANUP", False)
+    # If you manually cancel SL/TP on the exchange UI, optionally respect that and do not re-create for N seconds.
+    # 0 disables this behavior.
+    grvt_refresh_respect_manual_cancel_seconds: int = _getenv_int("GRVT_REFRESH_RESPECT_MANUAL_CANCEL_SECONDS", 0)
+    # When enabled (and Telegram configured), the bot will NOT automatically re-create missing TP/SL after manual cancel.
+    # Instead it will notify after GRVT_MANUAL_CANCEL_CONFIRM_AFTER_SECONDS and wait for /protect yes|no.
+    grvt_manual_cancel_confirm_enabled: bool = _getenv_bool("GRVT_MANUAL_CANCEL_CONFIRM_ENABLED", False)
+    grvt_manual_cancel_confirm_after_seconds: int = _getenv_int("GRVT_MANUAL_CANCEL_CONFIRM_AFTER_SECONDS", 60)
+    # Low-frequency safety: cancel leftover reduce-only TP/SL for symbols that are flat.
+    # Useful after partial fills/close-outs and across restarts.
+    grvt_orphan_protection_cleanup_enabled: bool = _getenv_bool("GRVT_ORPHAN_PROTECTION_CLEANUP_ENABLED", True)
+    grvt_orphan_protection_cleanup_seconds: int = _getenv_int("GRVT_ORPHAN_PROTECTION_CLEANUP_SECONDS", 1200)
+    # Safety: by default, do not place entry limit orders on GRVT via ENTRY_TWO_LIMIT mode.
+    # When enabled, ENTRY_TWO_LIMIT_ENABLED can place a single 0.5R limit entry (see app.main).
+    grvt_allow_entry_two_limit: bool = _getenv_bool("GRVT_ALLOW_ENTRY_TWO_LIMIT", False)
+    # When false, the service may attach SL/TP even if TRADING_ENABLED=false.
+    # This is useful for manually opened positions; keep default True to avoid
+    # unexpected exchange-side changes when running in "paper" mode.
+    grvt_refresh_requires_trading_enabled: bool = _getenv_bool(
+        "GRVT_REFRESH_REQUIRES_TRADING_ENABLED",
+        True,
+    )
 
     # Optional pattern filters (approximate, pivot-based)
     pattern_long: str = _getenv("PATTERN_LONG", "none").lower()  # none | w_bottom
@@ -245,6 +293,10 @@ class Settings:
     trail_start_r: float = _getenv_float("TRAIL_START_R", 0.8)
     trail_back_r: float = _getenv_float("TRAIL_BACK_R", 0.75)
     manager_poll_seconds: float = _getenv_float("MANAGER_POLL_SECONDS", 2.0)
+
+    # TradingView signal timeliness: if a webhook arrives too late, skip placing orders.
+    # Uses payload field `t` (bar time). 0 disables expiry.
+    tv_signal_max_age_seconds: int = _getenv_int("TV_SIGNAL_MAX_AGE_SECONDS", 0)
 
     # RSI ML filter (matches TradingView defaults)
     rsi_length: int = _getenv_int("RSI_LENGTH", 14)
@@ -353,6 +405,22 @@ LADDER_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_wait_candles_by_t
 LADDER_MAX_WAIT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.ladder_max_wait_candles_by_tf)
 LADDER_PRICE_DISTANCE_BY_TF = _parse_float_by_tf(SETTINGS.ladder_price_distance_by_tf)
 ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF = _parse_float_by_tf(SETTINGS.entry_two_limit_timeout_candles_by_tf)
+ENTRY_TWO_LIMIT_TOWARDS_SL_PCT_BY_TF = _parse_float_by_tf(SETTINGS.entry_two_limit_towards_sl_pct_by_tf)
+ENTRY_TWO_LIMIT_FROM_SL_PCT_BY_TF = _parse_float_by_tf(SETTINGS.entry_two_limit_from_sl_pct_by_tf)
+
+
+def _normalize_fraction_or_percent(value: float) -> float:
+    """Normalize user-provided value to [0, 1].
+
+    Accepts either fraction (0.8) or percent (80).
+    """
+    if value > 1.0:
+        value = value / 100.0
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
 
 
 def get_ladder_wait_candles(tf: str) -> float:
@@ -373,6 +441,18 @@ def get_ladder_price_distance(tf: str) -> float:
 def get_entry_two_limit_timeout_candles(tf: str) -> float:
     """Get two-limit entry timeout candles for a specific timeframe."""
     return ENTRY_TWO_LIMIT_TIMEOUT_CANDLES_BY_TF.get(tf, SETTINGS.entry_two_limit_timeout_candles)
+
+
+def get_entry_two_limit_from_sl_pct(tf: str) -> float:
+    """Get entry limit price % measured from SL towards ref price."""
+    raw = ENTRY_TWO_LIMIT_FROM_SL_PCT_BY_TF.get(tf, SETTINGS.entry_two_limit_from_sl_pct)
+    return _normalize_fraction_or_percent(float(raw))
+
+
+def get_entry_two_limit_towards_sl_pct(tf: str) -> float:
+    """Get entry limit price % measured from ref price towards SL (preferred)."""
+    raw = ENTRY_TWO_LIMIT_TOWARDS_SL_PCT_BY_TF.get(tf, SETTINGS.entry_two_limit_towards_sl_pct)
+    return _normalize_fraction_or_percent(float(raw))
 
 
 def tf_to_seconds(tf: str) -> int:

@@ -4,15 +4,27 @@ import asyncio
 import logging
 import logging.handlers
 import time
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from queue import SimpleQueue
 from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, ValidationError
 
-from app.config import SETTINGS, get_lookback_bars, get_ladder_wait_candles, get_ladder_max_wait_candles, get_ladder_price_distance, get_entry_two_limit_timeout_candles, tf_to_seconds
+from app.config import (
+    SETTINGS,
+    get_entry_two_limit_from_sl_pct,
+    get_entry_two_limit_towards_sl_pct,
+    get_entry_two_limit_timeout_candles,
+    get_ladder_max_wait_candles,
+    get_ladder_price_distance,
+    get_ladder_wait_candles,
+    get_lookback_bars,
+    tf_to_seconds,
+)
 from app.risk import fetch_candles_paged
 from app.signal_audit import append_event as _audit_append_event, sanitize_payload as _audit_sanitize_payload, utc_now_iso as _audit_utc_now_iso
 from app.charting import plot_kline
@@ -41,6 +53,297 @@ app = FastAPI(title="tv-webhook")
 state = InMemoryState()
 logger = logging.getLogger("uvicorn.error")
 
+
+@app.get("/api/grvt/markets")
+async def grvt_markets() -> dict:
+    """
+    Return the GRVT perpetual markets currently loaded by the remote trading service.
+
+    The local UI should call this via its own proxy endpoint to avoid CORS/mixed-content issues.
+    """
+    if SETTINGS.exchange != "grvt":
+        return {"ok": False, "error": "exchange_not_grvt", "exchange": SETTINGS.exchange, "markets": [], "instIds": []}
+
+    markets: dict | None = None
+    try:
+        api = getattr(exchange, "api", None)
+        markets = getattr(api, "markets", None) if api is not None else None
+    except Exception:
+        markets = None
+
+    if not isinstance(markets, dict) or not markets:
+        return {"ok": True, "exchange": "grvt", "markets": [], "instIds": []}
+
+    rows: list[dict] = []
+    inst_ids: list[str] = []
+    for sym in sorted(markets.keys()):
+        if not isinstance(sym, str):
+            continue
+        if not sym.endswith("_USDT_Perp"):
+            continue
+        base = sym[: -len("_USDT_Perp")]
+        inst_id = f"{base}-USDT-SWAP"
+        rows.append({"grvt_symbol": sym, "instId": inst_id})
+        inst_ids.append(inst_id)
+
+    return {"ok": True, "exchange": "grvt", "markets": rows, "instIds": inst_ids}
+
+
+@app.get("/api/orders/open")
+async def open_orders(instId: str | None = None) -> dict:
+    """
+    Return current OPEN orders (pending orders).
+
+    For GRVT this returns non-sensitive fields only (no signatures), suitable for displaying in local UI.
+    """
+    if SETTINGS.exchange != "grvt":
+        return {"ok": False, "error": "exchange_not_grvt", "exchange": SETTINGS.exchange, "orders": []}
+
+    inst_id_norm = _normalize_inst_id(instId) if instId else None
+    try:
+        if inst_id_norm:
+            orders = await exchange.get_open_orders(inst_id=inst_id_norm)
+        else:
+            # Best-effort: try account-wide open orders via the underlying GRVT SDK.
+            orders = []
+            api = getattr(exchange, "api", None)
+            fetch_fn = getattr(api, "fetch_open_orders", None) if api is not None else None
+            if callable(fetch_fn):
+                params = {"trading_account_id": getattr(exchange, "trading_account_id", None)}
+                params = {k: v for k, v in params.items() if v is not None}
+                # GRVT may paginate/limit results; request a higher limit and retry once to reduce "missing rows".
+                merged: dict[str, dict] = {}
+                for _ in range(2):
+                    batch = await fetch_fn(symbol=None, limit=500, params=params)
+                    if isinstance(batch, list):
+                        for o in batch:
+                            if not isinstance(o, dict):
+                                continue
+                            oid = o.get("order_id") or o.get("id") or o.get("ordId")
+                            key = str(oid) if oid is not None else None
+                            if key:
+                                merged[key] = o
+                    await asyncio.sleep(0.15)
+                orders = list(merged.values())
+    except Exception as e:
+        return {"ok": False, "error": "open_orders_failed", "detail": str(e), "orders": []}
+
+    def _to_inst_id(sym: str | None) -> str | None:
+        if not sym:
+            return None
+        s = str(sym).strip()
+        if s.endswith("_USDT_Perp"):
+            base = s[: -len("_USDT_Perp")]
+            return f"{base}-USDT-SWAP"
+        return None
+
+    out: list[dict] = []
+    for o in orders or []:
+        if not isinstance(o, dict):
+            continue
+        base = o.get("info") if isinstance(o.get("info"), dict) else o
+        meta = base.get("metadata") if isinstance(base, dict) else None
+        trigger = None
+        if isinstance(meta, dict):
+            t = meta.get("trigger")
+            trigger = t if isinstance(t, dict) else None
+        trigger_type = None
+        trigger_price = None
+        if isinstance(trigger, dict):
+            trigger_type = trigger.get("trigger_type")
+            tpsl = trigger.get("tpsl")
+            if isinstance(tpsl, dict):
+                trigger_price = tpsl.get("trigger_price") or tpsl.get("triggerPrice")
+            if trigger_price is None:
+                trigger_price = trigger.get("trigger_price") or trigger.get("triggerPrice")
+        legs = o.get("legs") if isinstance(o.get("legs"), list) else []
+        leg0 = legs[0] if legs else {}
+        instrument = leg0.get("instrument") or o.get("instrument") or o.get("symbol")
+        inst_id = _to_inst_id(instrument) or inst_id_norm
+        is_buy = leg0.get("is_buying_asset")
+        side = "buy" if is_buy is True else "sell" if is_buy is False else None
+        status = ((o.get("state") or {}) if isinstance(o.get("state"), dict) else {}).get("status") or o.get("status")
+        reduce_only = o.get("reduce_only")
+        if reduce_only is None and isinstance(o.get("params"), dict):
+            reduce_only = o.get("params", {}).get("reduce_only")
+        if reduce_only is None and isinstance(o.get("metadata"), dict):
+            reduce_only = o.get("metadata", {}).get("reduce_only")
+        limit_px = leg0.get("limit_price") or o.get("price")
+        size = leg0.get("size") or o.get("size") or o.get("amount")
+        create_time = (meta.get("create_time") if isinstance(meta, dict) else None) or (
+            ((o.get("metadata") or {}) if isinstance(o.get("metadata"), dict) else {}).get("create_time")
+        )
+        order_id = o.get("order_id") or o.get("id") or o.get("ordId")
+
+        out.append(
+            {
+                "order_id": str(order_id) if order_id is not None else None,
+                "instId": inst_id,
+                "instrument": instrument,
+                "side": side,
+                "limit_price": limit_px,
+                "trigger_type": str(trigger_type) if trigger_type is not None else None,
+                "trigger_price": str(trigger_price) if trigger_price is not None else None,
+                "size": size,
+                "reduce_only": bool(reduce_only) if reduce_only is not None else False,
+                "status": status,
+                "create_time": str(create_time) if create_time is not None else None,
+            }
+        )
+
+    # Sort newest first when we have create_time
+    out.sort(key=lambda x: x.get("create_time") or "", reverse=True)
+    return {"ok": True, "exchange": "grvt", "instId": inst_id_norm, "orders": out}
+
+
+class CancelOrderRequest(BaseModel):
+    instId: str
+    order_id: str
+    admin_key: str
+
+
+class ReplaceOrderRequest(BaseModel):
+    instId: str
+    order_id: str
+    new_price: str
+    new_size: str | None = None
+    admin_key: str
+
+
+def _require_admin_key(admin_key: str) -> None:
+    if not admin_key or admin_key != SETTINGS.tv_webhook_secret:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+
+
+@app.post("/api/orders/cancel")
+async def cancel_open_order(req: CancelOrderRequest) -> dict:
+    """Cancel a single open order by order_id (GRVT)."""
+    _require_admin_key(req.admin_key)
+    if SETTINGS.exchange != "grvt":
+        raise HTTPException(status_code=400, detail="exchange_not_grvt")
+    inst_id = _normalize_inst_id(req.instId)
+    try:
+        resp = await exchange.cancel_order(inst_id=inst_id, ord_id=req.order_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cancel_failed: {e}") from e
+    ok = str((resp or {}).get("code", "")) in {"0", "success"}
+    return {"ok": ok, "instId": inst_id, "order_id": req.order_id, "resp": resp}
+
+
+@app.post("/api/orders/replace")
+async def replace_open_order(req: ReplaceOrderRequest) -> dict:
+    """
+    Replace a LIMIT entry order by canceling then re-placing with a new limit price.
+
+    Safety:
+    - Only supports non-reduce-only (entry) orders.
+    - Uses current open-order details (size/side) from GRVT.
+    """
+    _require_admin_key(req.admin_key)
+    if SETTINGS.exchange != "grvt":
+        raise HTTPException(status_code=400, detail="exchange_not_grvt")
+    inst_id = _normalize_inst_id(req.instId)
+
+    # Parse price early
+    try:
+        new_px_f = float(req.new_price)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid_new_price: {e}") from e
+    if new_px_f <= 0:
+        raise HTTPException(status_code=400, detail="invalid_new_price")
+
+    # Find the order details to preserve size/side.
+    open_data = await open_orders(instId=inst_id)
+    orders = open_data.get("orders") if isinstance(open_data, dict) else None
+    if not isinstance(orders, list):
+        raise HTTPException(status_code=500, detail="open_orders_unavailable")
+
+    target = None
+    for o in orders:
+        if isinstance(o, dict) and str(o.get("order_id") or "") == str(req.order_id):
+            target = o
+            break
+    if not target:
+        raise HTTPException(status_code=404, detail="order_not_found")
+    if target.get("reduce_only"):
+        raise HTTPException(status_code=400, detail="cannot_replace_reduce_only")
+
+    side = target.get("side")
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="unknown_order_side")
+    pos_side = "long" if side == "buy" else "short"
+    sz = target.get("size")
+    if sz is None or str(sz).strip() == "":
+        raise HTTPException(status_code=400, detail="unknown_order_size")
+    old_px = target.get("limit_price")
+    old_sz = str(sz)
+
+    new_sz = old_sz
+    if req.new_size is not None:
+        try:
+            parsed_sz = float(str(req.new_size).strip())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid_new_size: {e}") from e
+        if parsed_sz <= 0:
+            raise HTTPException(status_code=400, detail="invalid_new_size")
+        new_sz = str(req.new_size).strip()
+
+    # Cancel first
+    try:
+        cancel_resp = await exchange.cancel_order(inst_id=inst_id, ord_id=req.order_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"cancel_failed: {e}") from e
+
+    # Place new limit order
+    place_resp = None
+    try:
+        cl_ord_id = f"ui_replace_{int(time.time()*1000)}"
+        place_resp = await exchange.place_order(
+            inst_id=inst_id,
+            td_mode=SETTINGS.okx_td_mode,
+            side=side,
+            pos_side=pos_side,
+            ord_type="limit",
+            sz=new_sz,
+            px=str(new_px_f),
+            cl_ord_id=cl_ord_id,
+            reduce_only=False,
+        )
+    except Exception as e:
+        place_resp = {"code": "1", "msg": str(e)}
+
+    place_ok = str((place_resp or {}).get("code", "")) in {"0", "success"}
+    restore_resp = None
+    if not place_ok:
+        # Best-effort restore old order so "edit" doesn't unintentionally remove the entry.
+        try:
+            if old_px is not None and str(old_px).strip() != "":
+                restore_id = f"ui_restore_{int(time.time()*1000)}"
+                restore_resp = await exchange.place_order(
+                    inst_id=inst_id,
+                    td_mode=SETTINGS.okx_td_mode,
+                    side=side,
+                    pos_side=pos_side,
+                    ord_type="limit",
+                    sz=old_sz,
+                    px=str(old_px),
+                    cl_ord_id=restore_id,
+                    reduce_only=False,
+                )
+        except Exception as e:
+            restore_resp = {"code": "1", "msg": str(e)}
+
+    return {
+        "ok": bool(place_ok),
+        "instId": inst_id,
+        "old_order_id": req.order_id,
+        "new_price": new_px_f,
+        "new_size": new_sz,
+        "cancel_resp": cancel_resp,
+        "place_resp": place_resp,
+        "restore_resp": restore_resp,
+    }
+
 manager: TradeManager | None = None
 fill_tracker = FillTracker()
 ws_manager: WsFillManager | None = None
@@ -59,6 +362,17 @@ _health_task: asyncio.Task | None = None
 _refresh_task: asyncio.Task | None = None
 _last_refresh_by_key: dict[str, float] = {}
 _lighter_refresh_size_by_key: dict[str, float] = {}
+_grvt_refresh_skip_log_ts: float = 0.0
+_grvt_refresh_last_protection: dict[str, dict[str, Any]] = {}
+_grvt_refresh_cancel_until: dict[str, float] = {}
+_grvt_emergency_close_state: dict[str, dict[str, Any]] = {}
+_grvt_manual_cancel_state: dict[str, dict[str, Any]] = {}
+# Anchor TP/Trail to the original SL distance to avoid drifting TP targets when SL is trailed.
+_grvt_tp_anchor_sl_by_key: dict[str, float] = {}
+# Best-effort cleanup: if a symbol had a position recently but is now flat, cancel leftover reduce-only TP/SL.
+_grvt_recent_position_last_seen: dict[str, float] = {}
+_grvt_orphan_cleanup_last_ts: float = 0.0
+_telegram_actions: SimpleQueue[tuple[str, dict[str, Any]]] = SimpleQueue()
 
 # Concurrency limiter for order placement (max 3 concurrent orders)
 _order_semaphore = asyncio.Semaphore(3)
@@ -443,9 +757,12 @@ else:
 
 def _configure_logging() -> None:
     """Configure log rotation and format for production use."""
+    import os
+
+    os.makedirs("logs", exist_ok=True)
     # Create rotating file handler (50MB files, keep 5 backups)
     handler = logging.handlers.RotatingFileHandler(
-        "tw168.log",
+        "logs/tw168.log",
         maxBytes=50 * 1024 * 1024,  # 50MB
         backupCount=5,
         encoding="utf-8"
@@ -625,8 +942,11 @@ if SETTINGS.candle_ws_enabled:
     elif SETTINGS.candle_ws_symbol_tfs:
         candle_ws_symbol_tfs = _parse_symbol_tfs(SETTINGS.candle_ws_symbol_tfs, default_tfs=default_tfs)
 
+    # Candle WS subscriptions should NOT narrow the trading allowlist.
+    # Only when SYMBOL_ALLOWLIST='*' do we derive the effective allowlist from the WS config.
     if candle_ws_symbol_tfs:
-        allowed_symbols = set(candle_ws_symbol_tfs.keys())
+        if "*" in SETTINGS.symbol_allowlist:
+            allowed_symbols = set(candle_ws_symbol_tfs.keys())
     elif "*" in SETTINGS.symbol_allowlist:
         logger.warning("CANDLE_WS enabled with SYMBOL_ALLOWLIST='*'; skipping WS subscriptions")
     else:
@@ -681,6 +1001,12 @@ class TvPayload(BaseModel):
     instId: str
     tf: str = "1m"
     t: str | None = None
+    # Preferred: the actual alert send time (e.g. TradingView `{{timenow}}`).
+    # This is used for stale-signal expiry, because `t` is often a bar-time.
+    sent_at: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("sent_at", "sentAt", "timenow", "time_now", "sentTime", "sent_time"),
+    )
     close: str | None = None
     zone: str | None = None
     side: str | None = None
@@ -691,7 +1017,7 @@ class TvPayload(BaseModel):
 
 class ManualSignalRequest(BaseModel):
     instId: str = Field(..., description="交易对，如 ETH-USDT-SWAP")
-    tf: str = Field(default="1h", description="时间周期：1m, 5m, 15m, 30m, 1h, 4h")
+    tf: str = Field(default="1h", description="时间周期：1m, 5m, 15m, 30m, 1h, 4h, 1d")
     side: str = Field(..., description="方向: long 或 short")
     type: str = Field(default="DIV", description="信号类型: ZONE 或 DIV")
     admin_key: str = Field(..., description="管理员密钥")
@@ -761,16 +1087,18 @@ def _build_dedupe_key(payload: "TvPayload", *, inst_id: str, tf: str, close_f: f
     return f"{payload.type}:{inst_id}:{tf}:{payload.t or ''}:{side_part}:{zone_part}:{close_part}"
 
 
-def _log_payload(payload: TvPayload) -> None:
+def _log_payload(payload: TvPayload, *, source: str) -> None:
     _audit_append_event(
         {
             "ts": _audit_utc_now_iso(),
             "event": "tv_webhook_received",
+            "signal_source": source,
             **_audit_sanitize_payload(payload),
         }
     )
     logger.info(
-        "tv_webhook received type=%s instId=%s tf=%s zone=%s t=%s close=%s rsi=%s long=%s short=%s",
+        "tv_webhook received signal_source=%s type=%s instId=%s tf=%s zone=%s t=%s close=%s rsi=%s long=%s short=%s",
+        source,
         payload.type,
         payload.instId,
         payload.tf,
@@ -803,6 +1131,11 @@ def _normalize_inst_id(raw_inst_id: str) -> str:
     if inst_id.endswith(".P"):
         inst_id = inst_id[:-2]
     inst_id = inst_id.replace("/", "")
+    # GRVT style: BTC_USDT_Perp / BTC_USDT_PERP -> BTC-USDT-SWAP
+    if "-" not in inst_id and "_USDT" in inst_id:
+        base = inst_id.split("_USDT", 1)[0]
+        if base:
+            return f"{base}-USDT-SWAP"
     if "-" in inst_id:
         return inst_id
     if inst_id.endswith("USDT"):
@@ -1153,7 +1486,26 @@ def _start_telegram_control() -> None:
     def handler(inst_id: str, tf: str) -> None:
         _handle_telegram_div(inst_id, tf)
 
-    tg_control = TelegramControl(token=bot_token, chat_id=chat_id, handler=handler)
+    def command_handler(cmd: str, args: list[str]) -> None:
+        cmd = (cmd or "").lower().strip()
+        if cmd != "protect":
+            return
+        # /protect yes TON-USDT-SWAP long
+        if len(args) < 3:
+            notify_info("用法: /protect yes|no INSTID long|short")
+            return
+        decision = args[0].lower().strip()
+        inst_id = _normalize_inst_id(args[1])
+        pos_side = args[2].lower().strip()
+        if pos_side not in {"long", "short"}:
+            notify_info("posSide 只能是 long 或 short: /protect yes|no INSTID long|short")
+            return
+        if decision not in {"yes", "no"}:
+            notify_info("只能回复 yes 或 no: /protect yes|no INSTID long|short")
+            return
+        _telegram_actions.put(("protect", {"decision": decision, "instId": inst_id, "posSide": pos_side}))
+
+    tg_control = TelegramControl(token=bot_token, chat_id=chat_id, handler=handler, command_handler=command_handler)
     tg_control.start()
 
 
@@ -1777,7 +2129,7 @@ async def _refresh_lighter_protection() -> None:
                                     if str(sl_retry.get("code", "")) in {"0", "success"}:
                                         sl_failed = False
 
-                    if sl_failed and SETTINGS.backup_sl_enabled:
+                    if sl_failed and SETTINGS.backup_sl_enabled and SETTINGS.exchange != "grvt":
                         try:
                             backup_sl_resp = await exchange.place_order(
                                 inst_id=inst_id,
@@ -1882,6 +2234,1073 @@ async def _refresh_lighter_protection() -> None:
                     pos_side,
                     sl_order_sz,
                 )
+
+
+async def _refresh_grvt_protection() -> None:
+    if SETTINGS.exchange != "grvt":
+        return
+    while True:
+        # Process Telegram actions (from polling thread)
+        try:
+            while True:
+                action, payload = _telegram_actions.get_nowait()
+                if action == "protect" and isinstance(payload, dict):
+                    inst_id = _normalize_inst_id(str(payload.get("instId") or ""))
+                    pos_side = str(payload.get("posSide") or "").lower().strip()
+                    decision = str(payload.get("decision") or "").lower().strip()
+                    if inst_id and pos_side in {"long", "short"} and decision in {"yes", "no"}:
+                        key = f"{inst_id}:{pos_side}"
+                        if decision == "yes":
+                            _grvt_manual_cancel_state.pop(key, None)
+                            _grvt_refresh_cancel_until[key] = 0.0
+                            _last_refresh_by_key[key] = 0.0
+                            _log_decision(inst_id, "", action="grvt_manual_cancel_confirmed", posSide=pos_side, decision="yes")
+                            notify_info(f"收到确认：补回 {inst_id} {pos_side} 的 TP/SL")
+                        else:
+                            until = time.time() + float(SETTINGS.grvt_refresh_respect_manual_cancel_seconds or 3600)
+                            _grvt_manual_cancel_state[key] = {"decision": "no", "until": until}
+                            _grvt_refresh_cancel_until[key] = until
+                            _log_decision(inst_id, "", action="grvt_manual_cancel_confirmed", posSide=pos_side, decision="no", until=until)
+                            notify_info(f"收到确认：不补回 {inst_id} {pos_side} 的 TP/SL（直到 {int(until)}）")
+        except Exception:
+            pass
+
+        await asyncio.sleep(max(5, SETTINGS.grvt_refresh_seconds))
+        if not SETTINGS.grvt_refresh_enabled:
+            continue
+        if SETTINGS.grvt_refresh_requires_trading_enabled and not SETTINGS.trading_enabled:
+            global _grvt_refresh_skip_log_ts
+            now = time.time()
+            if now - _grvt_refresh_skip_log_ts >= 60:
+                _grvt_refresh_skip_log_ts = now
+                logger.info(
+                    "grvt refresh skipped reason=trading_disabled env=TRADING_ENABLED=false override=GRVT_REFRESH_REQUIRES_TRADING_ENABLED"
+                )
+            continue
+        now = time.time()
+
+        inst_ids = [s for s in allowed_symbols if s and s != "*"]
+        try:
+            # GRVT is heavily rate-limited; fetch all positions once per tick.
+            raw_positions = await exchange.get_positions(inst_ids=inst_ids or None)
+        except Exception as e:
+            logger.warning("grvt refresh get_positions failed err=%s", str(e))
+            continue
+
+        # Build a reverse mapping from GRVT symbol -> our inst_id.
+        # This preserves k-prefixed mappings (e.g., BONK -> KBONK) when configured.
+        grvt_symbol_to_inst: dict[str, str] = {}
+        if inst_ids and hasattr(exchange, "_resolve_symbol"):
+            for inst in inst_ids:
+                try:
+                    sym = exchange._resolve_symbol(inst)
+                except Exception:
+                    sym = None
+                if sym:
+                    grvt_symbol_to_inst[str(sym)] = inst
+
+        def _pos_symbol(p: dict) -> str | None:
+            for k in ("symbol", "instrument", "inst", "instId"):
+                v = p.get(k)
+                if isinstance(v, str) and v:
+                    return v
+            return None
+
+        def _pos_size(p: dict) -> float:
+            # Prefer "size" for GRVT; some payloads include multiple fields with different semantics.
+            for k in ("size", "contracts", "position"):
+                v = p.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return 0.0
+
+        def _pos_entry_price(p: dict) -> float:
+            for k in ("entryPrice", "entry_price", "avgPx"):
+                v = p.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return 0.0
+
+        # Group raw positions by (inst_id, pos_side).
+        positions_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for p in raw_positions or []:
+            if not isinstance(p, dict):
+                continue
+            sym = _pos_symbol(p)
+            if not sym:
+                continue
+            inst_id = grvt_symbol_to_inst.get(sym)
+            if inst_id is None:
+                # Best-effort reverse normalize when allowlist is wildcard or mapping is missing.
+                if sym.endswith("_USDT_Perp"):
+                    base = sym[: -len("_USDT_Perp")]
+                    inst_id = f"{base}-USDT-SWAP"
+                else:
+                    continue
+
+            sz = _pos_size(p)
+            if sz == 0:
+                continue
+            pos_side = "long" if sz > 0 else "short"
+            positions_by_key[(inst_id, pos_side)] = p
+            _grvt_recent_position_last_seen[inst_id] = now
+
+        # Low-frequency orphan protection cleanup (works across restarts):
+        # For watched symbols that are currently flat, cancel leftover reduce-only STOP_LOSS/TAKE_PROFIT orders.
+        global _grvt_orphan_cleanup_last_ts
+        try:
+            if SETTINGS.grvt_orphan_protection_cleanup_enabled:
+                period_s = max(300, int(SETTINGS.grvt_orphan_protection_cleanup_seconds or 1200))
+                if (now - _grvt_orphan_cleanup_last_ts) >= period_s:
+                    _grvt_orphan_cleanup_last_ts = now
+                    active_inst_ids = {inst for (inst, _ps) in positions_by_key.keys()}
+                    scan_ids = set(inst_ids) if inst_ids else set(candle_ws_symbol_tfs.keys())
+                    scan_ids = {s for s in scan_ids if s and s != "*"}
+                    cancelled_total = 0
+                    scanned = 0
+                    for inst in sorted(scan_ids):
+                        if inst in active_inst_ids:
+                            continue
+                        scanned += 1
+                        try:
+                            oo = await exchange.get_open_orders(inst_id=inst)
+                        except Exception:
+                            oo = []
+                        cancelled = 0
+                        for o in oo or []:
+                            if not isinstance(o, dict):
+                                continue
+                            ro = o.get("reduce_only")
+                            if not (ro is True or str(ro).lower() in {"true", "1", "yes"}):
+                                continue
+                            meta = o.get("metadata") if isinstance(o.get("metadata"), dict) else {}
+                            trig = meta.get("trigger") if isinstance(meta, dict) else None
+                            t = str(trig.get("trigger_type") or "").upper() if isinstance(trig, dict) else ""
+                            if "STOP_LOSS" not in t and "TAKE_PROFIT" not in t:
+                                continue
+                            oid = o.get("order_id") or o.get("id") or o.get("ordId")
+                            if not oid:
+                                continue
+                            try:
+                                await exchange.cancel_order(inst_id=inst, ord_id=str(oid))
+                                cancelled += 1
+                                await asyncio.sleep(0.25)
+                            except Exception:
+                                pass
+                        if cancelled:
+                            cancelled_total += cancelled
+                            _log_decision(inst, "", action="grvt_orphan_protection_cleanup", cancelled=cancelled)
+                            # small spacing to reduce rate-limit risk
+                            await asyncio.sleep(0.25)
+                    if cancelled_total:
+                        logger.info("grvt orphan protection cleanup cancelled=%d", cancelled_total)
+                    else:
+                        logger.info(
+                            "grvt orphan protection cleanup ran scanned=%d active=%d cancelled=0",
+                            scanned,
+                            len(active_inst_ids),
+                        )
+        except Exception:
+            pass
+
+        # Orphan protection cleanup: if a symbol was recently in position but is now flat,
+        # cancel leftover reduce-only TP/SL orders (they serve no purpose when size=0).
+        try:
+            active_inst_ids = {inst for (inst, _ps) in positions_by_key.keys()}
+            recently_closed = [
+                inst
+                for inst, last_seen in list(_grvt_recent_position_last_seen.items())
+                if inst not in active_inst_ids and (now - float(last_seen or 0.0)) <= 6 * 3600
+            ]
+            for inst in recently_closed:
+                try:
+                    oo = await exchange.get_open_orders(inst_id=inst)
+                except Exception:
+                    oo = []
+                cancelled = 0
+                for o in oo or []:
+                    if not isinstance(o, dict):
+                        continue
+                    if not _is_reduce_only(o):
+                        continue
+                    trig = _order_trigger_meta(o)
+                    t = str(trig.get("trigger_type") or "").upper() if isinstance(trig, dict) else ""
+                    if "STOP_LOSS" not in t and "TAKE_PROFIT" not in t:
+                        continue
+                    oid = o.get("order_id") or o.get("id") or o.get("ordId")
+                    if not oid:
+                        continue
+                    try:
+                        await exchange.cancel_order(inst_id=inst, ord_id=str(oid))
+                        cancelled += 1
+                        await asyncio.sleep(0.2)
+                    except Exception:
+                        pass
+                if cancelled:
+                    _log_decision(inst, "", action="grvt_refresh_orphan_protection_cancelled", cancelled=cancelled)
+                _grvt_recent_position_last_seen.pop(inst, None)
+        except Exception:
+            pass
+
+        if not positions_by_key:
+            if os.getenv("GRVT_REFRESH_DEBUG", "").strip().lower() in {"1", "true", "yes"}:
+                logger.info("grvt refresh no_positions")
+            continue
+
+        logger.info("grvt refresh positions_detected count=%d", len(positions_by_key))
+
+        for (inst_id, pos_side), raw_pos in positions_by_key.items():
+            key = f"{inst_id}:{pos_side}"
+            cancel_until = _grvt_refresh_cancel_until.get(key, 0.0)
+            skip_cancel_until = bool(cancel_until and now < cancel_until)
+
+            try:
+                size = Decimal(str(abs(_pos_size(raw_pos))))
+            except Exception:
+                size = Decimal("0")
+            if size <= 0:
+                continue
+
+            try:
+                entry_price = float(_pos_entry_price(raw_pos) or 0.0)
+            except Exception:
+                entry_price = 0.0
+            if entry_price <= 0:
+                try:
+                    entry_price = float(await exchange.get_last_price(inst_id=inst_id) or 0.0)
+                except Exception:
+                    entry_price = 0.0
+            if entry_price <= 0:
+                continue
+
+            side = "buy" if pos_side == "long" else "sell"
+            sl_side = "sell" if side == "buy" else "buy"
+
+            inst_info = None
+            try:
+                inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+            except Exception:
+                inst_info = None
+            tick_size = inst_info.get("tickSz") if inst_info else None
+            lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
+            min_order = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
+
+            normalized_sz = _normalize_qty(size, step=lot_step, min_sz=min_order)
+            if normalized_sz <= 0:
+                continue
+            pos_sz_str = _format_decimal(normalized_sz)
+
+            entry_info = fill_tracker.get_entry_info(inst_id=inst_id)
+            sl_val: float | None = None
+            if entry_info is not None and entry_info.side == side and entry_info.stop_loss > 0:
+                sl_val = float(entry_info.stop_loss)
+            else:
+                entry_state = state.get_entry(inst_id, ttl_seconds=SETTINGS.lighter_entry_ttl_seconds)
+                if entry_state is not None and entry_state.side == side and entry_state.stop_loss > 0:
+                    sl_val = float(entry_state.stop_loss)
+
+                if sl_val is None:
+                    # Compute SL from OKX candles as a reference source.
+                    tf = "1h"
+                    if candle_ws_symbol_tfs and inst_id in candle_ws_symbol_tfs and candle_ws_symbol_tfs[inst_id]:
+                        tf = candle_ws_symbol_tfs[inst_id][0]
+                    elif SETTINGS.candle_ws_tfs:
+                        tf = str(SETTINGS.candle_ws_tfs[0])
+
+                    desired_limit = max(300, get_lookback_bars(tf) + 50)
+                    candles: list = []
+                    try:
+                        candles = await asyncio.to_thread(
+                            fetch_candles_paged,
+                            SETTINGS.okx_base_url,
+                            inst_id,
+                            tf,
+                            desired_limit,
+                        )
+                    except Exception:
+                        candles = []
+                    if not candles:
+                        _log_decision(inst_id, "", action="grvt_refresh_skip", reason="no_okx_candles")
+                        continue
+
+                    try:
+                        if SETTINGS.stop_method == "pivot":
+                            sl_comp = stop_loss_price(
+                                side=side,
+                                entry_price=float(entry_price),
+                                candles=candles,
+                                pivot_len=SETTINGS.pivot_len,
+                                atr_len=SETTINGS.atr_len,
+                                atr_buffer_mult=SETTINGS.atr_buffer_mult,
+                                min_buffer_bps=SETTINGS.min_buffer_bps,
+                            )
+                        else:
+                            sl_comp = stop_loss_price_lookback(
+                                side=side,
+                                entry_price=float(entry_price),
+                                candles=candles,
+                                lookback_bars=get_lookback_bars(tf),
+                                atr_len=SETTINGS.atr_len,
+                                atr_buffer_mult=SETTINGS.atr_buffer_mult,
+                                min_buffer_bps=SETTINGS.min_buffer_bps,
+                            )
+                        sl_val = float(sl_comp) if sl_comp else None
+                    except Exception:
+                        sl_val = None
+
+                if sl_val is None or sl_val <= 0:
+                    _log_decision(inst_id, "", action="grvt_refresh_skip", reason="no_sl")
+                    continue
+
+                # Basic sanity: SL must be on the correct side of entry.
+                if side == "buy" and sl_val >= entry_price:
+                    _log_decision(inst_id, "", action="grvt_refresh_skip", reason="sl_gte_entry", sl=sl_val, entry=entry_price)
+                    continue
+                if side == "sell" and sl_val <= entry_price:
+                    _log_decision(inst_id, "", action="grvt_refresh_skip", reason="sl_lte_entry", sl=sl_val, entry=entry_price)
+                    continue
+
+                # Emergency safety net: if price has already crossed SL, attempt immediate reduce-only market close.
+                if SETTINGS.grvt_emergency_close_on_stop_breach and SETTINGS.trading_enabled:
+                    try:
+                        current_price = float(await exchange.get_last_price(inst_id=inst_id) or 0.0)
+                    except Exception:
+                        current_price = 0.0
+
+                    breach = False
+                    bps = float(SETTINGS.grvt_emergency_stop_breach_bps or 0.0)
+                    if current_price > 0 and sl_val > 0:
+                        if pos_side == "long":
+                            threshold = float(sl_val) * (1.0 + (bps / 10000.0))
+                            breach = current_price <= threshold
+                        else:
+                            threshold = float(sl_val) * (1.0 - (bps / 10000.0))
+                            breach = current_price >= threshold
+
+                    if breach:
+                        st = _grvt_emergency_close_state.get(key) or {"retries": 0, "next_ts": 0.0}
+                        if now >= float(st.get("next_ts") or 0.0):
+                            close_side = "sell" if pos_side == "long" else "buy"
+                            try:
+                                close_resp = await exchange.place_order(
+                                    inst_id=inst_id,
+                                    td_mode=SETTINGS.okx_td_mode,
+                                    side=close_side,
+                                    pos_side=pos_side,
+                                    ord_type="market",
+                                    sz=pos_sz_str,
+                                    px=None,
+                                    reduce_only=True,
+                                )
+                            except Exception as e:
+                                close_resp = {"code": "1", "msg": str(e)}
+
+                            ok = str(close_resp.get("code", "")) in {"0", "success"}
+                            _log_decision(
+                                inst_id,
+                                "",
+                                action="grvt_emergency_close" if ok else "grvt_emergency_close_failed",
+                                posSide=pos_side,
+                                px=current_price,
+                                sl=sl_val,
+                                resp=close_resp,
+                            )
+                            if ok:
+                                _grvt_emergency_close_state.pop(key, None)
+                                _last_refresh_by_key[key] = now
+                                await asyncio.sleep(0.05)
+                                continue
+                            retries = int(st.get("retries") or 0) + 1
+                            next_ts = now + float(SETTINGS.grvt_emergency_retry_interval)
+                            if retries > int(SETTINGS.grvt_emergency_max_retries):
+                                # Keep backing off; avoid spamming the venue.
+                                retries = int(SETTINGS.grvt_emergency_max_retries)
+                                next_ts = now + float(SETTINGS.grvt_emergency_retry_interval) * 2
+                            _grvt_emergency_close_state[key] = {"retries": retries, "next_ts": next_ts}
+                        _last_refresh_by_key[key] = now
+                        await asyncio.sleep(0.05)
+                        continue
+
+                # Fetch open orders once per position.
+                try:
+                    existing_orders = await exchange.get_open_orders(inst_id=inst_id)
+                except Exception:
+                    existing_orders = []
+
+                def _order_trigger_meta(o: dict) -> dict | None:
+                    info = o.get("info") if isinstance(o.get("info"), dict) else o
+                    meta = info.get("metadata") if isinstance(info, dict) else None
+                    if not isinstance(meta, dict):
+                        return None
+                    trig = meta.get("trigger")
+                    return trig if isinstance(trig, dict) else None
+
+                def _is_reduce_only(o: dict) -> bool:
+                    for k in ("reduce_only", "reduceOnly", "reduceOnlyFlag"):
+                        val = o.get(k)
+                        if isinstance(val, bool) and val:
+                            return True
+                        if isinstance(val, str) and val.lower() in {"true", "1", "yes"}:
+                            return True
+                    info = o.get("info")
+                    if isinstance(info, dict):
+                        val = info.get("reduce_only") or info.get("reduceOnly")
+                        if isinstance(val, bool) and val:
+                            return True
+                        if isinstance(val, str) and val.lower() in {"true", "1", "yes"}:
+                            return True
+                    return False
+
+                sl_exists = False
+                existing_sl_total_sz = Decimal("0")
+                existing_sl_ord_id = ""
+                existing_sl_triggers: list[tuple[Decimal, Decimal, str]] = []  # (trigger_px, size, ord_id)
+                existing_tp_total_sz = Decimal("0")
+                # trigger_price -> [(size, ord_id), ...] (GRVT can have duplicates at the same trigger price)
+                existing_tp_info: dict[Decimal, list[tuple[Decimal, str]]] = {}
+                sl_tp_order_ids: list[str] = []
+
+                for order in existing_orders or []:
+                    if not isinstance(order, dict):
+                        continue
+                    if not _is_reduce_only(order):
+                        continue
+                    order_side = str(order.get("side", "")).lower()
+                    if order_side and order_side != sl_side:
+                        continue
+                    
+                    trig = _order_trigger_meta(order)
+                    trig_type = str(trig.get("trigger_type")) if trig else ""
+                    trig_px = None
+                    if isinstance(trig, dict):
+                        tpsl = trig.get("tpsl")
+                        if isinstance(tpsl, dict):
+                            trig_px = tpsl.get("trigger_price") or tpsl.get("triggerPrice")
+                    stop_loss_px = order.get("stopLossPrice")
+                    take_profit_px = order.get("takeProfitPrice")
+                    trigger_px = stop_loss_px or take_profit_px or trig_px or order.get("trigger_price")
+
+                    def _classify_trigger(px: Decimal, *, trig_type_val: str) -> str | None:
+                        if px <= 0:
+                            return None
+                        t = trig_type_val.upper().strip()
+                        if "STOP_LOSS" in t or t == "SL":
+                            return "sl"
+                        if "TAKE_PROFIT" in t or t == "TP":
+                            return "tp"
+                        if stop_loss_px is not None and take_profit_px is None:
+                            return "sl"
+                        if take_profit_px is not None and stop_loss_px is None:
+                            return "tp"
+                        return None
+                    
+                    try:
+                        px_dec = Decimal(str(trigger_px)) if trigger_px is not None else None
+                        legs = order.get("legs") if isinstance(order.get("legs"), list) else []
+                        leg0 = legs[0] if legs else {}
+                        raw_sz = leg0.get("size") or order.get("size") or order.get("sz") or order.get("amount") or 0
+                        sz_dec = Decimal(str(raw_sz))
+                    except Exception:
+                        continue
+                    if px_dec is None:
+                        continue
+                    trigger_kind = _classify_trigger(px_dec, trig_type_val=trig_type)
+                    if trigger_kind is None:
+                        continue
+
+                    ord_id = order.get("order_id") or order.get("id") or order.get("ordId")
+                    ord_id_str = str(ord_id) if ord_id else ""
+                    if ord_id_str:
+                        sl_tp_order_ids.append(ord_id_str)
+
+                    if trigger_kind == "sl":
+                        sl_exists = True
+                        existing_sl_total_sz += sz_dec
+                        existing_sl_ord_id = ord_id_str
+                        existing_sl_triggers.append((px_dec, sz_dec, ord_id_str))
+                    elif trigger_kind == "tp":
+                        existing_tp_info.setdefault(px_dec, []).append((sz_dec, ord_id_str))
+                        existing_tp_total_sz += sz_dec
+
+                # If the user manually cancelled protection recently, we can pause re-creation.
+                if skip_cancel_until:
+                    # If Telegram is configured, switch to "ask before restoring" mode.
+                    # Otherwise, fallback to the original behavior (skip re-creation).
+                    has_tg = bool(_getenv_optional("TELEGRAM_BOT_TOKEN") and _getenv_optional("TELEGRAM_CHAT_ID"))
+                    if has_tg and SETTINGS.grvt_manual_cancel_confirm_enabled and SETTINGS.grvt_refresh_respect_manual_cancel_seconds > 0:
+                        tp_missing = SETTINGS.tp_enabled and SETTINGS.grvt_refresh_tp_enabled and len(existing_tp_info) == 0
+                        sl_missing = SETTINGS.grvt_refresh_sl_enabled and (not sl_exists)
+                        if tp_missing or sl_missing:
+                            st = _grvt_manual_cancel_state.get(key) or {}
+                            # If user already said "no" and it's still within the window, keep skipping quietly.
+                            if st.get("decision") == "no" and float(st.get("until") or 0.0) > now:
+                                _last_refresh_by_key[key] = now
+                                continue
+                            missing_since = float(st.get("missing_since") or 0.0)
+                            if missing_since <= 0:
+                                missing_since = now
+                            notified_at = float(st.get("notified_at") or 0.0)
+                            st.update({"missing_since": missing_since, "notified_at": notified_at})
+                            _grvt_manual_cancel_state[key] = st
+
+                            # After N seconds still missing -> notify and ask.
+                            after_s = max(5, int(SETTINGS.grvt_manual_cancel_confirm_after_seconds or 60))
+                            if (now - missing_since) >= after_s and notified_at <= 0:
+                                st["notified_at"] = now
+                                _grvt_manual_cancel_state[key] = st
+                                need = []
+                                if sl_missing:
+                                    need.append("SL")
+                                if tp_missing:
+                                    need.append("TP")
+                                need_str = "/".join(need) if need else "TP/SL"
+                                notify_info(
+                                    f"{inst_id} {pos_side} 你手动取消了 {need_str}，已持续 {after_s}s 未补回。\n"
+                                    f"回复：/protect yes {inst_id} {pos_side} 立刻补回\n"
+                                    f"或：/protect no {inst_id} {pos_side} 暂不补回"
+                                )
+                            _last_refresh_by_key[key] = now
+                            continue
+
+                    # No telegram confirm: respect manual cancel by skipping all re-creation.
+                    _last_refresh_by_key[key] = now
+                    continue
+
+                # If the operator manually cancels protection orders on the exchange UI,
+                # we want to optionally respect that and not immediately re-create them.
+                if SETTINGS.grvt_refresh_respect_manual_cancel_seconds > 0:
+                    prev = _grvt_refresh_last_protection.get(key) or {}
+                    prev_any = bool(prev.get("sl_exists")) or int(prev.get("tp_count") or 0) > 0
+                    now_any = sl_exists or len(existing_tp_info) > 0
+                    if prev_any and not now_any:
+                        _grvt_refresh_cancel_until[key] = now + float(SETTINGS.grvt_refresh_respect_manual_cancel_seconds)
+                        _grvt_refresh_last_protection[key] = {
+                            "sl_exists": sl_exists,
+                            "tp_count": len(existing_tp_info),
+                            "ts": now,
+                        }
+                        _log_decision(inst_id, "", action="grvt_refresh_skip", reason="manual_cancel_respected")
+                        _last_refresh_by_key[key] = now
+                        continue
+                    _grvt_refresh_last_protection[key] = {
+                        "sl_exists": sl_exists,
+                        "tp_count": len(existing_tp_info),
+                        "ts": now,
+                    }
+
+                _log_decision(
+                    inst_id,
+                    "",
+                    action="grvt_refresh_detected",
+                    posSide=pos_side,
+                    size=pos_sz_str,
+                    entry=entry_price,
+                    sl=sl_val,
+                    sl_exists=sl_exists,
+                    sl_sz=str(existing_sl_total_sz),
+                    tp_existing=len(existing_tp_info),
+                    tp_sz=str(existing_tp_total_sz),
+                )
+
+                # Anchor SL to the exchange if we already have a matching full-size SL order.
+                # This prevents candle-based recomputation drift from shifting TP targets and creating duplicates.
+                if existing_sl_triggers:
+                    try:
+                        size_tol = Decimal(str(lot_step)) if lot_step else Decimal("0.000001")
+                    except Exception:
+                        size_tol = Decimal("0.000001")
+                    candidates = [(px, sz, oid) for (px, sz, oid) in existing_sl_triggers if abs(sz - normalized_sz) <= size_tol]
+                    if not candidates:
+                        candidates = existing_sl_triggers
+                    chosen = max(candidates, key=lambda x: x[0]) if pos_side == "long" else min(candidates, key=lambda x: x[0])
+                    try:
+                        sl_val = float(chosen[0])
+                    except Exception:
+                        pass
+
+                # Store anchored SL so later refreshes won't drift.
+                fill_tracker.register_entry(inst_id=inst_id, side=side, entry_price=float(entry_price), stop_loss=float(sl_val))
+                state.set_entry(inst_id=inst_id, side=side, entry_price=float(entry_price), stop_loss=float(sl_val))
+
+                # TP anchor: keep the original stop distance for TP/trailing calculations.
+                # When SL gets trailed upwards (long) / downwards (short), we do NOT want to shift TP targets.
+                # - long: keep the minimum (farthest) SL
+                # - short: keep the maximum (farthest) SL
+                prev_anchor = _grvt_tp_anchor_sl_by_key.get(key)
+                if prev_anchor is None:
+                    _grvt_tp_anchor_sl_by_key[key] = float(sl_val)
+                else:
+                    try:
+                        if pos_side == "long":
+                            _grvt_tp_anchor_sl_by_key[key] = float(min(prev_anchor, float(sl_val)))
+                        else:
+                            _grvt_tp_anchor_sl_by_key[key] = float(max(prev_anchor, float(sl_val)))
+                    except Exception:
+                        pass
+
+                def _price_tol() -> Decimal:
+                    if tick_size:
+                        try:
+                            return Decimal(str(tick_size))
+                        except Exception:
+                            return Decimal("0.00000001")
+                    return Decimal("0.00000001")
+
+                def _size_tol() -> Decimal:
+                    if lot_step:
+                        return Decimal(str(lot_step))
+                    return Decimal("0.000001")
+
+                desired_sl_px = Decimal(str(_round_price_to_tick(sl_val, tick_size)))
+                # If we already have a full-size SL on the book, treat it as authoritative to avoid
+                # churn from candle-based recomputation and only dedupe/correct sizes.
+                full_size_sl: list[tuple[Decimal, Decimal, str]] = []
+                for px, sz, oid in existing_sl_triggers:
+                    if not oid:
+                        continue
+                    if abs(sz - normalized_sz) <= _size_tol():
+                        full_size_sl.append((px, sz, oid))
+                if full_size_sl:
+                    if pos_side == "long":
+                        keep_px, _keep_sz, _keep_id = max(full_size_sl, key=lambda x: x[0])
+                    else:
+                        keep_px, _keep_sz, _keep_id = min(full_size_sl, key=lambda x: x[0])
+                    desired_sl_px = keep_px
+
+                # Trailing stop (a.k.a. "moving take-profit"): once profit >= TRAIL_START_R,
+                # move SL closer to entry to lock in profit. Uses the TP anchor SL distance.
+                try:
+                    anchor_sl = float(_grvt_tp_anchor_sl_by_key.get(key) or float(sl_val))
+                except Exception:
+                    anchor_sl = float(sl_val)
+                last_price = None
+                try:
+                    last_price = float(await exchange.get_last_price(inst_id=inst_id) or 0.0)
+                except Exception:
+                    last_price = None
+
+                if last_price is not None and last_price > 0 and anchor_sl > 0:
+                    try:
+                        trail_sl = _compute_trailing_sl(
+                            side=side,
+                            entry_price=float(entry_price),
+                            sl_price=float(anchor_sl),
+                            last_price=float(last_price),
+                            trail_start_r=float(SETTINGS.trail_start_r),
+                        )
+                    except Exception:
+                        trail_sl = None
+                    if trail_sl is not None:
+                        trail_px = Decimal(str(_round_price_to_tick(float(trail_sl), tick_size)))
+                        if pos_side == "long":
+                            desired_sl_px = max(desired_sl_px, trail_px)
+                        else:
+                            desired_sl_px = min(desired_sl_px, trail_px)
+
+                        # Avoid placing SL too close to current price (may trigger immediately).
+                        gap = Decimal(str(tick_size)) if tick_size else Decimal("0")
+                        last_dec = Decimal(str(last_price))
+                        if pos_side == "long" and desired_sl_px >= (last_dec - gap):
+                            desired_sl_px = trail_px  # fallback to the computed trail
+                            if desired_sl_px >= (last_dec - gap):
+                                desired_sl_px = Decimal(str(_round_price_to_tick(float(sl_val), tick_size)))
+                        if pos_side == "short" and desired_sl_px <= (last_dec + gap):
+                            desired_sl_px = trail_px
+                            if desired_sl_px <= (last_dec + gap):
+                                desired_sl_px = Decimal(str(_round_price_to_tick(float(sl_val), tick_size)))
+                sl_ok = False
+                matching_sl_ids: list[str] = []
+                for px, sz, _oid in existing_sl_triggers:
+                    if abs(px - desired_sl_px) <= _price_tol() and abs(sz - normalized_sz) <= _size_tol():
+                        sl_ok = True
+                        if _oid:
+                            matching_sl_ids.append(_oid)
+                # If we already have multiple identical SL orders, keep one and cancel extras.
+                if sl_ok and matching_sl_ids:
+                    keep = matching_sl_ids[0]
+                    cancelled = 0
+                    for _px, _sz, oid in existing_sl_triggers:
+                        if not oid or oid == keep:
+                            continue
+                        try:
+                            await exchange.cancel_order(inst_id=inst_id, ord_id=oid)
+                            cancelled += 1
+                            await asyncio.sleep(0.2)
+                        except Exception:
+                            pass
+                    if cancelled:
+                        _log_decision(inst_id, "", action="grvt_refresh_sl_dedupe", kept=keep, cancelled=cancelled)
+                # Replace SL only when missing OR not matching our desired trigger+size.
+                sl_mismatch = sl_exists and (not sl_ok)
+                
+                if SETTINGS.grvt_refresh_sl_enabled and (not sl_exists or sl_mismatch):
+                    if sl_mismatch:
+                        logger.info("grvt_refresh_sl_mismatch instId=%s pos=%s sl_total=%s", inst_id, normalized_sz, existing_sl_total_sz)
+                    
+                    sl_px = str(desired_sl_px)
+                    try:
+                        if sl_mismatch and existing_sl_triggers:
+                            for _px, _sz, oid in existing_sl_triggers:
+                                if not oid:
+                                    continue
+                                try:
+                                    logger.info("grvt_refresh_sl_cancel instId=%s old_id=%s", inst_id, oid)
+                                    await exchange.cancel_order(inst_id=inst_id, ord_id=oid)
+                                    await asyncio.sleep(0.2)
+                                except Exception:
+                                    pass
+
+                        sl_resp = await exchange.place_algo_order(
+                            inst_id=inst_id,
+                            td_mode=SETTINGS.okx_td_mode,
+                            side=sl_side,
+                            pos_side=pos_side,
+                            ord_type="conditional",
+                            sz=pos_sz_str,
+                            sl_trigger_px=sl_px,
+                            sl_ord_px="-1",
+                        )
+                    except Exception as e:
+                        sl_resp = {"code": "1", "msg": str(e)}
+                    if str(sl_resp.get("code", "")) not in {"0", "success"}:
+                        _log_decision(inst_id, "", action="grvt_refresh_sl_failed", resp=sl_resp)
+                    else:
+                        _log_decision(inst_id, "", action="grvt_refresh_sl_set", sl=sl_px, sz=pos_sz_str)
+
+                if SETTINGS.grvt_refresh_tp_enabled and SETTINGS.tp_enabled:
+                    try:
+                        tp_targets = await _build_tp_targets(
+                            inst_id=inst_id,
+                            side=side,
+                            entry_price=float(entry_price),
+                            sl=float(_grvt_tp_anchor_sl_by_key.get(key) or float(sl_val)),
+                            total_sz=normalized_sz,
+                            tick_size=tick_size,
+                        )
+                    except Exception as e:
+                        _log_decision(inst_id, "", action="grvt_refresh_tp_skip", reason="build_tp_targets_failed", err=str(e))
+                        tp_targets = []
+
+                    # Safety cleanup: if TP total size exceeds the current position size,
+                    # cancel TP orders that don't match the current target ladder until sane.
+                    # This prevents old leftover TP orders (from larger historical size) from sticking around
+                    # when orphan cleanup is disabled.
+                    if existing_tp_info and tp_targets:
+                        sz_tol = _size_tol()
+                        if existing_tp_total_sz > (normalized_sz + sz_tol):
+                            px_tol = _price_tol()
+                            wanted: list[tuple[Decimal, Decimal]] = []
+                            for t in tp_targets:
+                                try:
+                                    wanted.append((Decimal(str(t["price"])), Decimal(str(t["size"]))))
+                                except Exception:
+                                    continue
+
+                            def _matches_wanted(px: Decimal, sz: Decimal) -> bool:
+                                for w_px, w_sz in wanted:
+                                    if abs(px - w_px) <= px_tol and abs(sz - w_sz) <= sz_tol:
+                                        return True
+                                return False
+
+                            extras: list[tuple[Decimal, Decimal, str]] = []
+                            for px_dec, entries in existing_tp_info.items():
+                                for sz_dec, oid in entries:
+                                    if not oid:
+                                        continue
+                                    if not _matches_wanted(px_dec, sz_dec):
+                                        extras.append((px_dec, sz_dec, oid))
+
+                            # Cancel farthest first (long: highest TP; short: lowest TP).
+                            extras.sort(key=lambda x: x[0], reverse=(pos_side == "long"))
+                            cur_total = existing_tp_total_sz
+                            cancelled = 0
+                            for _px, _sz, oid in extras:
+                                if cur_total <= (normalized_sz + sz_tol):
+                                    break
+                                try:
+                                    await exchange.cancel_order(inst_id=inst_id, ord_id=oid)
+                                    cancelled += 1
+                                    cur_total -= _sz
+                                    await asyncio.sleep(0.2)
+                                except Exception:
+                                    pass
+                            if cancelled:
+                                _log_decision(
+                                    inst_id,
+                                    "",
+                                    action="grvt_refresh_tp_excess_cleanup",
+                                    cancelled=cancelled,
+                                    tp_total=str(existing_tp_total_sz),
+                                    pos_sz=str(normalized_sz),
+                                )
+
+                    # Cancel exact-duplicate TP orders (same trigger price, same size) to avoid drift.
+                    # This is safe to do always, even when orphan cleanup is disabled.
+                    if existing_tp_info:
+                        sz_tol = _size_tol()
+                        dup_cancelled = 0
+                        for px_dec, entries in list(existing_tp_info.items()):
+                            if not entries or len(entries) < 2:
+                                continue
+                            # Keep first occurrence per size bucket; cancel subsequent duplicates.
+                            seen_sizes: list[Decimal] = []
+                            for sz_dec, oid in entries:
+                                if not oid:
+                                    continue
+                                if any(abs(sz_dec - s) <= sz_tol for s in seen_sizes):
+                                    try:
+                                        await exchange.cancel_order(inst_id=inst_id, ord_id=oid)
+                                        dup_cancelled += 1
+                                        await asyncio.sleep(0.2)
+                                    except Exception:
+                                        pass
+                                else:
+                                    seen_sizes.append(sz_dec)
+                        if dup_cancelled:
+                            _log_decision(inst_id, "", action="grvt_refresh_tp_dedupe", cancelled=dup_cancelled)
+
+                    # If existing TP ladder already matches, do nothing (idempotent).
+                    def _tp_targets_satisfied() -> bool:
+                        if not tp_targets:
+                            return True
+                        if not existing_tp_info:
+                            return False
+                        px_tol = _price_tol()
+                        sz_tol = _size_tol()
+                        for target in tp_targets:
+                            try:
+                                t_px = Decimal(str(target["price"]))
+                                t_sz = Decimal(str(target["size"]))
+                            except Exception:
+                                return False
+                            matched = False
+                            for p_px, entries in existing_tp_info.items():
+                                if abs(t_px - p_px) > px_tol:
+                                    continue
+                                for p_sz, _p_id in entries:
+                                    if abs(t_sz - p_sz) <= sz_tol:
+                                        matched = True
+                                        break
+                                if matched:
+                                    break
+                            if not matched:
+                                return False
+                        return True
+
+                    if _tp_targets_satisfied():
+                        _log_decision(inst_id, "", action="grvt_refresh_tp_skip", reason="tp_already_ok")
+                        _last_refresh_by_key[key] = now
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    def _get_existing_tp_id(px: Decimal, target_sz: Decimal) -> str | None:
+                        if not existing_tp_info:
+                            return None
+                        
+                        # Find TP near this price
+                        best_match_px = None
+                        if tick_size:
+                            tick_val = Decimal(str(tick_size))
+                            for p in existing_tp_info:
+                                if abs(px - p) <= tick_val:
+                                    best_match_px = p
+                                    break
+                        else:
+                            for p in existing_tp_info:
+                                if abs(px - p) <= Decimal("0.00000001"):
+                                    best_match_px = p
+                                    break
+                                    
+                        if best_match_px is not None:
+                            entries = existing_tp_info.get(best_match_px) or []
+                            size_tol = (lot_step or Decimal("0.000001"))
+                            # If any existing size matches, treat as already correct.
+                            for existing_sz, ord_id in entries:
+                                if abs(existing_sz - target_sz) <= size_tol:
+                                    return "ALREADY_CORRECT"
+                            # Otherwise, return one ID to be replaced (and we'll dedupe/cancel extras).
+                            for _sz, ord_id in entries:
+                                if ord_id:
+                                    return ord_id
+                        return None
+
+                    for target in tp_targets:
+                        try:
+                            px_dec = Decimal(str(target["price"]))
+                            sz_dec = Decimal(str(target["size"]))
+                        except Exception:
+                            continue
+                        
+                        existing_id = _get_existing_tp_id(px_dec, sz_dec)
+                        if existing_id == "ALREADY_CORRECT":
+                            continue
+                        
+                        if existing_id:
+                            # Size mismatch: cancel old one first
+                            try:
+                                logger.info("grvt_refresh_tp_resize instId=%s px=%s old_id=%s", inst_id, px_dec, existing_id)
+                                await exchange.cancel_order(inst_id=inst_id, ord_id=existing_id)
+                            except Exception:
+                                pass
+
+                        try:
+                            tp_resp = await exchange.place_algo_order(
+                                inst_id=inst_id,
+                                td_mode=SETTINGS.okx_td_mode,
+                                side=sl_side,
+                                pos_side=pos_side,
+                                ord_type="conditional",
+                                sz=target["size"],
+                                tp_trigger_px=target["price"],
+                                tp_ord_px="-1",
+                            )
+                        except Exception as e:
+                            tp_resp = {"code": "1", "msg": str(e)}
+                        if str(tp_resp.get("code", "")) not in {"0", "success"}:
+                            _log_decision(inst_id, "", action="grvt_refresh_tp_failed", tag=target.get("tag"), resp=tp_resp)
+                            # GRVT may enforce tight order placement limits; if we hit LIMIT,
+                            # stop trying further TP levels this tick and retry next refresh.
+                            if str(tp_resp.get("msg", "")).strip().upper() == "LIMIT":
+                                break
+                        else:
+                            _log_decision(inst_id, "", action="grvt_refresh_tp_set", tag=target.get("tag"), px=target.get("price"), sz=target.get("size"))
+
+                        # Small spacing to avoid bursting the GRVT create_order limit.
+                        await asyncio.sleep(0.15)
+
+                    # --- ORPHAN TP CLEANUP ---
+                    if not SETTINGS.grvt_refresh_tp_orphan_cleanup:
+                        _last_refresh_by_key[key] = now
+                        await asyncio.sleep(0.05)
+                        continue
+                    # 1. Collect all IDs that are considered "valid" (either ALREADY_CORRECT or just placed).
+                    # Actually, we can just iterate `existing_tp_info` again.
+                    # Any ID that was NOT returned by `_get_existing_tp_id` as "ALREADY_CORRECT"
+                    # and was NOT cancelled during the resize step is effectively an orphan?
+                    #
+                    # Better approach:
+                    # - Gather all IDs we WANT to keep (from `tp_targets` matching `existing_tp_info`).
+                    # - Any other ID in `existing_tp_info` is an orphan.
+                    
+                    wanted_tp_ids = set()
+                    for target in tp_targets:
+                        try:
+                            px_dec = Decimal(str(target["price"]))
+                            sz_dec = Decimal(str(target["size"]))
+                        except Exception:
+                            continue
+                        
+                        # Check exact match or close match logic again
+                        best_match_px = None
+                        if tick_size:
+                            tick_val = Decimal(str(tick_size))
+                            for p in existing_tp_info:
+                                if abs(px_dec - p) <= tick_val:
+                                    best_match_px = p
+                                    break
+                        else:
+                            for p in existing_tp_info:
+                                if abs(px_dec - p) <= Decimal("0.00000001"):
+                                    best_match_px = p
+                                    break
+                        
+                        if best_match_px is not None:
+                            existing_sz, ord_id = existing_tp_info[best_match_px]
+                            # If size is correct, we wanted to keep this ID.
+                            if abs(existing_sz - sz_dec) <= (lot_step or Decimal("0.000001")):
+                                wanted_tp_ids.add(ord_id)
+
+                    # Now scan all existing TPs. If ID not in wanted_tp_ids, KILL IT.
+                    # Note: The loop above (lines 2268+) might have already cancelled some to resize them.
+                    # We need to act carefully. Ideally, we do this cleaning *after* the placement loop?
+                    # Yes, but current logic iterates and places/resizes.
+                    #
+                    # A safer way:
+                    # The logic above handles "missing" and "resizing".
+                    # It DOES NOT handle "excess".
+                    # e.g. if we have 5 TPs but only want 4, the loop above touches the best 4. The 5th is left alone.
+                    #
+                    # So, we just need to identify the IDs that corresponded to `ALREADY_CORRECT` matches.
+                    # And anything else in `existing_tp_info` that wasn't cancelled in the loop is an orphan.
+                    
+                    # Let's perform a simple check:
+                    # For every order in `existing_tp_info`, does it match one of our `tp_targets`?
+                    # If not -> Cancel.
+
+                    valid_orphan_check_ids = set()
+                    for target in tp_targets:
+                        # Find best match in existing
+                        try:
+                            t_price = Decimal(str(target["price"]))
+                            t_size = Decimal(str(target["size"]))
+                        except:
+                            continue
+
+                        best_p = None
+                        if tick_size:
+                            tv = Decimal(str(tick_size))
+                            for p in existing_tp_info:
+                                if abs(t_price - p) <= tv:
+                                    best_p = p
+                                    break
+                        else:
+                            for p in existing_tp_info:
+                                if abs(t_price - p) <= Decimal("0.00000001"):
+                                    best_p = p
+                                    break
+                        
+                        if best_p is not None:
+                             e_sz, e_id = existing_tp_info[best_p]
+                             # If it matches size, it's valid.
+                             if abs(e_sz - t_size) <= (lot_step or Decimal("0.000001")):
+                                 valid_orphan_check_ids.add(e_id)
+
+                    # Cancel extras
+                    for price, (sz, oid) in existing_tp_info.items():
+                        if oid not in valid_orphan_check_ids:
+                            # Verify it wasn't valid by some other metric? 
+                            # If it's not in valid_ids, it means either:
+                            # 1. It was a size mismatch (handled in loop above? maybe).
+                            # 2. It is a price that doesn't exist in targets (PURE ORPHAN).
+                            
+                            # If it was a size mismatch, the loop above *might* have cancelled it if it matched a target price.
+                            # But if the price didn't match any target, the loop above ignored it.
+                            
+                            # So we can safely try to cancel it. If it's already cancelled, no harm.
+                            try:
+                                logger.info("grvt_refresh_tp_orphan_cleanup instId=%s px=%s id=%s", inst_id, price, oid)
+                                await exchange.cancel_order(inst_id=inst_id, ord_id=oid)
+                                await asyncio.sleep(0.2)
+                            except Exception:
+                                pass
+
+                _last_refresh_by_key[key] = now
+
+            # Small delay to avoid hammering open-orders + algo placement endpoints.
+            await asyncio.sleep(0.05)
+
+
+async def _refresh_grvt_protection_supervisor() -> None:
+    """Keep the GRVT refresh loop alive even if a bug/rate-limit edge case raises unexpectedly."""
+    if SETTINGS.exchange != "grvt":
+        return
+    while True:
+        try:
+            await _refresh_grvt_protection()
+            # If the underlying loop returns (shouldn't), stop supervising.
+            return
+        except Exception:
+            logger.exception("grvt refresh task crashed; restarting in 2s")
+            await asyncio.sleep(2)
+
 
 
 async def _lighter_emergency_close(
@@ -2151,6 +3570,9 @@ async def _startup() -> None:
         _refresh_task = asyncio.create_task(_refresh_lighter_protection())
         _refresh_task = asyncio.create_task(_dedupe_lighter_orders())
 
+    if SETTINGS.exchange == "grvt" and SETTINGS.grvt_refresh_enabled:
+        _refresh_task = asyncio.create_task(_refresh_grvt_protection_supervisor())
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
@@ -2257,11 +3679,22 @@ async def webhook_tradingview(req: Request) -> dict:
         logger.error("tv_webhook unexpected_error err=%s body_snippet=%s", e, snippet, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error") from e
 
-    payload = TvPayload.model_validate(data)
+    try:
+        payload = TvPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning("tv_webhook invalid_payload err=%s data=%s", str(e), data)
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "Invalid payload", "details": e.errors()},
+        ) from e
+
     global last_webhook_ts, last_webhook_count
     last_webhook_ts = time.time()
     last_webhook_count += 1
-    return await _process_payload(payload)
+    result = await _process_payload(payload, source="tradingview")
+    if isinstance(result, dict):
+        result.setdefault("signal_source", "tradingview")
+    return result
 
 
 @app.post("/manual/signal")
@@ -2272,7 +3705,6 @@ async def manual_signal(req: ManualSignalRequest) -> dict:
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
     # 构造 TvPayload
-    from datetime import datetime
     payload = TvPayload(
         secret=SETTINGS.tv_webhook_secret,
         type=req.type,
@@ -2285,7 +3717,31 @@ async def manual_signal(req: ManualSignalRequest) -> dict:
     )
 
     # 复用现有的信号处理逻辑
-    return await _process_payload(payload, allow_no_zone=True)
+    result = await _process_payload(payload, allow_no_zone=True, source="manual")
+    if isinstance(result, dict):
+        result.setdefault("signal_source", "manual")
+    return result
+
+
+def _parse_payload_time_utc(value: str) -> datetime | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
 
 
 @app.get("/")
@@ -2484,6 +3940,7 @@ async def web_ui():
                                             <option value="30m">30分钟</option>
                                             <option value="1h" selected>1小时</option>
                                             <option value="4h">4小时</option>
+                                            <option value="1d">1天</option>
                                         </select>
                                     </div>
                                     <div class="col-md-3 mb-3">
@@ -2703,7 +4160,8 @@ async def web_ui():
     return HTMLResponse(content=html_content, status_code=200)
 
 
-async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -> dict:
+async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False, source: str = "tradingview") -> dict:
+    received_at = datetime.now(timezone.utc)
     inst_id = _normalize_inst_id(payload.instId)
     if inst_id != payload.instId:
         _log_decision(payload.instId, payload.tf, action="symbol_mapped", mapped=inst_id)
@@ -2711,10 +4169,13 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         {
             "ts": _audit_utc_now_iso(),
             "event": "tv_webhook_validated",
+            "signal_source": source,
+            "received_at": received_at.isoformat().replace("+00:00", "Z"),
             "instId": inst_id,
             "tf": payload.tf,
             "type": payload.type,
             "t": payload.t,
+            "sent_at": payload.sent_at,
             "close": payload.close,
             "zone": payload.zone,
             "side": payload.side,
@@ -2730,11 +4191,72 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         _log_decision(inst_id, payload.tf, action="reject", reason="symbol_not_allowed")
         raise HTTPException(status_code=403, detail="Symbol not allowed")
 
+    # GRVT-specific: fail fast for unsupported markets.
+    # This avoids repeatedly attempting to place orders that will be rejected with
+    # "symbol not found" when the venue doesn't list the instrument.
+    if SETTINGS.exchange == "grvt":
+        grvt_symbol = None
+        try:
+            normalize_fn = getattr(exchange, "_normalize_symbol", None)
+            if callable(normalize_fn):
+                grvt_symbol = normalize_fn(inst_id)
+        except Exception:
+            grvt_symbol = None
+        try:
+            inst_info = await exchange.get_instrument_info(inst_id=inst_id)
+        except Exception:
+            inst_info = None
+        if inst_info is None:
+            _log_decision(
+                inst_id,
+                payload.tf,
+                action="skip",
+                reason="symbol_not_supported",
+                exchange="grvt",
+                grvt_symbol=grvt_symbol,
+            )
+            return {
+                "ok": True,
+                "skipped": "symbol_not_supported",
+                "exchange": "grvt",
+                "instId": inst_id,
+                "grvt_symbol": grvt_symbol,
+            }
+
     tf = payload.tf
     is_paper_tf = tf.lower() in SETTINGS.paper_trade_tfs
     key = _key(inst_id, tf)
 
-    _log_payload(payload)
+    _log_payload(payload, source=source)
+
+    # TradingView timeliness guard: avoid trading on stale alerts.
+    if source == "tradingview" and SETTINGS.tv_signal_max_age_seconds and SETTINGS.tv_signal_max_age_seconds > 0:
+        ts_raw = payload.sent_at
+        if not ts_raw:
+            # `t` is often bar-time (e.g., 30m candle start), so it can be minutes old even for fresh alerts.
+            # Without a proper send timestamp, we skip expiry to avoid false positives.
+            _log_decision(inst_id, payload.tf, action="skip_expiry_check", reason="missing_sent_at", signal_source=source)
+        else:
+            payload_ts = _parse_payload_time_utc(ts_raw)
+            if payload_ts is not None:
+                age_s = (received_at - payload_ts).total_seconds()
+                if age_s > float(SETTINGS.tv_signal_max_age_seconds):
+                    _log_decision(
+                        inst_id,
+                        payload.tf,
+                        action="skip",
+                        reason="signal_expired",
+                        age_seconds=round(age_s, 3),
+                        max_age_seconds=SETTINGS.tv_signal_max_age_seconds,
+                        signal_source=source,
+                    )
+                    return {
+                        "ok": True,
+                        "skipped": "signal_expired",
+                        "age_seconds": round(age_s, 3),
+                        "max_age_seconds": SETTINGS.tv_signal_max_age_seconds,
+                        "signal_source": source,
+                    }
 
     close_f: float | None = None
     if payload.close is not None and payload.close != "":
@@ -2815,10 +4337,11 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
         _log_decision(inst_id, tf, action="skip", reason="missing_side")
         raise HTTPException(status_code=400, detail="DIV signal must specify 'side' field (buy or sell)")
 
-    # Check cooldown (skip for paper-collection TFs)
-    if (not is_paper_tf) and (not state.can_trade(key, SETTINGS.cooldown_seconds)):
-        _log_decision(inst_id, tf, action="skip", reason="cooldown")
-        return {"ok": True, "skipped": "cooldown"}
+    # Check cooldown (skip for paper-collection TFs).
+    # Only apply cooldown to TradingView webhooks; UI/manual signals are operator-driven and should not be blocked.
+    if source == "tradingview" and (not is_paper_tf) and (not state.can_trade(key, SETTINGS.cooldown_seconds)):
+        _log_decision(inst_id, tf, action="skip", reason="cooldown", signal_source=source)
+        return {"ok": True, "skipped": "cooldown", "signal_source": source}
 
     side = payload_side
     pos_side = "long" if side == "buy" else "short"
@@ -3617,7 +5140,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
     inst_info = await exchange.get_instrument_info(inst_id=inst_id)
     tick_size = inst_info.get("tickSz") if inst_info else None
 
-    if SETTINGS.entry_two_limit_enabled:
+    # Entry-two-limit (single 0.5R limit entry).
+    # For GRVT it's gated behind GRVT_ALLOW_ENTRY_TWO_LIMIT to avoid surprises.
+    if SETTINGS.entry_two_limit_enabled and (SETTINGS.exchange != "grvt" or SETTINGS.grvt_allow_entry_two_limit):
         ref_price = await _get_ref_price_from_bar(inst_id, bar=SETTINGS.entry_two_limit_ref_bar) or float(entry_price)
         if ref_price <= 0:
             _log_decision(inst_id, tf, action="two_limit_skip", reason="no_ref_price")
@@ -3632,93 +5157,91 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             _log_decision(inst_id, tf, action="two_limit_skip", reason="invalid_sl_distance", ref=ref_price, sl=sl)
             return {"ok": True, "skipped": "invalid_sl_distance"}
 
-        l1_r = float(SETTINGS.entry_two_limit_l1_r)
-        l2_r = float(SETTINGS.entry_two_limit_l2_r)
-        if not (0 < l1_r < l2_r < 1.0):
-            _log_decision(inst_id, tf, action="two_limit_skip", reason="bad_r_config", l1_r=l1_r, l2_r=l2_r)
-            return {"ok": True, "skipped": "bad_r_config"}
+        # Single limit entry derived from stop-loss distance.
+        # Preferred: pct measured from ref_price towards SL (bigger => closer to SL).
+        # Backward compat: if ENTRY_TWO_LIMIT_FROM_SL_PCT is set (>0), interpret it as pct from SL towards ref.
+        towards_sl_pct = float(get_entry_two_limit_towards_sl_pct(tf))
+        from_sl_pct = float(get_entry_two_limit_from_sl_pct(tf))
+        if from_sl_pct > 0 and towards_sl_pct == 0.5 and not SETTINGS.entry_two_limit_towards_sl_pct_by_tf:
+            # Likely old config is in use; convert to towards_sl_pct = 1 - from_sl_pct
+            towards_sl_pct = max(0.0, min(1.0, 1.0 - from_sl_pct))
 
         if side == "buy":
-            px1 = ref_price - l1_r * d
-            px2 = ref_price - l2_r * d
+            # Long: SL below ref. Move down from ref towards SL.
+            px_target = float(ref_price) - (towards_sl_pct * (float(ref_price) - float(sl)))
         else:
-            px1 = ref_price + l1_r * d
-            px2 = ref_price + l2_r * d
+            # Short: SL above ref. Move up from ref towards SL.
+            px_target = float(ref_price) + (towards_sl_pct * (float(sl) - float(ref_price)))
 
-        px1_rounded = _round_price_to_tick(px1, tick_size)
-        px2_rounded = _round_price_to_tick(px2, tick_size)
-
-        total_sz = Decimal(str(order_sz))
-        inst_info = await exchange.get_instrument_info(inst_id=inst_id)
-        lot_step = Decimal(str(inst_info.get("lotStep"))) if inst_info and inst_info.get("lotStep") else None
-        min_order_sz = Decimal(str(inst_info.get("lotSz"))) if inst_info and inst_info.get("lotSz") else None
-
-        l1_pct = float(SETTINGS.entry_two_limit_l1_pct)
-        l2_pct = float(SETTINGS.entry_two_limit_l2_pct)
-        if l1_pct <= 0 or l2_pct <= 0 or abs((l1_pct + l2_pct) - 1.0) > 0.01:
-            _log_decision(inst_id, tf, action="two_limit_skip", reason="bad_pct_config", l1_pct=l1_pct, l2_pct=l2_pct)
-            return {"ok": True, "skipped": "bad_pct_config"}
-
-        level1_sz_raw = total_sz * Decimal(str(l1_pct))
-        level2_sz_raw = total_sz * Decimal(str(l2_pct))
-        level1_sz = _normalize_qty(level1_sz_raw, step=lot_step, min_sz=min_order_sz) if level1_sz_raw > 0 else Decimal("0")
-        level2_sz = _normalize_qty(level2_sz_raw, step=lot_step, min_sz=min_order_sz) if level2_sz_raw > 0 else Decimal("0")
-
-        if level1_sz <= 0 and level2_sz <= 0:
-            _log_decision(inst_id, tf, action="two_limit_skip", reason="zero_size")
-            return {"ok": True, "skipped": "zero_size"}
-
-        # Use numeric suffix (1/2) instead of letters (E1/E2) for GRVT compatibility
-        cl1 = f"tv{ts}{rnd}{side[:1]}1"[:32]
-        cl2 = f"tv{ts}{rnd}{side[:1]}2"[:32]
-
+        px_rounded = _round_price_to_tick(px_target, tick_size)
+        
+        # Place single limit order
+        pct_tag = int(round(towards_sl_pct * 100))
+        cl_ord_id = f"tv{ts}{rnd}{side[:1]}L{pct_tag:02d}P"[:32]
+        
         placed_orders: list[dict[str, object]] = []
-        for label, sz_dec, px_dec, cl in (
-            ("E1", level1_sz, px1_rounded, cl1),
-            ("E2", level2_sz, px2_rounded, cl2),
-        ):
-            if sz_dec <= 0:
-                continue
-            resp = await exchange.place_order(
-                inst_id=inst_id,
-                td_mode=SETTINGS.okx_td_mode,
-                side=side,
-                pos_side=pos_side,
-                ord_type="limit",
-                sz=_format_decimal(sz_dec),
-                px=px_dec,
-                cl_ord_id=cl,
-                sl_trigger_px=None,
-                tp_trigger_px=None,
-                reduce_only=False,
-            )
-            if str(resp.get("code", "")) not in {"0", "success"}:
-                _log_decision(inst_id, tf, action="two_limit_rejected", level=label, resp=resp)
-            else:
-                placed_orders.append({"level": label, "cl_ord_id": cl, "sz": float(sz_dec), "px": float(px_dec)})
-                fill_tracker.register_order_label(key=cl, label=f"entry_{label.lower()}")
-                symbol_for_state = inst_id.replace("-USDT-SWAP", "/USDT")
-                state.add_pending_order(key=key, order_id=cl, symbol=symbol_for_state, level=label)
 
-        if not placed_orders:
-            _log_decision(inst_id, tf, action="two_limit_skip", reason="no_orders_placed")
-            return {"ok": False, "error": "no_orders_placed"}
+        # Ensure proper decimal formatting
+        sz_str = str(order_sz)
 
-        state.mark_traded(key)
-        state.clear_zone(key)
-        _log_decision(
-            inst_id,
-            tf,
-            action="two_limit_orders_placed",
+        resp = await exchange.place_order(
+            inst_id=inst_id,
+            td_mode=SETTINGS.okx_td_mode,
             side=side,
-            posSide=pos_side,
-            ref=ref_price,
-            sl=sl,
-            e1_px=px1_rounded,
-            e2_px=px2_rounded,
-            e1_sz=_format_decimal(level1_sz),
-            e2_sz=_format_decimal(level2_sz),
+            pos_side=pos_side,
+            ord_type="limit",
+            sz=sz_str,
+            px=px_rounded,
+            cl_ord_id=cl_ord_id,
+            sl_trigger_px=None,
+            tp_trigger_px=None,
+            reduce_only=False,
         )
+
+        placed_orders.append(
+            {
+                "cl_ord_id": cl_ord_id,
+                "type": "limit",
+                "px": px_rounded,
+                "sz": sz_str,
+                "resp": resp,
+            }
+        )
+
+        if str(resp.get("code", "")) not in {"0", "success"}:
+            _log_decision(inst_id, tf, action="limit_0.5r_rejected", px=px_rounded, resp=resp)
+            return {
+                "ok": False,
+                "type": "DIV",
+                "side": side,
+                "posSide": pos_side,
+                "ref": ref_price,
+                "entry": float(px_rounded),
+                "sl": sl,
+                "order_sz": order_sz,
+                "orders": placed_orders,
+                "error": "limit_order_rejected",
+                "detail": resp,
+            }
+        else:
+            # Register order
+            fill_tracker.register_order_label(key=cl_ord_id, label="entry_limit_0.5r")
+            symbol_for_state = inst_id.replace("-USDT-SWAP", "/USDT")
+            state.add_pending_order(key=key, order_id=cl_ord_id, symbol=symbol_for_state, level="L0.5R")
+            
+            state.mark_traded(key)
+            state.clear_zone(key)
+            _log_decision(
+                inst_id,
+                tf,
+                action="limit_0.5r_placed",
+                side=side,
+                posSide=pos_side,
+                ref=ref_price,
+                sl=sl,
+                px=px_rounded,
+                sz=sz_str
+            )
 
         timeout_candles = float(get_entry_two_limit_timeout_candles(tf))
         timeout_seconds = tf_to_seconds(tf) * timeout_candles if timeout_candles > 0 else 24 * 3600
@@ -3744,7 +5267,9 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
             "side": side,
             "posSide": pos_side,
             "ref": ref_price,
+            "entry": float(px_rounded),
             "sl": sl,
+            "order_sz": order_sz,
             "orders": placed_orders,
             "note": "two_limit_orders_pending",
         }
@@ -4343,13 +5868,32 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
                 details.get("min_quote", 0),
             )
 
-            # If already adjusted, increase by 10% buffer
+            # If already adjusted OR if we have valid min_quote from details
+            min_quote_val = Decimal(str(details.get("min_quote", 0)))
+            retry_sz = None
+            
             if sl_adjusted:
+                # Simple buffer increase if we already knew about min_quote
                 retry_sz = normalized_sl_sz * Decimal("1.1")
+            elif min_quote_val > 0:
+                # If we didn't know before (missing metadata) but know now from error
+                price_for_calc = Decimal(str(sl)) if sl > 0 else Decimal(str(filled_price))
+                if price_for_calc > 0:
+                    # Calculate required size: min_quote / price
+                    raw_retry_sz = (min_quote_val / price_for_calc)
+                    # Add 5% buffer to be safe
+                    retry_sz = raw_retry_sz * Decimal("1.05")
+                    
+                    logger.info(
+                        "tv_webhook sl_retry_calc_from_error min_quote=%s price=%s raw_sz=%s buffer_sz=%s",
+                        min_quote_val, price_for_calc, raw_retry_sz, retry_sz
+                    )
+
+            if retry_sz is not None:
                 retry_sz = _normalize_qty(retry_sz, step=lot_step, min_sz=min_order)
                 retry_sz_str = _format_decimal(retry_sz)
 
-                logger.info("tv_webhook sl_retry with_increased_size=%s", retry_sz_str)
+                logger.info("tv_webhook sl_retry with_new_size=%s", retry_sz_str)
                 sl_resp = await exchange.place_algo_order(
                     inst_id=inst_id,
                     td_mode=SETTINGS.okx_td_mode,
@@ -4384,7 +5928,7 @@ async def _process_payload(payload: TvPayload, *, allow_no_zone: bool = False) -
 
     # Try backup stop-loss strategy if enabled
     backup_sl_attempted = False
-    if not sl_order_success and SETTINGS.backup_sl_enabled:
+    if not sl_order_success and SETTINGS.backup_sl_enabled and SETTINGS.exchange != "grvt":
         backup_sl_attempted = True
         logger.info("tv_webhook trying_backup_sl instId=%s method=limit_order", inst_id)
         try:

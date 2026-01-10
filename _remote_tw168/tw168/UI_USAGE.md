@@ -8,15 +8,42 @@ TW168 现在配备了一个现代化的Web用户界面（UI），提供了一个
 
 ### 远程下单模式（本地UI → 远程交易服务）
 
-如果你的 UI 跑在本地（端口 9000），但希望把信号转发到远程服务器（端口 8000）由远程程序按既定逻辑开单，在本地 `.env` 增加：
+如果你的 UI 跑在本地（端口 9000），但希望把信号转发到远程服务器由远程程序按既定逻辑开单，推荐走 Nginx 的 **443**（更稳定，也不需要开放 8000），在本地 `.env` 增加：
 
 ```bash
-TRADING_SERVICE_BASE_URL=http://<remote-ip>:8000
+TRADING_SERVICE_BASE_URL=https://<your-domain>
 ```
 
 此时：
 - UI 的 `/signals/send` 和 `/signals/send/form` 会转发到远程的 `/manual/signal`
 - 管理员密钥仍使用 `TV_WEBHOOK_SECRET`（由远程服务校验；本地也会在配置了真实密钥时做一次校验）
+
+### 信号来源区分（推荐）
+
+系统会在审计日志（`SIGNAL_AUDIT_DIR` 下的 `tv_signals_YYYYMMDD.jsonl`）里记录 `signal_source` 字段：
+- `signal_source=tradingview`：来自 `/webhook/tradingview`（TradingView）
+- `signal_source=manual`：来自 `/manual/signal`（本地 UI/脚本转发）
+- `signal_source=ui`：UI 直接在本机处理（未配置远程转发时）
+
+### TradingView 信号过期（推荐）
+
+如果担心“延迟很久的 TradingView 信号”误触发下单，可在远程 `.env` 配置：
+
+```bash
+TV_SIGNAL_MAX_AGE_SECONDS=300
+```
+
+当 webhook 的 payload 里 `t` 时间戳距离当前时间超过该阈值时，会跳过执行（仅记录，不下单）。
+
+如果你仍想直连 `:8000`，需要满足：
+- 远程服务监听 `0.0.0.0:8000`
+- Lightsail 防火墙/安全组放行 8000
+
+如果远程 8000 仅监听 `127.0.0.1`（推荐的安全做法），可以改用 SSH 隧道，然后本地 UI 指向隧道端口：
+
+```bash
+TRADING_SERVICE_BASE_URL=http://127.0.0.1:<local-tunnel-port>
+```
 
 ### 方式1：本地启动（开发环境）
 
@@ -53,7 +80,7 @@ pm2 start "/.venv/bin/python ui_server.py" --name tw168-ui --cwd /path/to/tw168
 
 ## 网页界面
 
-访问 `http://localhost:9000` 或 `http://<remote-ip>:9000` 来打开UI
+访问 `http://localhost:9000` 来打开UI（UI 推荐只在本机运行，不建议部署到远程服务器）
 
 ### 界面功能
 
@@ -296,11 +323,11 @@ if __name__ == "__main__":
 ### Q: 如何在远程服务器上访问UI
 **A:** 
 1. 在服务器上启动UI服务器
-2. 使用服务器IP: `http://<server-ip>:9000`
+2. （不推荐）将 UI 部署到远程服务器：请自行做好访问控制与风控隔离
 3. 配置防火墙允许9000端口
 4. 使用反向代理（Nginx）配置HTTPS
 
-## 使用Nginx反向代理（推荐用于生产）
+## 使用Nginx反向代理（不推荐：仅在你确实要把 UI 部署到远程服务器时使用）
 
 创建 `/etc/nginx/sites-available/tw168-ui` 文件：
 

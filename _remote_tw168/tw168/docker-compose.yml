@@ -2,10 +2,12 @@ services:
   tv-okx:
     build: .
     ports:
-      - "127.0.0.1:8000:8000"  # 只监听本地，不暴露到公网
+      # Bind locally only; access remotely via Nginx/443 reverse proxy.
+      - "127.0.0.1:8000:8000"
     volumes:
       - ${PERPBOT_SRC_PATH:-../../src}:/src:ro
       - ./logs:/app/logs
+      - ./app:/app/app
     env_file:
       - .env
     environment:

@@ -4,6 +4,7 @@
 .venv/
 logs/
 tw168.log
+.ui_server.pid
 __pycache__/
 *.pyc
 *.pyo

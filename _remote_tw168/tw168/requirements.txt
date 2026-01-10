@@ -8,3 +8,5 @@ websockets
 httpx
 ccxt
 grvt-pysdk
+jinja2
+python-multipart

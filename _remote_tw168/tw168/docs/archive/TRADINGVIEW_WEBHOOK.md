@@ -1,5 +1,7 @@
 # TradingView Webhook 配置指南
 
+> ⚠️ 说明：此文档归档自早期方案，`http://3.38.98.169:8000` 属于旧的直连方式；当前推荐通过 Nginx **443** 访问（示例域名：`https://trader:***@3-38-98-169.nip.io`）。
+
 ## 🔴 当前问题
 
 您的TradingView警报发送的webhook格式不正确，缺少必填字段 `type` 和 `instId`，导致服务器返回500错误。
@@ -9,7 +11,7 @@
 ### Webhook URL
 
 ```
-http://3.38.98.169:8000/webhook/tradingview
+https://trader:TW168Trading!2026@3-38-98-169.nip.io/webhook/tradingview
 ```
 
 ### Webhook消息格式
@@ -79,7 +81,7 @@ TradingView警报的"消息"部分必须使用以下JSON格式：
 - **条件**: 选择您的指标或策略条件
 - **选项**:
   - ☑️ Webhook URL
-  - 输入：`http://3.38.98.169:8000/webhook/tradingview`
+  - 输入：`https://trader:TW168Trading!2026@3-38-98-169.nip.io/webhook/tradingview`
 
 ### 3. 配置消息
 
@@ -131,7 +133,8 @@ TradingView警报的"消息"部分必须使用以下JSON格式：
 ### 方法1：使用curl测试
 
 ```bash
-curl -X POST http://3.38.98.169:8000/webhook/tradingview \
+curl -X POST https://3-38-98-169.nip.io/webhook/tradingview \
+  -u "trader:TW168Trading!2026" \
   -H "Content-Type: application/json" \
   -d '{
     "secret": "rtrwrwtrtsgssdfgsfgfhdghdfgsgdsgsfhgsfhgggdhsfgfdghgdgfhgfgsgdsfeaff6",
@@ -151,7 +154,8 @@ curl -X POST http://3.38.98.169:8000/webhook/tradingview \
 ### 方法2：发送DIV测试
 
 ```bash
-curl -X POST http://3.38.98.169:8000/webhook/tradingview \
+curl -X POST https://3-38-98-169.nip.io/webhook/tradingview \
+  -u "trader:TW168Trading!2026" \
   -H "Content-Type: application/json" \
   -d '{
     "secret": "rtrwrwtrtsgssdfgsfgfhdghdfgsgdsgsfhgsfgggdhsfgfdghgdgfhgfgsgdsfeaff6",

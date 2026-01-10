@@ -3,6 +3,11 @@
 
 cd "$(dirname "$0")"
 
+# Prefer the more robust launcher (handles venv + .env defaults)
+if [ -f "./start_ui_server.sh" ]; then
+    exec ./start_ui_server.sh
+fi
+
 # Check if UI is already running
 if ss -tuln | grep -q ":9000"; then
     echo "✅ UI server is already running on http://localhost:9000"
@@ -10,7 +15,15 @@ if ss -tuln | grep -q ":9000"; then
 fi
 
 # Activate virtual environment and start UI
-source .venv/bin/activate
+if [ -d ".venv" ]; then
+    source .venv/bin/activate
+elif [ -d "venv" ]; then
+    source venv/bin/activate
+else
+    echo "❌ 虚拟环境不存在: .venv 或 venv"
+    exit 1
+fi
+
 nohup python ui_server.py > ui_server.log 2>&1 &
 
 # Wait for server to start

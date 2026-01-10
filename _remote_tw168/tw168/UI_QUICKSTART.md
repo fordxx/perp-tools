@@ -36,10 +36,9 @@ tail -f ui.log
 
 启动后，在浏览器中打开：
 
-- **本地**: `http://localhost:9000`
-- **远程**: `http://<server-ip>:9000`
+- **本地**: `http://localhost:9000`（推荐）
 
-如果需要把本地 UI 的信号转发到远程服务器开单，请在本地 `.env` 设置 `TRADING_SERVICE_BASE_URL=http://<remote-ip>:8000`（详见 `UI_USAGE.md`）。
+如果需要把本地 UI 的信号转发到远程服务器开单，优先走 Nginx 的 **443**（更稳定，避免开放 8000），请在本地 `.env` 设置 `TRADING_SERVICE_BASE_URL=https://<your-domain>`（详见 `UI_USAGE.md`）。
 
 ## 🎯 使用流程
 
