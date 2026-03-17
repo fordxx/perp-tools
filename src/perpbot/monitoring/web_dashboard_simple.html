@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PERP Trading System</title>
+
+  <!-- Element Plus -->
+  <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+  <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+  <script src="https://unpkg.com/element-plus"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0e1a;
+      color: #e8eaf0;
+      font-size: 14px;
+    }
+
+    #app {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    /* 顶部栏 */
+    .header {
+      background: linear-gradient(135deg, #1a1f35 0%, #0d1221 100%);
+      border: 1px solid #2a3f5f;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .header h1 {
+      font-size: 24px;
+      color: #ffffff;
+      margin: 0;
+    }
+
+    .ws-status {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px 16px;
+      background: rgba(42, 63, 95, 0.3);
+      border-radius: 6px;
+      font-size: 12px;
+      max-width: 250px;
+    }
+
+    .ws-status-title {
+      font-weight: 600;
+      color: #ffffff;
+      margin-bottom: 4px;
+    }
+
+    .exchange-status {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .ws-status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .ws-status-dot.connected {
+      background: #00d9a5;
+      animation: pulse 2s infinite;
+    }
+
+    .ws-status-dot.disconnected {
+      background: #ff4757;
+    }
+
+    .ws-status-dot.connecting {
+      background: #ffa502;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+    }
+
+    .stat-box {
+      background: rgba(42, 63, 95, 0.3);
+      border: 1px solid #2a3f5f;
+      border-radius: 6px;
+      padding: 12px;
+    }
+
+    .stat-label {
+      font-size: 12px;
+      color: #8a9ab5;
+      margin-bottom: 6px;
+    }
+
+    .stat-value {
+      font-size: 20px;
+      color: #ffffff;
+      font-weight: 600;
+    }
+
+    .stat-value.positive { color: #00d9a5; }
+    .stat-value.negative { color: #ff4757; }
+
+    /* 标签页导航 */
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #2a3f5f;
+      padding-bottom: 0;
+    }
+
+    .tab {
+      padding: 12px 24px;
+      background: transparent;
+      border: none;
+      color: #8a9ab5;
+      cursor: pointer;
+      font-size: 15px;
+      font-weight: 500;
+      border-bottom: 3px solid transparent;
+      transition: all 0.3s;
+    }
+
+    .tab:hover {
+      color: #ffffff;
+      background: rgba(42, 63, 95, 0.3);
+    }
+
+    .tab.active {
+      color: #ffffff;
+      border-bottom-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.1);
+    }
+
+    /* 策略卡片 */
+    .strategy-section {
+      margin-bottom: 30px;
+    }
+
+    .section-title {
+      font-size: 18px;
+      color: #ffffff;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 2px solid #3b82f6;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .strategy-card {
+      background: linear-gradient(135deg, #1a1f35 0%, #0d1221 100%);
+      border: 1px solid #2a3f5f;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 16px;
+      transition: border-color 0.3s;
+    }
+
+    .strategy-card:hover {
+      border-color: #3b82f6;
+    }
+
+    .strategy-card.running {
+      border-left: 4px solid #00d9a5;
+    }
+
+    .strategy-card.stopped {
+      border-left: 4px solid #6b7280;
+    }
+
+    .strategy-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .strategy-title {
+      font-size: 16px;
+      color: #ffffff;
+      font-weight: 600;
+    }
+
+    .status-badge {
+      padding: 4px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .status-badge.running {
+      background: rgba(0, 217, 165, 0.2);
+      color: #00d9a5;
+    }
+
+    .status-badge.stopped {
+      background: rgba(107, 114, 128, 0.2);
+      color: #9ca3af;
+    }
+
+    .strategy-params {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .param {
+      background: rgba(42, 63, 95, 0.3);
+      border-radius: 4px;
+      padding: 8px 12px;
+    }
+
+    .param-label {
+      font-size: 11px;
+      color: #8a9ab5;
+      margin-bottom: 4px;
+    }
+
+    .param-value {
+      font-size: 14px;
+      color: #ffffff;
+      font-weight: 500;
+    }
+
+    .strategy-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .btn {
+      padding: 8px 16px;
+      border: 1px solid #2a3f5f;
+      background: rgba(42, 63, 95, 0.3);
+      color: #ffffff;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: all 0.3s;
+    }
+
+    .btn:hover {
+      background: rgba(59, 130, 246, 0.2);
+      border-color: #3b82f6;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
+      border: none;
+      color: #ffffff;
+    }
+
+    .btn-primary:hover {
+      background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+    }
+
+    .btn-danger {
+      background: rgba(255, 71, 87, 0.2);
+      border-color: #ff4757;
+      color: #ff4757;
+    }
+
+    .btn-danger:hover {
+      background: rgba(255, 71, 87, 0.3);
+    }
+
+    /* 配置表单 */
+    .config-form {
+      background: #1a1f35;
+      border-radius: 8px;
+      padding: 24px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 14px;
+      color: #ffffff;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+
+    .form-input {
+      width: 100%;
+      padding: 10px 12px;
+      background: rgba(42, 63, 95, 0.3);
+      border: 1px solid #2a3f5f;
+      border-radius: 6px;
+      color: #ffffff;
+      font-size: 14px;
+    }
+
+    .form-input:focus {
+      outline: none;
+      border-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.1);
+    }
+
+    .checkbox-group {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+
+    .checkbox-item {
+      background: rgba(42, 63, 95, 0.3);
+      border: 1px solid #2a3f5f;
+      border-radius: 6px;
+      padding: 12px;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    .checkbox-item:hover {
+      border-color: #3b82f6;
+      background: rgba(59, 130, 246, 0.1);
+    }
+
+    .checkbox-item.checked {
+      border-color: #00d9a5;
+      background: rgba(0, 217, 165, 0.1);
+    }
+
+    .checkbox-item.disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .checkbox-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #ffffff;
+      font-size: 14px;
+    }
+
+    .checkbox-status {
+      font-size: 12px;
+      color: #8a9ab5;
+      margin-top: 4px;
+    }
+
+    .checkbox-status.available {
+      color: #00d9a5;
+    }
+
+    .checkbox-status.unavailable {
+      color: #ff4757;
+    }
+
+    /* Dialog覆盖样式 */
+    .el-dialog {
+      background: #0d1221 !important;
+      border: 1px solid #3b82f6 !important;
+    }
+
+    .el-dialog__header {
+      background: #1a1f35 !important;
+      border-bottom: 2px solid #3b82f6 !important;
+    }
+
+    .el-dialog__title {
+      color: #ffffff !important;
+      font-size: 18px !important;
+      font-weight: 600 !important;
+    }
+
+    .el-dialog__body {
+      background: #0d1221 !important;
+      color: #e8eaf0 !important;
+    }
+
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- 顶部统计 -->
+    <div class="header">
+      <div class="header-top">
+        <h1>PERP Trading System - 永续合约交易系统</h1>
+        <div class="ws-status">
+          <div class="ws-status-title">🔌 交易所连接状态</div>
+          <div class="exchange-status" v-for="exchange in exchangeStatuses" :key="exchange.id">
+            <div class="ws-status-dot" :class="exchange.status"></div>
+            <span>{{ exchange.name }}</span>
+          </div>
+        </div>
+      </div>
+      <div class="stats">
+        <div class="stat-box">
+          <div class="stat-label">总盈亏</div>
+          <div class="stat-value positive">+${{ stats.totalPnl.toFixed(2) }}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">24h成交量</div>
+          <div class="stat-value">${{ formatNumber(stats.volume24h) }}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">活跃策略</div>
+          <div class="stat-value">{{ activeStrategiesCount }}/{{ totalStrategiesCount }}</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">成功率</div>
+          <div class="stat-value">{{ stats.successRate }}%</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 标签页导航 -->
+    <div class="tabs">
+      <button
+        class="tab"
+        :class="{ active: currentTab === 'market-making' }"
+        @click="currentTab = 'market-making'"
+      >
+        📈 做市策略
+      </button>
+      <button
+        class="tab"
+        :class="{ active: currentTab === 'hedging' }"
+        @click="currentTab = 'hedging'"
+      >
+        💰 对冲策略
+      </button>
+      <button
+        class="tab"
+        :class="{ active: currentTab === 'arbitrage' }"
+        @click="currentTab = 'arbitrage'"
+      >
+        ⚡ 套利策略
+      </button>
+      <button
+        class="tab"
+        :class="{ active: currentTab === 'monitoring' }"
+        @click="currentTab = 'monitoring'"
+      >
+        📊 实时监控
+      </button>
+    </div>
+
+    <!-- 做市策略页面 -->
+    <div v-show="currentTab === 'market-making'">
+      <!-- Simple MM 策略组 -->
+      <div class="strategy-section">
+        <div class="section-title">
+          <span>Simple MM - 简单做市</span>
+          <button class="btn btn-primary" @click="openConfigDialog('simple_mm')">+ 新建</button>
+        </div>
+
+        <div v-if="simpleMMStrategies.length === 0" style="text-align: center; padding: 40px; color: #8a9ab5;">
+          暂无策略，点击右上角"+ 新建"创建
+        </div>
+
+        <div v-for="strategy in simpleMMStrategies" :key="strategy.id"
+             class="strategy-card"
+             :class="strategy.status">
+          <div class="strategy-header">
+            <div class="strategy-title">{{ strategy.symbol }} @ {{ strategy.exchange.toUpperCase() }}</div>
+            <span class="status-badge" :class="strategy.status">
+              {{ strategy.status === 'running' ? '● 运行中' : '○ 已停止' }}
+            </span>
+          </div>
+
+          <div class="strategy-params">
+            <div class="param">
+              <div class="param-label">点差</div>
+              <div class="param-value">{{ strategy.spread_bps }} bps</div>
+            </div>
+            <div class="param">
+              <div class="param-label">订单大小</div>
+              <div class="param-value">{{ strategy.size }}</div>
+            </div>
+            <div class="param">
+              <div class="param-label">最大库存</div>
+              <div class="param-value">{{ strategy.max_inventory }}</div>
+            </div>
+            <div class="param">
+              <div class="param-label">24h PnL</div>
+              <div class="param-value" :style="{ color: strategy.pnl24h >= 0 ? '#00d9a5' : '#ff4757' }">
+                {{ strategy.pnl24h >= 0 ? '+' : '' }}${{ strategy.pnl24h.toFixed(2) }}
+              </div>
+            </div>
+          </div>
+
+          <div class="strategy-actions">
+            <button class="btn" @click="toggleStrategy(strategy)">
+              {{ strategy.status === 'running' ? '暂停' : '启动' }}
+            </button>
+            <button class="btn" @click="editStrategy(strategy)">修改参数</button>
+            <button class="btn" @click="viewChart(strategy)">查看图表</button>
+            <button class="btn btn-danger" @click="deleteStrategy(strategy)">删除</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Grid MM 策略组 -->
+      <div class="strategy-section">
+        <div class="section-title">
+          <span>Grid MM - 网格做市</span>
+          <button class="btn btn-primary" @click="openConfigDialog('grid_mm')">+ 新建</button>
+        </div>
+
+        <div v-if="gridMMStrategies.length === 0" style="text-align: center; padding: 40px; color: #8a9ab5;">
+          暂无策略，点击右上角"+ 新建"创建
+        </div>
+
+        <div v-for="strategy in gridMMStrategies" :key="strategy.id"
+             class="strategy-card"
+             :class="strategy.status">
+          <div class="strategy-header">
+            <div class="strategy-title">{{ strategy.symbol }} @ {{ strategy.exchange.toUpperCase() }}</div>
+            <span class="status-badge" :class="strategy.status">
+              {{ strategy.status === 'running' ? '● 运行中' : '○ 已停止' }}
+            </span>
+          </div>
+
+          <div class="strategy-params">
+            <div class="param">
+              <div class="param-label">网格层数</div>
+              <div class="param-value">{{ strategy.grid_levels }}层</div>
+            </div>
+            <div class="param">
+              <div class="param-label">网格间距</div>
+              <div class="param-value">{{ strategy.grid_spacing_bps }} bps</div>
+            </div>
+            <div class="param">
+              <div class="param-label">每层大小</div>
+              <div class="param-value">{{ strategy.size_per_level }}</div>
+            </div>
+            <div class="param">
+              <div class="param-label">24h PnL</div>
+              <div class="param-value" :style="{ color: strategy.pnl24h >= 0 ? '#00d9a5' : '#ff4757' }">
+                {{ strategy.pnl24h >= 0 ? '+' : '' }}${{ strategy.pnl24h.toFixed(2) }}
+              </div>
+            </div>
+          </div>
+
+          <div class="strategy-actions">
+            <button class="btn" @click="toggleStrategy(strategy)">
+              {{ strategy.status === 'running' ? '暂停' : '启动' }}
+            </button>
+            <button class="btn" @click="editStrategy(strategy)">修改参数</button>
+            <button class="btn" @click="viewGrid(strategy)">查看网格</button>
+            <button class="btn btn-danger" @click="deleteStrategy(strategy)">删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 对冲策略页面 -->
+    <div v-show="currentTab === 'hedging'">
+      <div class="strategy-section">
+        <div class="section-title">
+          <span>Volume Hedge - 成交量对冲</span>
+          <button class="btn btn-primary" @click="openConfigDialog('volume_hedge')">+ 新建</button>
+        </div>
+
+        <div v-if="volumeHedgeStrategies.length === 0" style="text-align: center; padding: 40px; color: #8a9ab5;">
+          暂无策略，点击右上角"+ 新建"创建
+        </div>
+
+        <div v-for="strategy in volumeHedgeStrategies" :key="strategy.id"
+             class="strategy-card"
+             :class="strategy.status">
+          <div class="strategy-header">
+            <div class="strategy-title">
+              {{ strategy.symbol }} | {{ strategy.primary_exchange.toUpperCase() }} → {{ strategy.hedge_exchanges.map(e => e.toUpperCase()).join(', ') }}
+            </div>
+            <span class="status-badge" :class="strategy.status">
+              {{ strategy.status === 'running' ? '● 运行中' : '○ 已停止' }}
+            </span>
+          </div>
+
+          <div class="strategy-params">
+            <div class="param">
+              <div class="param-label">主交易所</div>
+              <div class="param-value">{{ strategy.primary_exchange.toUpperCase() }}</div>
+            </div>
+            <div class="param">
+              <div class="param-label">对冲交易所</div>
+              <div class="param-value">{{ strategy.hedge_exchanges.length }}个</div>
+            </div>
+            <div class="param">
+              <div class="param-label">目标成交量</div>
+              <div class="param-value">${{ (strategy.target_volume_usd / 1000).toFixed(0) }}K</div>
+            </div>
+            <div class="param">
+              <div class="param-label">24h PnL</div>
+              <div class="param-value" :style="{ color: strategy.pnl24h >= 0 ? '#00d9a5' : '#ff4757' }">
+                {{ strategy.pnl24h >= 0 ? '+' : '' }}${{ strategy.pnl24h.toFixed(2) }}
+              </div>
+            </div>
+          </div>
+
+          <div class="strategy-actions">
+            <button class="btn" @click="toggleStrategy(strategy)">
+              {{ strategy.status === 'running' ? '暂停' : '启动' }}
+            </button>
+            <button class="btn" @click="editStrategy(strategy)">修改参数</button>
+            <button class="btn" @click="viewChart(strategy)">查看图表</button>
+            <button class="btn btn-danger" @click="deleteStrategy(strategy)">删除</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 套利策略页面 -->
+    <div v-show="currentTab === 'arbitrage'">
+      <div style="text-align: center; padding: 80px; color: #8a9ab5;">
+        套利策略功能开发中...
+      </div>
+    </div>
+
+    <!-- 实时监控页面 -->
+    <div v-show="currentTab === 'monitoring'">
+      <div style="text-align: center; padding: 80px; color: #8a9ab5;">
+        实时监控功能开发中...
+      </div>
+    </div>
+
+    <!-- 配置对话框 -->
+    <el-dialog
+      v-model="configDialogVisible"
+      :title="configDialogTitle"
+      width="800px"
+      :close-on-click-modal="false"
+    >
+      <div class="config-form">
+        <!-- 交易对选择 -->
+        <div class="form-group">
+          <label class="form-label">交易对</label>
+          <input
+            class="form-input"
+            v-model="configForm.symbol"
+            placeholder="例如: BTC/USDT"
+            @input="onSymbolChange"
+          >
+        </div>
+
+        <!-- 交易所选择（勾选框 + 实时验证） -->
+        <div class="form-group" v-if="configForm.strategyType !== 'volume_hedge'">
+          <label class="form-label">选择交易所（支持多选）</label>
+          <div class="checkbox-group">
+            <div
+              v-for="exchange in availableExchanges"
+              :key="exchange.id"
+              class="checkbox-item"
+              :class="{
+                checked: configForm.exchanges.includes(exchange.id),
+                disabled: !exchange.available
+              }"
+              @click="toggleExchange(exchange.id)"
+            >
+              <div class="checkbox-label">
+                <span>{{ exchange.available ? '✓' : '✗' }}</span>
+                <span>{{ exchange.name }}</span>
+              </div>
+              <div class="checkbox-status" :class="exchange.available ? 'available' : 'unavailable'">
+                {{ exchange.available ? '支持' : '不支持' }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Simple MM 参数 -->
+        <template v-if="configForm.strategyType === 'simple_mm'">
+          <div class="form-group">
+            <label class="form-label">点差 (bps)</label>
+            <input class="form-input" type="number" v-model.number="configForm.spread_bps" step="0.1">
+          </div>
+          <div class="form-group">
+            <label class="form-label">订单大小</label>
+            <input class="form-input" type="number" v-model.number="configForm.size" step="0.001">
+          </div>
+          <div class="form-group">
+            <label class="form-label">最大库存</label>
+            <input class="form-input" type="number" v-model.number="configForm.max_inventory" step="100">
+          </div>
+        </template>
+
+        <!-- Grid MM 参数 -->
+        <template v-if="configForm.strategyType === 'grid_mm'">
+          <div class="form-group">
+            <label class="form-label">网格层数</label>
+            <input class="form-input" type="number" v-model.number="configForm.grid_levels" min="2" max="20">
+          </div>
+          <div class="form-group">
+            <label class="form-label">网格间距 (bps)</label>
+            <input class="form-input" type="number" v-model.number="configForm.grid_spacing_bps" step="0.5">
+          </div>
+          <div class="form-group">
+            <label class="form-label">每层大小</label>
+            <input class="form-input" type="number" v-model.number="configForm.size_per_level" step="0.001">
+          </div>
+        </template>
+
+        <!-- Volume Hedge 参数 -->
+        <template v-if="configForm.strategyType === 'volume_hedge'">
+          <div class="form-group">
+            <label class="form-label">选择主交易所（单选）</label>
+            <div class="checkbox-group">
+              <div
+                v-for="exchange in availableExchanges"
+                :key="exchange.id"
+                class="checkbox-item"
+                :class="{
+                  checked: configForm.primary_exchange === exchange.id,
+                  disabled: !exchange.available
+                }"
+                @click="selectPrimaryExchange(exchange.id)"
+              >
+                <div class="checkbox-label">
+                  <span>{{ exchange.available ? '✓' : '✗' }}</span>
+                  <span>{{ exchange.name }}</span>
+                </div>
+                <div class="checkbox-status" :class="exchange.available ? 'available' : 'unavailable'">
+                  {{ configForm.primary_exchange === exchange.id ? '已选为主交易所' : (exchange.available ? '支持' : '不支持') }}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">选择对冲交易所（支持多选）</label>
+            <div class="checkbox-group">
+              <div
+                v-for="exchange in availableExchanges"
+                :key="exchange.id"
+                class="checkbox-item"
+                :class="{
+                  checked: configForm.hedge_exchanges.includes(exchange.id),
+                  disabled: !exchange.available || exchange.id === configForm.primary_exchange
+                }"
+                @click="toggleHedgeExchange(exchange.id)"
+              >
+                <div class="checkbox-label">
+                  <span>{{ exchange.available ? '✓' : '✗' }}</span>
+                  <span>{{ exchange.name }}</span>
+                </div>
+                <div class="checkbox-status" :class="exchange.available ? 'available' : 'unavailable'">
+                  {{ exchange.id === configForm.primary_exchange ? '主交易所' : (exchange.available ? '支持' : '不支持') }}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">目标成交量 (USD)</label>
+            <input class="form-input" type="number" v-model.number="configForm.target_volume_usd" step="1000">
+          </div>
+        </template>
+      </div>
+
+      <template #footer>
+        <div style="display: flex; justify-content: flex-end; gap: 12px;">
+          <button class="btn" @click="configDialogVisible = false">取消</button>
+          <button class="btn btn-primary" @click="saveStrategy">启动策略</button>
+        </div>
+      </template>
+    </el-dialog>
+  </div>
+
+  <script>
+    const { createApp } = Vue;
+    const { ElMessage, ElMessageBox } = ElementPlus;
+
+    createApp({
+      data() {
+        return {
+          currentTab: 'market-making',
+
+          // 统计数据（从API获取）
+          stats: {
+            totalPnl: 0,
+            volume24h: 0,
+            successRate: 0
+          },
+
+          // 策略数据（从API获取）
+          simpleMMStrategies: [],
+          gridMMStrategies: [],
+          volumeHedgeStrategies: [],
+
+          // 配置对话框
+          configDialogVisible: false,
+          configDialogTitle: '',
+          configForm: {
+            strategyType: '',
+            symbol: '',
+            exchanges: [],
+            spread_bps: 8.5,
+            size: 0.015,
+            max_inventory: 5000,
+            grid_levels: 5,
+            grid_spacing_bps: 12.0,
+            size_per_level: 0.01,
+            primary_exchange: '',
+            hedge_exchanges: [],
+            target_volume_usd: 50000
+          },
+
+          // 可用交易所列表（所有已配置的交易所默认可用）
+          availableExchanges: [
+            { id: 'grvt', name: 'GRVT', available: true },
+            { id: 'okx', name: 'OKX', available: true },
+            { id: 'hyperliquid', name: 'Hyperliquid', available: true },
+            { id: 'backpack', name: 'Backpack', available: true },
+            { id: 'ethereal', name: 'Ethereal', available: true },
+            { id: 'extended', name: 'Extended', available: true },
+            { id: 'edgex', name: 'EdgeX', available: true },
+            { id: 'binance', name: 'Binance', available: true }
+          ],
+
+          // WebSocket连接
+          ws: null,
+          wsStatus: 'disconnected',
+
+          // 交易所连接状态
+          exchangeStatuses: [
+            { id: 'grvt', name: 'GRVT', status: 'disconnected' },
+            { id: 'okx', name: 'OKX', status: 'disconnected' },
+            { id: 'hyperliquid', name: 'Hype', status: 'disconnected' },
+            { id: 'backpack', name: 'Backpack', status: 'disconnected' },
+            { id: 'ethereal', name: 'Ethereal', status: 'disconnected' },
+            { id: 'extended', name: 'Extended', status: 'disconnected' }
+          ]
+        };
+      },
+
+      computed: {
+        activeStrategiesCount() {
+          return this.simpleMMStrategies.filter(s => s.status === 'running').length +
+                 this.gridMMStrategies.filter(s => s.status === 'running').length +
+                 this.volumeHedgeStrategies.filter(s => s.status === 'running').length;
+        },
+
+        totalStrategiesCount() {
+          return this.simpleMMStrategies.length +
+                 this.gridMMStrategies.length +
+                 this.volumeHedgeStrategies.length;
+        }
+      },
+
+      methods: {
+        formatNumber(num) {
+          if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+          if (num >= 1000) return (num / 1000).toFixed(0) + 'K';
+          return num.toString();
+        },
+
+        async openConfigDialog(strategyType) {
+          this.configForm.strategyType = strategyType;
+
+          const titles = {
+            simple_mm: '新建 Simple MM 策略',
+            grid_mm: '新建 Grid MM 策略',
+            volume_hedge: '新建 Volume Hedge 策略'
+          };
+
+          this.configDialogTitle = titles[strategyType];
+          this.configForm.symbol = '';
+          this.configForm.exchanges = [];
+          this.configForm.primary_exchange = '';
+          this.configForm.hedge_exchanges = [];
+
+          // 重新加载交易所列表（重置为全部可用）
+          await this.loadExchanges();
+
+          this.configDialogVisible = true;
+        },
+
+        async onSymbolChange() {
+          const symbol = this.configForm.symbol.toUpperCase().trim();
+          if (!symbol) return;
+
+          try {
+            // 调用后端API实时验证交易对可用性
+            const response = await fetch(`/api/exchanges/check_symbol?symbol=${encodeURIComponent(symbol)}`);
+            const data = await response.json();
+
+            if (data.exchanges) {
+              // 更新交易所可用性
+              this.availableExchanges = data.exchanges;
+            }
+          } catch (error) {
+            console.error('检查交易对可用性失败:', error);
+            // 降级：使用默认逻辑
+            if (symbol === 'BTC/USDT' || symbol === 'ETH/USDT' || symbol === 'SOL/USDT') {
+              this.availableExchanges.forEach(ex => ex.available = true);
+            }
+          }
+        },
+
+        toggleExchange(exchangeId) {
+          const exchange = this.availableExchanges.find(ex => ex.id === exchangeId);
+          if (!exchange.available) return;
+
+          const index = this.configForm.exchanges.indexOf(exchangeId);
+          if (index > -1) {
+            this.configForm.exchanges.splice(index, 1);
+          } else {
+            this.configForm.exchanges.push(exchangeId);
+          }
+        },
+
+        selectPrimaryExchange(exchangeId) {
+          const exchange = this.availableExchanges.find(ex => ex.id === exchangeId);
+          if (!exchange.available) return;
+
+          // 设置为主交易所
+          this.configForm.primary_exchange = exchangeId;
+
+          // 从对冲交易所列表中移除（如果已选）
+          const index = this.configForm.hedge_exchanges.indexOf(exchangeId);
+          if (index > -1) {
+            this.configForm.hedge_exchanges.splice(index, 1);
+          }
+        },
+
+        toggleHedgeExchange(exchangeId) {
+          const exchange = this.availableExchanges.find(ex => ex.id === exchangeId);
+          if (!exchange.available || exchangeId === this.configForm.primary_exchange) return;
+
+          const index = this.configForm.hedge_exchanges.indexOf(exchangeId);
+          if (index > -1) {
+            this.configForm.hedge_exchanges.splice(index, 1);
+          } else {
+            this.configForm.hedge_exchanges.push(exchangeId);
+          }
+        },
+
+        saveStrategy() {
+          if (!this.configForm.symbol) {
+            ElMessage.error('请输入交易对');
+            return;
+          }
+
+          if (this.configForm.strategyType === 'volume_hedge') {
+            if (!this.configForm.primary_exchange) {
+              ElMessage.error('请选择主交易所');
+              return;
+            }
+            if (this.configForm.hedge_exchanges.length === 0) {
+              ElMessage.error('请至少选择一个对冲交易所');
+              return;
+            }
+          } else {
+            if (this.configForm.exchanges.length === 0) {
+              ElMessage.error('请至少选择一个交易所');
+              return;
+            }
+          }
+
+          // TODO: 调用后端API保存策略
+
+          const newStrategy = {
+            id: 'new_' + Date.now(),
+            symbol: this.configForm.symbol,
+            status: 'stopped',
+            pnl24h: 0
+          };
+
+          if (this.configForm.strategyType === 'simple_mm') {
+            newStrategy.exchange = this.configForm.exchanges[0];
+            newStrategy.spread_bps = this.configForm.spread_bps;
+            newStrategy.size = this.configForm.size;
+            newStrategy.max_inventory = this.configForm.max_inventory;
+            this.simpleMMStrategies.push(newStrategy);
+          } else if (this.configForm.strategyType === 'grid_mm') {
+            newStrategy.exchange = this.configForm.exchanges[0];
+            newStrategy.grid_levels = this.configForm.grid_levels;
+            newStrategy.grid_spacing_bps = this.configForm.grid_spacing_bps;
+            newStrategy.size_per_level = this.configForm.size_per_level;
+            this.gridMMStrategies.push(newStrategy);
+          } else if (this.configForm.strategyType === 'volume_hedge') {
+            newStrategy.primary_exchange = this.configForm.primary_exchange;
+            newStrategy.hedge_exchanges = [...this.configForm.hedge_exchanges];
+            newStrategy.target_volume_usd = this.configForm.target_volume_usd;
+            this.volumeHedgeStrategies.push(newStrategy);
+          }
+
+          this.configDialogVisible = false;
+          ElMessage.success('策略创建成功');
+        },
+
+        toggleStrategy(strategy) {
+          strategy.status = strategy.status === 'running' ? 'stopped' : 'running';
+          ElMessage.success(strategy.status === 'running' ? '策略已启动' : '策略已暂停');
+        },
+
+        editStrategy(strategy) {
+          ElMessage.info('编辑功能开发中...');
+        },
+
+        viewChart(strategy) {
+          ElMessage.info('图表功能开发中...');
+        },
+
+        viewGrid(strategy) {
+          ElMessage.info('网格查看功能开发中...');
+        },
+
+        deleteStrategy(strategy) {
+          ElMessageBox.confirm('确定要删除这个策略吗？', '警告', {
+            confirmButtonText: '确定',
+            cancelButtonText: '取消',
+            type: 'warning'
+          }).then(() => {
+            [this.simpleMMStrategies, this.gridMMStrategies, this.volumeHedgeStrategies].forEach(arr => {
+              const index = arr.findIndex(s => s.id === strategy.id);
+              if (index > -1) arr.splice(index, 1);
+            });
+            ElMessage.success('策略已删除');
+          }).catch(() => {});
+        },
+
+        async loadSystemStatus() {
+          try {
+            const response = await fetch('/api/system/status');
+            const data = await response.json();
+
+            if (data.stats) {
+              this.stats.totalPnl = data.stats.pnl24h || 0;
+              this.stats.volume24h = data.stats.volume24h || 0;
+              this.stats.successRate = data.stats.successRate || 0;
+            }
+          } catch (error) {
+            console.error('加载系统状态失败:', error);
+          }
+        },
+
+        async loadStrategies() {
+          try {
+            const response = await fetch('/api/strategies');
+            const data = await response.json();
+
+            if (data.groups) {
+              // 解析策略数据并分配到对应数组
+              // TODO: 根据后端返回的真实数据结构解析
+              console.log('策略数据:', data);
+            }
+          } catch (error) {
+            console.error('加载策略失败:', error);
+          }
+        },
+
+        async loadExchanges() {
+          try {
+            const response = await fetch('/api/exchanges/available');
+            const data = await response.json();
+
+            if (data.exchanges && data.exchanges.length > 0) {
+              this.availableExchanges = data.exchanges;
+              console.log('已加载交易所列表:', this.availableExchanges.length, '个');
+            }
+          } catch (error) {
+            console.error('加载交易所列表失败:', error);
+          }
+        }
+      },
+
+      async mounted() {
+        console.log('Dashboard mounted');
+
+        // 1. 加载初始数据
+        await this.loadSystemStatus();
+        await this.loadStrategies();
+        await this.loadExchanges();
+
+        // 2. 建立WebSocket连接实时推送数据
+        this.connectWebSocket();
+      },
+
+      connectWebSocket() {
+        const wsUrl = `ws://${window.location.hostname}:18889`;
+        console.log('连接WebSocket:', wsUrl);
+
+        this.wsStatus = 'connecting';
+        this.ws = new WebSocket(wsUrl);
+
+        this.ws.onopen = () => {
+          console.log('✅ WebSocket已连接');
+          this.wsStatus = 'connected';
+        };
+
+        this.ws.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data);
+
+            if (message.type === 'connected') {
+              console.log('服务器欢迎:', message.message);
+            } else if (message.type === 'update') {
+              // 更新系统状态
+              if (message.data.system && message.data.system.stats) {
+                this.stats.totalPnl = message.data.system.stats.pnl24h || 0;
+                this.stats.volume24h = message.data.system.stats.volume24h || 0;
+                this.stats.successRate = message.data.system.stats.successRate || 0;
+              }
+
+              // 更新策略数据
+              if (message.data.strategies) {
+                console.log('WebSocket收到策略更新');
+              }
+
+              // 更新交易所连接状态
+              if (message.data.exchange_statuses) {
+                message.data.exchange_statuses.forEach(exStatus => {
+                  const ex = this.exchangeStatuses.find(e => e.id === exStatus.id);
+                  if (ex) {
+                    ex.status = exStatus.connected ? 'connected' : 'disconnected';
+                  }
+                });
+              }
+            }
+          } catch (error) {
+            console.error('解析WebSocket消息错误:', error);
+          }
+        };
+
+        this.ws.onerror = (error) => {
+          console.error('WebSocket错误:', error);
+          this.wsStatus = 'disconnected';
+        };
+
+        this.ws.onclose = () => {
+          console.log('WebSocket已断开，5秒后重连...');
+          this.wsStatus = 'disconnected';
+          setTimeout(() => {
+            this.connectWebSocket();
+          }, 5000);
+        };
+
+        // 定期发送心跳
+        setInterval(() => {
+          if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'ping' }));
+          }
+        }, 30000);
+      }
+    }).use(ElementPlus).mount('#app');
+  </script>
+</body>
+</html>
