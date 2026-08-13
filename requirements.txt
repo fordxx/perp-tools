@@ -6,3 +6,7 @@ httpx>=0.27
 websockets>=12.0
 python-dotenv>=1.0
 eth-account>=0.8
+
+# bitget_earnings/ 用（同步 REST + 同步 WS，与上面的 httpx/websockets 并存）
+requests>=2.31
+websocket-client>=1.7
